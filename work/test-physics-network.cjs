@@ -40,16 +40,41 @@ assert.equal(visual.ejected[0].x,150,'Delayed snapshots must not rewind feed ani
 assert.equal(visual.ejected[0].vx,300,'Delayed snapshots must not restart feed velocity');
 const correctionFunction = source.slice(source.indexOf("  function applyOwnCells("), source.indexOf("  function mergeNetworkCell("));
 const local = vm.createContext({ running:true, normalizeNetworkCell:cell=>({...cell}), radiusForMass:physics.radius,
-  playerCells:[{netId:'parent',mass:50,x:110,y:100,alive:true}, {netId:'new-child',mass:50,x:150,y:100,alive:true}], player:null });
+  playerCells:[{netId:'parent',mass:50,x:110,y:100,alive:true,_syncMassWeights:{parent:.5}}, {netId:'new-child',mass:50,x:150,y:100,alive:true,_syncMassWeights:{parent:.5}}], player:null });
 vm.runInContext(correctionFunction,local);
 vm.runInContext("applyOwnCells([{netId:'parent',mass:97.5,x:100,y:100,alive:true}], [{netId:'parent',mass:100}]);",local);
 assert.equal(local.playerCells.length,2);
 assert.equal(local.playerCells.reduce((sum,cell)=>sum+cell.mass,0),97.5);
 assert.equal(local.playerCells[0].x,110);
-local.playerCells = [{netId:'parent',mass:100,x:100,y:100,alive:true}];
+local.playerCells = [{netId:'parent',mass:100,x:100,y:100,alive:true,_syncMassWeights:{parent:1,merged:1}}];
 vm.runInContext("applyOwnCells([{netId:'parent',mass:50,x:100,y:100,alive:true},{netId:'merged',mass:52.2,x:100,y:100,alive:true}], [{netId:'parent',mass:50},{netId:'merged',mass:50}]);",local);
 assert.equal(local.playerCells.length,1);
 assert(Math.abs(local.playerCells[0].mass-102.2)<.000001);
+
+const game = fs.readFileSync(path.join(__dirname, '..', 'game.js'), 'utf8');
+const splitCode = game.slice(game.indexOf('function aimDirection()'), game.indexOf('function feedMass()'));
+for (const [split, count] of [['splitPlayer',2],['quadSplitPlayer',4],['tripleSplitPlayer',3],['fiveSplitPlayer',5],['sixSplitPlayer',6],['squareSplitPlayer',4]]) {
+  const race = vm.createContext({BlobPhysics:physics,running:true,width:1000,height:1000,pointer:{x:900,y:500},worldSize:10000,
+    performance:{now:()=>1000},radiusForMass:physics.radius,emit(){},clamp:(v,min,max)=>Math.max(min,Math.min(max,v)),
+    boundCell:(v,r)=>Math.max(r,Math.min(10000-r,v)),normalizeNetworkCell:cell=>({...cell}),
+    playerCells:[{netId:'parent',x:5000,y:5000,mass:1000,radius:physics.radius(1000),alive:true,_syncMassWeights:{parent:1}}],player:null});
+  vm.runInContext(splitCode + correctionFunction, race);
+  vm.runInContext(`${split}(); ${split}();
+    playerCells.forEach(cell=>{cell.x+=1200;});
+    applyOwnCells([{netId:'parent',mass:250,x:5000,y:5000,alive:true}],[{netId:'parent',mass:1000}]);`,race);
+  assert.equal(race.playerCells.length,count*count,'Delayed feed response must preserve all new pieces');
+  for (const cell of race.playerCells) {
+    assert(Math.abs(cell.mass-250/(count*count))<.000001,'Feed cost must be divided across every descendant, not crush the parent');
+    assert(cell.x>6000,'A pre-split response must not teleport the parent backward');
+    assert(Number.isFinite(cell.launchX||0));
+  }
+  // Recombining descendants must retain the complete pending correction exactly once.
+  vm.runInContext(`const first=playerCells[0];
+    for(const other of playerCells.slice(1)){combineMassCorrections(first,other);first.mass+=other.mass;}
+    playerCells=[first];
+    applyOwnCells([{netId:'parent',mass:1022,x:5000,y:5000,alive:true}],[{netId:'parent',mass:1000}]);`,race);
+  assert(Math.abs(race.playerCells[0].mass-272)<.000001);
+}
 
 const directory = fs.mkdtempSync(path.join(os.tmpdir(),"tricksplit-feed-"));
 const base = "http://127.0.0.1:11003";
