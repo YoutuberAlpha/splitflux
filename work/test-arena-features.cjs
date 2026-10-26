@@ -7,7 +7,10 @@ for (const position of [{x:1000,y:1000},{x:1100,y:800},{x:1300,y:1200}]) {
   const target={x:1800,y:900};
   const pellet=physics.createFeed({...position,mass:100},target.x-position.x,target.y-position.y,target);
   for(let frame=0;frame<120;frame++)physics.moveFeed(pellet,1/120,5200);
-  assert(Math.hypot(pellet.x-target.x,pellet.y-target.y)<.00001,'Every source must converge on the actual cursor');
+  const dx=target.x-position.x,dy=target.y-position.y;
+  const px=pellet.x-position.x,py=pellet.y-position.y;
+  assert(Math.abs(dx*py-dy*px)<.00001,'Every source must aim at the actual cursor');
+  assert(Math.hypot(px,py)<=physics.radius(100)+10+360,'A distant cursor must not turn feeding into a cross-map projectile');
 }
 const directory=fs.mkdtempSync(path.join(os.tmpdir(),'splitflux-features-'));
 let processHandle;

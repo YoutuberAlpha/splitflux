@@ -26,6 +26,21 @@ assert(Math.abs(feedFlight(30,300)-feedFlight(240,300))<.000001);
 assert(feedFlight(60,300)<160,'Ordinary feed range should be much shorter');
 assert(feedFlight(60,300)>feedFlight(60,28),'Feed range should still scale with blob size');
 assert(feedFlight(60,1000000)<=360.000001,'Very large blobs should not fire feed across the map');
+for(const fps of [30,60,144,240]) {
+  const shot=physics.createFeed({x:1000,y:1000,mass:300},1,0,{x:1e9,y:1000},5200);
+  const start=shot.x;
+  let previous=start;
+  for(let frame=0;frame<fps;frame++) {
+    physics.moveFeed(shot,1/fps,5200);
+    assert(shot.x>=previous,'A shot must never reverse or jump backward');previous=shot.x;
+  }
+  assert(shot.x-start<=160,'A distant cursor must not increase shot range');
+  assert.equal(shot.vx,0);
+}
+const huge=physics.createFeed({x:2600,y:2600,mass:1e15},1,0,{x:1e12,y:2600},5200);
+assert(huge.x<=5192&&huge.flightEndX<=5192,'Large admin blobs must not eject outside the arena');
+const nearby=physics.createFeed({x:1000,y:1000,mass:300},1,0,{x:1100,y:1000},5200);
+physics.moveFeed(nearby,1,5200);assert.equal(nearby.x,1100,'Nearby cursor targets must be reached exactly');
 assert(physics.catchesFeed({x:200,y:100,radius:12}, {x:300,y:100,r:8}, 100, 100));
 assert.deepEqual(physics.direction(0,0), {x:1,y:0});
 

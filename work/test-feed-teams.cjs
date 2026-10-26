@@ -54,6 +54,18 @@ const charged=vm.runInContext(`
 assert.equal(charged.paidMass,15,'A reserved feed cost must follow split pieces without overdrawing their original parent');
 assert.equal(charged.pellets,1,'Retrying a split feed must not charge or emit twice');
 assert.equal(charged.afterInvalid,1,'A client cannot emit feed without paying the complete cost');
+const intake=vm.runInContext(`
+  const receiver={name:'Test',revision:1,lastReplyRevision:0,lastReplyCells:[{netId:'parent',mass:200}],
+    cells:[cleanCell({netId:'parent',x:1000,y:1000,mass:222,alive:true})]};
+  const next=acceptClientCells(receiver,[{netId:'parent',x:1400,y:1000,mass:100,alive:true,massOrigins:{parent:.5}},
+    {netId:'child',x:1500,y:1000,mass:100,alive:true,massOrigins:{parent:.5}}],0);
+  const swept=collisionDistance({x:1400,y:1000,_moveFromX:1000,_moveFromY:1000,_moveUntil:2000},{x:1200,y:1000},1000);
+  ({x:next[0].x,masses:next.map(cell=>cell.mass),swept});
+`,context);
+assert.equal(intake.x,1400,'Receiving feed must not reject newer movement');
+assert.equal(intake.masses.length,2,'Receiving feed must not reject a new split');
+assert(intake.masses.every(mass=>mass===111),'Unacknowledged intake must be shared across descendants exactly once');
+assert.equal(intake.swept,0,'Eating must catch a prey crossed between updates');
 
 const source = fs.readFileSync(path.join(__dirname, "..", "game.js"), "utf8");
 const updateFeed = source.slice(source.indexOf("function updateEjected(dt)"), source.indexOf("function handleCells()"));
