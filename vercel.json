@@ -1,5 +1,19 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": null,
-  "buildCommand": "npm run build"
+  "buildCommand": "npm run build",
+  "outputDirectory": "public",
+  "regions": ["iad1"],
+  "functions": {
+    "api/index.js": {
+      "maxDuration": 30,
+      "includeFiles": "{server.cjs,accounts.cjs,moderation.cjs,physics.js}"
+    }
+  },
+  "rewrites": [
+    {"source":"/api/:path*","destination":"/api/index?route=:path*"},
+    {"source":"/owner","destination":"/index.html"},
+    {"source":"/mobile","destination":"/index.html"},
+    {"source":"/mobile-owner","destination":"/index.html"}
+  ]
 }

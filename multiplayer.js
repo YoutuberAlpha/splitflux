@@ -131,10 +131,9 @@
     const current = new Map(playerCells.map(cell => [cell.netId, cell]));
     const sent = new Map(sentCells.map(cell => [cell.netId, cell]));
     const unsent = playerCells.filter(cell => cell.alive && !sent.has(cell.netId));
-    let mergedMassCorrection = 0;
+    const massCorrections = new Map(serverCells.filter(cell => sent.has(cell.netId)).map(cell => [cell.netId, cell.mass - sent.get(cell.netId).mass]));
     playerCells = serverCells.filter(serverCell => {
       if (sent.has(serverCell.netId) && !current.has(serverCell.netId)) {
-        mergedMassCorrection += serverCell.mass - sent.get(serverCell.netId).mass;
         return false;
       }
       return true;
@@ -142,9 +141,8 @@
       const normalized = normalizeNetworkCell(serverCell);
       const existing = current.get(normalized.netId);
       if (existing) {
-        existing.mass = Math.max(.000001, normalized.mass + existing.mass - (sent.get(existing.netId)?.mass ?? existing.mass));
-        existing.radius = radiusForMass(existing.mass);
-        if (Math.hypot(normalized.x - existing.x, normalized.y - existing.y) > Math.max(500, existing.radius * 4)) {
+        const unchangedShape = !existing._syncMassWeights || existing._syncMassWeights[existing.netId] === 1 && Object.keys(existing._syncMassWeights).length === 1;
+        if (unchangedShape && Math.hypot(normalized.x - existing.x, normalized.y - existing.y) > Math.max(500, existing.radius * 4)) {
           existing.x = normalized.x;
           existing.y = normalized.y;
         }
@@ -166,9 +164,13 @@
       };
     });
     playerCells.push(...unsent.filter(cell => !playerCells.some(other => other.netId === cell.netId)));
-    if (playerCells.length && mergedMassCorrection) {
-      playerCells[0].mass = Math.max(.000001, playerCells[0].mass + mergedMassCorrection);
-      playerCells[0].radius = radiusForMass(playerCells[0].mass);
+    // A response describes the pre-split cells. Carry its mass delta through local splits/merges.
+    for (const cell of playerCells) {
+      const weights = cell._syncMassWeights || { [cell.netId]: 1 };
+      let correction = 0;
+      for (const [id, weight] of Object.entries(weights)) correction += (massCorrections.get(id) || 0) * weight;
+      cell.mass = Math.max(.000001, cell.mass + correction);
+      cell.radius = radiusForMass(cell.mass);
     }
     player = playerCells.find(cell => cell.alive) || playerCells[0] || player;
   }
@@ -320,6 +322,8 @@
 
   function updateAdminAccess() {
     isAdmin = Boolean(session && session.isAdmin);
+    document.querySelector("#botBanOptions").hidden = !isAdmin;
+    if (!isAdmin) document.querySelector("#moderationMenu").classList.add("hidden");
     updateBlobImageAccess();
     document.querySelector("#mobileRole").textContent = isAdmin ? "OWNER" : "GUEST";
     adminShortcut.classList.toggle("hidden", !isAdmin);
@@ -423,7 +427,7 @@
         score,
         immune: isAdmin && botImmunity,
         cursor: cursorWorldPosition(),
-        botFeeding: running && Boolean(followedBotTeam) && Boolean(keys.KeyR),
+        botFeeding: running && Boolean(followedBotTeam) && Boolean(keys.KeyT),
         botSplitCommands: [...pendingBotSplitCommands].slice(0,8),
         ackRevision: networkRevision,
         ackWorldRevision: worldRevision,
@@ -435,6 +439,7 @@
           : [],
       };
       if (networkSkin!==lastSentSkin) payload.skin=networkSkin;
+      for (const cell of playerCells) cell._syncMassWeights = { [cell.netId]: 1 };
       const sentMapSize = worldSize;
       const requestAt=performance.now();
       const response = await fetch("/api/state", {

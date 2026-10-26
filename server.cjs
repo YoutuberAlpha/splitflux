@@ -6,6 +6,7 @@ const path = require("path");
 const BlobPhysics = require("./physics.js");
 
 const root = __dirname;
+const cloudMode = process.env.SPLITFLUX_CLOUD_MODE === "1";
 const port = Number(process.env.PORT) || 1000;
 const adminPassword = process.env.SPLITFLUX_OWNER_PASSWORD || process.env.TRICKSPLIT_ADMIN_PASSWORD;
 const dataDirectory = process.env.SPLITFLUX_DATA_DIR || process.env.TRICKSPLIT_DATA_DIR || path.join(root, ".tricksplit-data");
@@ -686,6 +687,11 @@ function sessionView(session) {
 }
 
 function readBody(request) {
+  if (request.body !== undefined) {
+    const body=typeof request.body==="string" || Buffer.isBuffer(request.body) ? JSON.parse(String(request.body)||"{}") : request.body;
+    if (Buffer.byteLength(JSON.stringify(body))>2_000_000) return Promise.reject(new Error("Request too large"));
+    return Promise.resolve(body);
+  }
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
@@ -718,7 +724,7 @@ function cleanupSessions() {
   }
 }
 
-const server = http.createServer(async (request, response) => {
+const handleRequest = async (request, response) => {
   const url = new URL(request.url, `http://${request.headers.host || "localhost"}`);
 
   if (request.method === "GET" && url.pathname === "/health") {
@@ -1027,7 +1033,8 @@ const server = http.createServer(async (request, response) => {
 
   response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
   response.end("Not found");
-});
+};
+const server = http.createServer(handleRequest);
 
 world = cleanWorld({ worldSize: 5200, bots: [], viruses: Array.from({ length: 22 }, () => ({
   x: 100 + Math.random() * 5000,
@@ -1038,10 +1045,7 @@ world = cleanWorld({ worldSize: 5200, bots: [], viruses: Array.from({ length: 22
 for (let index = 0; index < 24; index++) spawnServerBot();
 
 let lastFallbackTick = Date.now();
-const fallbackTimer = setInterval(() => {
-  const now = Date.now();
-  const dt = Math.min(.05, Math.max(.001, (now - lastFallbackTick) / 1000));
-  lastFallbackTick = now;
+function tickArena(dt) {
   cleanupSessions();
   simulateSharedEjected(dt);
   simulateBotFeeding();
@@ -1051,10 +1055,17 @@ const fallbackTimer = setInterval(() => {
     world.bots=world.bots.filter(bot=>!moderation.until([`bot:${bot.botTeam||bot.name}`]));
     if (world.bots.length!==before) botRevision++;
   }
-}, 40);
-fallbackTimer.unref();
+}
+function advanceArena() {
+  const now=Date.now();
+  let elapsed=Math.min(2,Math.max(0,(now-lastFallbackTick)/1000));
+  while (elapsed>0) {const dt=Math.min(.04,elapsed);tickArena(dt);elapsed-=dt;}
+  lastFallbackTick=now;
+}
+const fallbackTimer = cloudMode ? null : setInterval(advanceArena,40);
+fallbackTimer?.unref();
 
-server.listen(port, "0.0.0.0", () => {
+if (!cloudMode) server.listen(port, "0.0.0.0", () => {
   const addresses = [];
   for (const entries of Object.values(os.networkInterfaces())) {
     for (const entry of entries || []) {
@@ -1075,4 +1086,20 @@ server.listen(port, "0.0.0.0", () => {
   console.log("Sign in to the alpha account for owner and admin powers.");
 });
 
-module.exports = { server };
+function exportState() {
+  return {world,worldRevision,botRevision,botMassRevision,serverBotCounter,serverFallbackActive,
+    botRespawnBlockedUntil,targetBotTeams,botPieceCap,lastFallbackTick,ownerId,
+    sessions:[...sessions.values()].map(session=>({...session,feedIds:[...session.feedIds],
+      botActionIds:[...session.botActionIds],teamedBots:[...session.teamedBots]}))};
+}
+function importState(state) {
+  if (!state || !state.world || !Array.isArray(state.sessions)) throw new Error("Invalid shared arena state");
+  world=state.world; worldRevision=state.worldRevision||0; botRevision=state.botRevision||0;
+  botMassRevision=state.botMassRevision||0; serverBotCounter=state.serverBotCounter||0;
+  serverFallbackActive=Boolean(state.serverFallbackActive);botRespawnBlockedUntil=state.botRespawnBlockedUntil||0;
+  targetBotTeams=state.targetBotTeams||24;botPieceCap=state.botPieceCap||96;
+  lastFallbackTick=state.lastFallbackTick||Date.now();ownerId=state.ownerId||null;sessions.clear();
+  for (const session of state.sessions) sessions.set(session.id,{...session,feedIds:new Set(session.feedIds),
+    botActionIds:new Set(session.botActionIds),teamedBots:new Set(session.teamedBots)});
+}
+module.exports = { server, handleRequest, advanceArena, exportState, importState };

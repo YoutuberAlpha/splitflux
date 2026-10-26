@@ -495,7 +495,7 @@ function updatePlayer(dt) {
   feedCooldown = Math.max(0, feedCooldown - dt);
   if (keys.KeyW) feedMass();
   offlineBotFeedCooldown = Math.max(0, offlineBotFeedCooldown - dt);
-  if (!onlineMode && keys.KeyR && followedBotTeam && !offlineBotFeedCooldown) {
+  if (!onlineMode && keys.KeyT && followedBotTeam && !offlineBotFeedCooldown) {
     offlineBotFeedCooldown = .06;
     const target = cursorWorldPosition();
     for (const bot of bots.filter(bot => bot.alive && (bot.botTeam || bot.name) === followedBotTeam && bot.mass > BlobPhysics.minFeedMass)) {
@@ -524,12 +524,24 @@ function aimDirection() {
   return BlobPhysics.direction(dx, dy);
 }
 
+function partitionMassCorrection(cell, pieces) {
+  if (!cell._syncMassWeights) return;
+  cell._syncMassWeights = Object.fromEntries(Object.entries(cell._syncMassWeights).map(([id, weight]) => [id, weight / pieces]));
+}
+
+function combineMassCorrections(target, source) {
+  const weights = { ...target._syncMassWeights };
+  for (const [id, weight] of Object.entries(source._syncMassWeights || {})) weights[id] = (weights[id] || 0) + weight;
+  target._syncMassWeights = weights;
+}
+
 function splitPlayer() {
   if (!running) return;
   const dir = aimDirection();
   const now = performance.now();
   const newCells = [];
   for (const cell of playerCells.filter(c => c.alive)) {
+    partitionMassCorrection(cell, 2);
     cell.mass = Math.max(cell.mass / 2, .000001);
     cell.radius = radiusForMass(cell.mass);
     cell.mergeAt = now + 3000;
@@ -554,6 +566,7 @@ function quadSplitPlayer() {
   const now = performance.now();
   const result = [];
   for (const cell of original) {
+    partitionMassCorrection(cell, 4);
     const pieceMass = Math.max(cell.mass / 4, .000001);
     cell.mass = pieceMass;
     cell.radius = radiusForMass(pieceMass);
@@ -578,6 +591,7 @@ function tripleSplitPlayer() {
   const now = performance.now();
   const result = [];
   for (const cell of original) {
+    partitionMassCorrection(cell, 3);
     const pieceMass = Math.max(cell.mass / 3, .000001);
     cell.mass = pieceMass;
     cell.radius = radiusForMass(pieceMass);
@@ -602,6 +616,7 @@ function fiveSplitPlayer() {
   const now = performance.now();
   const result = [];
   for (const cell of original) {
+    partitionMassCorrection(cell, 5);
     const pieceMass = Math.max(cell.mass / 5, .000001);
     cell.mass = pieceMass;
     cell.radius = radiusForMass(pieceMass);
@@ -626,6 +641,7 @@ function sixSplitPlayer() {
   const now = performance.now();
   const result = [];
   for (const cell of original) {
+    partitionMassCorrection(cell, 6);
     const pieceMass = Math.max(cell.mass / 6, .000001);
     cell.mass = pieceMass;
     cell.radius = radiusForMass(pieceMass);
@@ -649,6 +665,7 @@ function squareSplitPlayer() {
   const now = performance.now();
   const result = [];
   for (const cell of original) {
+    partitionMassCorrection(cell, 4);
     const pieceMass = Math.max(cell.mass / 4, .000001);
     const centerX = cell.x;
     const centerY = cell.y;
@@ -710,6 +727,7 @@ function separatePlayerCells() {
     const canMerge = now >= a.mergeAt && now >= b.mergeAt;
     if (canMerge && d < a.radius + b.radius * .65) {
       const big = a.mass >= b.mass ? a : b, small = big === a ? b : a;
+      combineMassCorrections(big, small);
       big.mass += small.mass;
       big.radius = radiusForMass(big.mass);
       small.alive = false;
@@ -734,6 +752,7 @@ function separatePlayerCells() {
 function burstPlayerCell(cell) {
   if (!cell.alive || cell.mass < 90 || playerCells.length >= 16) return;
   const pieces = Math.min(6, 16 - playerCells.length);
+  partitionMassCorrection(cell, pieces + 1);
   const pieceMass = cell.mass / (pieces + 1);
   cell.mass = pieceMass;
   cell.radius = radiusForMass(pieceMass);
@@ -1102,7 +1121,7 @@ function endGame() {
 
 function returnToMainMenu() {
   running = false;
-  keys.KeyR=false;
+  keys.KeyT=false;
   setSpikePainter(false);
   document.querySelector("#botTeamMenu").classList.add("hidden");
   gameOver = false;
@@ -1479,7 +1498,7 @@ async function toggleSelectedBotTeam() {
     else if (enabled) { teamedBots.clear(); teamedBots.add(team); followedBotTeam=team; }
     else { teamedBots.delete(team); followedBotTeam=null; }
     button.textContent = enabled ? "STOP TEAMING" : "TEAM WITH BOT";
-    document.querySelector("#botTeamMessage").textContent = enabled ? "Following cursor. Hold R: bot feed. Press 1: bot split. Your last blob is protected." : "No longer teaming.";
+    document.querySelector("#botTeamMessage").textContent = enabled ? "Following cursor. Hold T: bot feed. Press 1: bot split. Your last blob is protected." : "No longer teaming.";
   } catch(error) { document.querySelector("#botTeamMessage").textContent = error.message||"Could not update team. Try again."; }
   finally { button.disabled = false; }
 }
@@ -1551,9 +1570,12 @@ addEventListener("keydown", e => {
     }
     return;
   }
+  if (e.code === "KeyT") {
+    if (running && followedBotTeam) { e.preventDefault(); keys.KeyT=true; }
+    return;
+  }
   if (e.code === "KeyR") {
-    if (running && followedBotTeam) { e.preventDefault(); keys.KeyR=true; }
-    else if (!e.repeat) instantlyRemerge();
+    if (!e.repeat) { e.preventDefault(); instantlyRemerge(); }
     return;
   }
   if (e.code === "Digit1" && !e.repeat && running && followedBotTeam) {
@@ -1830,6 +1852,7 @@ function instantlyRemerge() {
   if (alive.length < 2) return;
   const center = playerCenter();
   const merged = alive[0];
+  for (const cell of alive.slice(1)) combineMassCorrections(merged, cell);
   merged.mass = center.mass;
   merged.radius = radiusForMass(center.mass);
   merged.x = worldSize > merged.radius * 2 ? clamp(center.x, merged.radius, worldSize - merged.radius) : worldSize / 2;
@@ -1958,7 +1981,7 @@ document.querySelectorAll("[data-mobile-action]").forEach(button => {
     if (action) action();
   });
 });
-function releaseHeldActions() {stopMobileFeed();keys.KeyR=false;spikePainting=false;}
+function releaseHeldActions() {stopMobileFeed();keys.KeyT=false;spikePainting=false;}
 addEventListener("blur", releaseHeldActions);
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) releaseHeldActions();
