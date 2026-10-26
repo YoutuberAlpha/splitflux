@@ -23,6 +23,7 @@
   let networkSkin = "";
   let lastSentSkin = null;
   let teamRevision = 0;
+  let nextSyncAt = 0;
   function updateNetworkSkin() {
     if (skinSource === playerBlobImageData) return;
     skinSource = playerBlobImageData;
@@ -47,6 +48,7 @@
   function cellForNetwork(cell) {
     if (!cell.netId) cell.netId = `${session ? session.id : "local"}-${Math.random().toString(36).slice(2)}`;
     const splitLineRemaining = Math.max(0, (Number(cell.splitLineUntil) || 0) - performance.now());
+    const mass = cell.mass + Object.values(cell._pendingFeedCosts || {}).reduce((sum, cost) => sum + cost, 0);
     return {
       netId: cell.netId,
       name: cell.name,
@@ -54,8 +56,8 @@
       y: cell.y,
       vx: cell.vx,
       vy: cell.vy,
-      mass: cell.mass,
-      radius: cell.radius,
+      mass,
+      radius: radiusForMass(mass),
       color: cell.color,
       accent: cell.accent,
       alive: cell.alive,
@@ -122,6 +124,8 @@
       sourceX: pellet.sourceX,
       sourceY: pellet.sourceY,
       sourceMass: pellet.sourceMass,
+      debits: playerCells.filter(cell => cell.alive && cell._pendingFeedCosts?.[pellet.netId] > 0)
+        .map(cell => ({netId:cell.netId,cost:cell._pendingFeedCosts[pellet.netId]})),
       color: pellet.color,
     };
   }
@@ -142,9 +146,10 @@
       const existing = current.get(normalized.netId);
       if (existing) {
         const unchangedShape = !existing._syncMassWeights || existing._syncMassWeights[existing.netId] === 1 && Object.keys(existing._syncMassWeights).length === 1;
-        if (unchangedShape && Math.hypot(normalized.x - existing.x, normalized.y - existing.y) > Math.max(500, existing.radius * 4)) {
-          existing.x = normalized.x;
-          existing.y = normalized.y;
+        const baseline = sent.get(existing.netId);
+        if (unchangedShape && baseline && Number.isFinite(baseline.x) && Number.isFinite(baseline.y)) {
+          existing.x += normalized.x - baseline.x;
+          existing.y += normalized.y - baseline.y;
         }
         return {
           ...existing,
@@ -175,8 +180,22 @@
     player = playerCells.find(cell => cell.alive) || playerCells[0] || player;
   }
 
+  function settleFeedPredictions(ids) {
+    for (const cell of playerCells) {
+      const costs = { ...cell._pendingFeedCosts };
+      for (const id of ids) {
+        cell.mass += costs[id] || 0;
+        delete costs[id];
+      }
+      cell._pendingFeedCosts = costs;
+      cell.radius = radiusForMass(cell.mass);
+    }
+  }
+
   function mergeNetworkCell(current, incoming) {
     incoming = normalizeNetworkCell(incoming);
+    const now = performance.now();
+    const sample = {time:now,x:incoming.x,y:incoming.y};
     if (!current) {
       return {
         ...incoming,
@@ -184,17 +203,24 @@
         _netTargetY: incoming.y,
         _netTargetMass: incoming.mass,
         _netTargetRadius: incoming.radius,
+        _netSamples: [sample],
+        _netSpacing: 100,
       };
     }
     const x = current.x;
     const y = current.y;
     const mass = current.mass;
     const radius = current.radius;
+    const samples = current._netSamples || [];
+    const interval = samples.length ? now-samples[samples.length-1].time : 100;
+    const spacing = Math.max(50,Math.min(500,(current._netSpacing||100)*.7+interval*.3));
     Object.assign(current, incoming);
     current.x = x;
     current.y = y;
     current.mass = mass;
     current.radius = radius;
+    current._netSamples = [...samples.slice(-11),sample];
+    current._netSpacing = spacing;
     current._netTargetX = incoming.x + (Number(incoming.vx) || 0) * .07;
     current._netTargetY = incoming.y + (Number(incoming.vy) || 0) * .07;
     current._netTargetMass = incoming.mass;
@@ -269,8 +295,8 @@
       if (!bot || !bot.alive) continue;
       const mass = Number(serverBot.mass);
       if (!Number.isFinite(mass)) continue;
-      bot.mass = mass;
-      bot.radius = radiusForMass(bot.mass);
+      bot._netTargetMass = mass;
+      bot._netTargetRadius = radiusForMass(mass);
     }
   }
 
@@ -309,8 +335,23 @@
     if (!Number.isFinite(cell._netTargetX)) return;
     const positionEase = 1 - Math.exp(-dt * 14);
     const sizeEase = 1 - Math.exp(-dt * 11);
-    cell.x += (cell._netTargetX - cell.x) * positionEase;
-    cell.y += (cell._netTargetY - cell.y) * positionEase;
+    const samples = cell._netSamples;
+    if (samples?.length > 1) {
+      const renderTime = performance.now()-Math.max(90,Math.min(500,cell._netSpacing*1.2));
+      let before=samples[0], after=samples[samples.length-1];
+      for (let i=1;i<samples.length;i++) {
+        if(samples[i].time>=renderTime){before=samples[i-1];after=samples[i];break;}
+        before=samples[i];
+      }
+      const span=after.time-before.time;
+      const blend=span>0?Math.max(0,Math.min(1,(renderTime-before.time)/span)):1;
+      const ahead=Math.max(0,Math.min(.1,(renderTime-after.time)/1000));
+      cell.x=before.x+(after.x-before.x)*blend+(Number(cell.vx)||0)*ahead;
+      cell.y=before.y+(after.y-before.y)*blend+(Number(cell.vy)||0)*ahead;
+    } else {
+      cell.x += (cell._netTargetX - cell.x) * positionEase;
+      cell.y += (cell._netTargetY - cell.y) * positionEase;
+    }
     cell.mass += (cell._netTargetMass - cell.mass) * sizeEase;
     cell.radius += (cell._netTargetRadius - cell.radius) * sizeEase;
   }
@@ -415,6 +456,8 @@
   async function syncRoom() {
     if (currentBanUntil>Date.now()) return;
     if (!session || syncing) return;
+    if (!running && performance.now() < nextSyncAt) return;
+    nextSyncAt = performance.now() + (running ? 75 : 1500);
     syncing = true;
     try {
       updateNetworkSkin();
@@ -464,6 +507,7 @@
       if (snapshot.botSplitError) showArenaError(new Error(snapshot.botSplitError));
       bannedBotTeams=new Set(snapshot.bannedBotTeams||[]);
       const acceptedFeedIds = new Set(snapshot.acceptedFeedIds || []);
+      settleFeedPredictions(acceptedFeedIds);
       acceptedFeedIds.forEach(id => pendingFeedCommands.delete(id));
       ejected.forEach(pellet => { if (acceptedFeedIds.has(pellet.netId)) pellet._serverConfirmed = true; });
       if ((snapshot.teamRevision||0)>=teamRevision) {

@@ -525,14 +525,17 @@ function aimDirection() {
 }
 
 function partitionMassCorrection(cell, pieces) {
-  if (!cell._syncMassWeights) return;
-  cell._syncMassWeights = Object.fromEntries(Object.entries(cell._syncMassWeights).map(([id, weight]) => [id, weight / pieces]));
+  for (const key of ["_syncMassWeights", "_pendingFeedCosts"]) {
+    if (cell[key]) cell[key] = Object.fromEntries(Object.entries(cell[key]).map(([id, weight]) => [id, weight / pieces]));
+  }
 }
 
 function combineMassCorrections(target, source) {
-  const weights = { ...target._syncMassWeights };
-  for (const [id, weight] of Object.entries(source._syncMassWeights || {})) weights[id] = (weights[id] || 0) + weight;
-  target._syncMassWeights = weights;
+  for (const key of ["_syncMassWeights", "_pendingFeedCosts"]) {
+    const weights = { ...target[key] };
+    for (const [id, weight] of Object.entries(source[key] || {})) weights[id] = (weights[id] || 0) + weight;
+    target[key] = weights;
+  }
 }
 
 function splitPlayer() {
@@ -698,10 +701,9 @@ function feedMass() {
   const target = cursorWorldPosition();
   let fed = false;
   for (const cell of playerCells.filter(c => c.alive)) {
-    const pendingCost = onlineMode ? [...pendingFeedCommands.values()].filter(command => command.ownerCellId === cell.netId).length * BlobPhysics.feedCost : 0;
-    if (cell.mass - pendingCost <= BlobPhysics.minFeedMass) continue;
+    if (cell.mass <= BlobPhysics.minFeedMass) continue;
     if (!cell.netId) cell.netId = `local-feed-owner-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`;
-    if (!onlineMode) cell.mass -= BlobPhysics.feedCost;
+    cell.mass -= BlobPhysics.feedCost;
     cell.radius = radiusForMass(cell.mass);
     const pellet = { ...BlobPhysics.createFeed(cell, target.x - cell.x, target.y - cell.y, target),
       netId: `feed-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`,
@@ -710,7 +712,10 @@ function feedMass() {
     pellet.startX = pellet.x;
     pellet.startY = pellet.y;
     ejected.push(pellet);
-    if (onlineMode) pendingFeedCommands.set(pellet.netId, { ...pellet });
+    if (onlineMode) {
+      cell._pendingFeedCosts = { ...cell._pendingFeedCosts, [pellet.netId]: BlobPhysics.feedCost };
+      pendingFeedCommands.set(pellet.netId, { ...pellet });
+    }
     fed = true;
   }
   if (fed) feedCooldown = .011;

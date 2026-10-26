@@ -46,11 +46,9 @@ function createCloudHandler(pool, options={}) {
     try {
       await initialize();
       client=await pool.connect();
-      await client.query("BEGIN");
-      await client.query("SET LOCAL statement_timeout = '8s'");
-      await client.query("SET LOCAL lock_timeout = '5s'");
       // One row lock owns the arena until its state and response are committed together.
-      const result=await client.query("SELECT payload FROM splitflux_arena WHERE id=1 FOR UPDATE");
+      const results=await client.query("BEGIN; SET LOCAL statement_timeout = '8s'; SET LOCAL lock_timeout = '5s'; SELECT payload FROM splitflux_arena WHERE id=1 FOR UPDATE");
+      const result=Array.isArray(results)?results[results.length-1]:results;
       const snapshot=result.rows[0].payload;
       const engine=makeEngine(snapshot,directory);
       engine.advanceArena();

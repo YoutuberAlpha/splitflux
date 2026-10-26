@@ -262,10 +262,24 @@ function addSharedEjected(session, additions) {
     if (existingIds.has(netId) || session.feedIds.has(netId)) continue;
     if (world.ejected.length >= 700) break;
     session.feedIds.add(netId);
-    const owner = session.cells.find(cell => cell.alive && cell.netId === raw.ownerCellId);
-    if (!owner || owner.mass <= BlobPhysics.minFeedMass) continue;
-    owner.mass -= BlobPhysics.feedCost;
-    owner.radius = radiusForMass(owner.mass);
+    let owner = session.cells.find(cell => cell.alive && cell.netId === raw.ownerCellId);
+    if (Array.isArray(raw.debits)) {
+      const debits = new Map();
+      for (const debit of raw.debits.slice(0,256)) {
+        if (typeof debit.netId !== "string" || !Number.isFinite(debit.cost) || debit.cost <= 0) continue;
+        debits.set(debit.netId,(debits.get(debit.netId)||0)+debit.cost);
+      }
+      const total = [...debits.values()].reduce((sum,cost)=>sum+cost,0);
+      const payers = [...debits].map(([id,cost])=>({cell:session.cells.find(cell=>cell.alive&&cell.netId===id),cost}));
+      if (Math.abs(total-BlobPhysics.feedCost)>1e-6 || payers.some(({cell,cost})=>!cell||cell.mass-cost<.0000001)) continue;
+      owner = owner || payers[0]?.cell;
+      if (!owner) continue;
+      for (const {cell,cost} of payers) {cell.mass-=cost;cell.radius=radiusForMass(cell.mass);}
+    } else {
+      if (!owner || owner.mass <= BlobPhysics.minFeedMass) continue;
+      owner.mass -= BlobPhysics.feedCost;
+      owner.radius = radiusForMass(owner.mass);
+    }
     session.revision++;
     const target = Number.isFinite(raw.targetX) && Number.isFinite(raw.targetY)
       ? { x: number(raw.targetX, owner.x, 0, world.worldSize), y: number(raw.targetY, owner.y, 0, world.worldSize) } : null;
