@@ -33,7 +33,7 @@
     const speed = 2 * range / stopTime;
     return { x: cell.x + dir.x * offset, y: cell.y + dir.y * offset,
       vx: dir.x * speed, vy: dir.y * speed, dirX: dir.x, dirY: dir.y, targetX: target?.x, targetY: target?.y,
-      feedDrag: speed / stopTime, value: 2.2, r: 8 };
+      feedDrag: speed / stopTime, value: 22, r: 8 };
   }
   function moveFeed(body, dt, size) {
     const speed = Math.hypot(body.vx, body.vy);
@@ -54,5 +54,5 @@
     const t = lengthSquared ? clamp(((cell.x - previousX) * dx + (cell.y - previousY) * dy) / lengthSquared, 0, 1) : 0;
     return Math.hypot(cell.x - previousX - dx * t, cell.y - previousY - dy * t) < cell.radius + pellet.r * .5;
   }
-  return { radius, direction, moveBoost, moveFeed, createFeed, catchesFeed, feedCost: 2.5, minFeedMass: 20 };
+  return { radius, direction, moveBoost, moveFeed, createFeed, catchesFeed, feedCost: 25, feedValue: 22, minFeedMass: 25 };
 });

@@ -27,6 +27,8 @@ let botMassRevision = 0;
 let serverBotCounter = 0;
 let serverFallbackActive = false;
 let botRespawnBlockedUntil = 0;
+let targetBotTeams = 24;
+let botPieceCap = 96;
 
 const SERVER_BOT_NAMES = [
   "Alex", "Maya", "Jordan", "Sofia", "Ethan", "Chloe", "Noah", "Ava",
@@ -266,7 +268,12 @@ function addSharedEjected(session, additions) {
     session.revision++;
     const target = Number.isFinite(raw.targetX) && Number.isFinite(raw.targetY)
       ? { x: number(raw.targetX, owner.x, 0, world.worldSize), y: number(raw.targetY, owner.y, 0, world.worldSize) } : null;
-    const launch = BlobPhysics.createFeed(owner, target ? target.x - owner.x : number(raw.dirX, number(raw.vx)), target ? target.y - owner.y : number(raw.dirY, number(raw.vy)), target);
+    const source = {...owner};
+    if (Number.isFinite(raw.sourceX) && Number.isFinite(raw.sourceY) && Math.hypot(raw.sourceX-owner.x,raw.sourceY-owner.y) < owner.radius*2+150) {
+      source.x=raw.sourceX; source.y=raw.sourceY;
+      source.mass=number(raw.sourceMass,owner.mass,owner.mass,owner.mass+BlobPhysics.feedCost*80);
+    }
+    const launch = BlobPhysics.createFeed(source, target ? target.x - source.x : number(raw.dirX, number(raw.vx)), target ? target.y - source.y : number(raw.dirY, number(raw.vy)), target);
     world.ejected.push({
       ...launch,
       netId,
@@ -322,7 +329,7 @@ function simulateSharedEjected(dt) {
     for (const entry of playerEntries) {
       if (entry.session.id === pellet.ownerSessionId && entry.cell.netId === pellet.ownerCellId && now < pellet.ownerUntil) continue;
       if (!BlobPhysics.catchesFeed(entry.cell, pellet, previousX, previousY)) continue;
-      entry.cell.mass = safeMass(entry.cell.mass) + Math.max(.1, Math.min(3, safeMass(pellet.value)));
+      entry.cell.mass = safeMass(entry.cell.mass) + Math.max(.1, Math.min(BlobPhysics.feedValue, safeMass(pellet.value)));
       entry.cell.radius = radiusForMass(entry.cell.mass);
       entry.session.revision++;
       eaten = true;
@@ -331,7 +338,7 @@ function simulateSharedEjected(dt) {
     if (!eaten) {
       const bot = world.bots.find(candidate => candidate.alive && (candidate.netId !== pellet.ownerCellId || now >= pellet.ownerUntil) && BlobPhysics.catchesFeed(candidate, pellet, previousX, previousY));
       if (bot) {
-        bot.mass = safeMass(bot.mass) + Math.max(.1, Math.min(3, safeMass(pellet.value)));
+        bot.mass = safeMass(bot.mass) + Math.max(.1, Math.min(BlobPhysics.feedValue, safeMass(pellet.value)));
         bot.radius = radiusForMass(bot.mass);
         botChanged = true;
         eaten = true;
@@ -345,9 +352,10 @@ function simulateSharedEjected(dt) {
   return changed;
 }
 
-function splitServerBot(bot, target, burstPieces = 1) {
-  if (!world || !bot.alive || bot.mass < 44 || world.bots.length >= 96) return;
-  const pieces = Math.max(1, Math.min(burstPieces, 96 - world.bots.length));
+function splitServerBot(bot, target, burstPieces = 1, commanded = false) {
+  const limit = commanded ? Math.max(512,botPieceCap) : botPieceCap;
+  if (!world || !bot.alive || bot.mass < (commanded ? .000002 : 44) || world.bots.length >= limit) return;
+  const pieces = Math.max(1, Math.min(burstPieces, limit - world.bots.length));
   const pieceMass = bot.mass / (pieces + 1);
   if (target && pieces === 1 && pieceMass < target.mass * 1.18) return;
   bot.mass = pieceMass;
@@ -363,8 +371,8 @@ function splitServerBot(bot, target, burstPieces = 1) {
     const splitLineUntil = Date.now() + 900;
     bot.vx = dirX * 160;
     bot.vy = dirY * 160;
-    bot.launchX = dirX * targetLaunchSpeed;
-    bot.launchY = dirY * targetLaunchSpeed;
+    bot.launchX = 0;
+    bot.launchY = 0;
     bot.targetX = Math.max(0, Math.min(world.worldSize, bot.x + dirX * 1800));
     bot.targetY = Math.max(0, Math.min(world.worldSize, bot.y + dirY * 1800));
     bot.splitLineX = dirX;
@@ -383,8 +391,8 @@ function splitServerBot(bot, target, burstPieces = 1) {
       y: bot.y + Math.sin(angle) * bot.radius * 1.3,
       vx: target ? bot.vx : bot.vx,
       vy: target ? bot.vy : bot.vy,
-      launchX: target ? bot.launchX : Math.cos(angle) * launchSpeed,
-      launchY: target ? bot.launchY : Math.sin(angle) * launchSpeed,
+      launchX: Math.cos(angle) * launchSpeed,
+      launchY: Math.sin(angle) * launchSpeed,
       targetX: target ? bot.targetX : bot.x + Math.cos(angle) * 500,
       targetY: target ? bot.targetY : bot.y + Math.sin(angle) * 500,
       splitLineX: target ? bot.splitLineX : 0,
@@ -397,6 +405,14 @@ function splitServerBot(bot, target, burstPieces = 1) {
     };
     world.bots.push(child);
   }
+}
+
+function splitTeammate(session) {
+  const pieces=world.bots.filter(bot=>bot.alive&&(bot.botTeam||bot.name)===session.followedBotTeam);
+  if (pieces.length*2>256 || world.bots.length+pieces.length>Math.max(512,botPieceCap)) return "Bot split limit reached. Wait for the pieces to merge.";
+  for (const bot of pieces) splitServerBot(bot,{...session.cursor,mass:0},1,true);
+  botRevision++;
+  return null;
 }
 
 function serverBotShouldSplitFor(bot, prey, preyDistance) {
@@ -475,6 +491,12 @@ function resolveServerBotCollisions() {
           big.serverMergeAt = 0;
           small.alive = false;
         }
+        if (a.alive && b.alive && (now<a.serverMergeAt || now<b.serverMergeAt) && separation<a.radius+b.radius) {
+          const dx=separation ? (b.x-a.x)/separation : 1;
+          const dy=separation ? (b.y-a.y)/separation : 0;
+          const push=Math.min(30,(a.radius+b.radius-separation)*.2);
+          a.x-=dx*push;a.y-=dy*push;b.x+=dx*push;b.y+=dy*push;
+        }
         continue;
       }
       const big = a.mass >= b.mass ? a : b;
@@ -487,10 +509,7 @@ function resolveServerBotCollisions() {
 
 function simulateServerBots(dt) {
   if (!world) return false;
-  if (ownerIsDrivingWorld()) {
-    serverFallbackActive = false;
-    return false;
-  }
+  if (process.env.NODE_ENV === "test" && process.env.SPLITFLUX_TEST_WORLD === "1" && ownerIsDrivingWorld()) return false;
   if (!serverFallbackActive) {
     const now = Date.now();
     const teamCounts = new Map();
@@ -596,14 +615,14 @@ function simulateServerBots(dt) {
       candidate.alive && candidate.mass > 90 && distance(candidate, virus) < candidate.radius + virus.r * .65
     ));
     if (!bot) continue;
-    splitServerBot(bot, null, Math.min(6, 96 - world.bots.length));
+    splitServerBot(bot, null, Math.min(6, botPieceCap - world.bots.length));
     world.viruses.splice(index, 1);
   }
 
   resolveServerBotCollisions();
   resolveCollisions();
   const livingTeams = new Set(world.bots.filter(bot => bot.alive).map(bot => bot.botTeam));
-  if (Date.now() >= botRespawnBlockedUntil && livingTeams.size < 24 && world.bots.length < 64) spawnServerBot();
+  if (Date.now() >= botRespawnBlockedUntil && livingTeams.size < targetBotTeams && world.bots.length < botPieceCap) spawnServerBot();
   worldRevision++;
   botRevision++;
   return true;
@@ -728,6 +747,7 @@ const server = http.createServer(async (request, response) => {
       botActionIds: new Set(),
       feedIds: new Set(),
       teamedBots: new Set(),
+      teamRevision: 0,
       followedBotTeam: null,
       cursor: null,
       running: false,
@@ -812,18 +832,42 @@ const server = http.createServer(async (request, response) => {
         session.teamedBots.delete(team);
         if (session.followedBotTeam === team) session.followedBotTeam = null;
       }
-      sendJson(response, 200, { teamedBots: [...session.teamedBots], followedBotTeam: session.followedBotTeam });
+      session.teamRevision++;
+      sendJson(response, 200, { teamedBots: [...session.teamedBots], followedBotTeam: session.followedBotTeam, teamRevision:session.teamRevision });
     } catch { sendJson(response, 400, { error: "Invalid team request" }); }
     return;
   }
 
-  if (request.method === "POST" && ["/api/admin/ban", "/api/admin/paint-spikes"].includes(url.pathname)) {
+  if (request.method === "POST" && ["/api/admin/ban", "/api/admin/paint-spikes", "/api/admin/arena"].includes(url.pathname)) {
     try {
       const body = await readBody(request);
       const admin = sessions.get(String(body.id || ""));
       const account = accounts.fromRequest(request);
       if (!admin || admin.sessionKey !== body.sessionKey || !account?.isAdmin) { sendJson(response, 403, { error: "Admin access required" }); return; }
-      if (url.pathname.endsWith("/ban")) {
+      if (url.pathname.endsWith("/arena")) {
+        if (!world) { sendJson(response, 409, {error:"Start a round first."}); return; }
+        if (body.mapScale === 2 || body.mapScale === .5) {
+          const nextSize = number(world.worldSize * body.mapScale, world.worldSize, 5200, 1e9);
+          const scale = nextSize / world.worldSize;
+          for (const item of [...world.bots, ...world.viruses, ...world.ejected, ...activePlayerCells()]) {
+            item.x *= scale; item.y *= scale;
+            if (Number.isFinite(item.targetX)) item.targetX *= scale;
+            if (Number.isFinite(item.targetY)) item.targetY *= scale;
+          }
+          world.worldSize = nextSize;
+          for (const player of sessions.values()) player.revision++;
+        }
+        if ([24,48,96,192].includes(body.botCount)) {
+          targetBotTeams = body.botCount;
+          botPieceCap = Math.max(96, targetBotTeams * 2);
+          const teams = [...new Set(world.bots.map(bot=>bot.botTeam||bot.name))];
+          const keep = new Set(teams.slice(0,targetBotTeams));
+          world.bots = world.bots.filter(bot=>keep.has(bot.botTeam||bot.name)).slice(0,botPieceCap);
+        }
+        if (body.clearSpikes) world.viruses = [];
+        worldRevision++; botRevision++;
+        sendJson(response,200,{world, self:sessionView(admin), botRevision});
+      } else if (url.pathname.endsWith("/ban")) {
         const target = sessions.get(String(body.targetId || ""));
         const team = typeof body.botTeam === "string" ? body.botTeam : null;
         if (target) {
@@ -902,18 +946,17 @@ const server = http.createServer(async (request, response) => {
       if (bannedUntil) { stopBannedPlayer(session); sendJson(response, 403, {error:"You are banned from this arena.",bannedUntil}); return; }
       const wasRunning = session.running;
       session.running = Boolean(body.running);
-      if (!session.running) session.followedBotTeam = null;
       if (body.cursor && world) session.cursor = { x: number(body.cursor.x, 0, 0, world.worldSize), y: number(body.cursor.y, 0, 0, world.worldSize) };
       session.botFeeding = Boolean(body.botFeeding);
       if (typeof body.skin==="string" && body.skin.length<=60000 && (body.skin==="" || /^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(body.skin)) && body.skin!==session.skin) {
         session.skin=body.skin; session.skinVersion=(session.skinVersion||0)+1;
       }
+      let botSplitError=null;
       for (const id of (Array.isArray(body.botSplitCommands) ? body.botSplitCommands : []).slice(0, 8)) {
         if (typeof id !== "string" || id.length > 100 || session.botActionIds.has(id)) continue;
         session.botActionIds.add(id);
         if (!session.running || !session.followedBotTeam || !session.cursor || !world) continue;
-        for (const bot of [...world.bots].filter(bot => bot.alive && (bot.botTeam || bot.name) === session.followedBotTeam)) splitServerBot(bot, { ...session.cursor, mass:0 });
-        botRevision++;
+        botSplitError=splitTeammate(session)||botSplitError;
       }
       session.name = cleanText(body.name, "PLAYER", 14);
       session.color = /^#[0-9a-f]{6}$/i.test(body.color) ? body.color : "#55d6ff";
@@ -922,14 +965,15 @@ const server = http.createServer(async (request, response) => {
       if (number(body.ackRevision, 0, 0) >= session.revision) {
         session.cells = cleanCells(body.cells, session.name, 256);
       }
-      if (session.isAdmin && session.running && body.world && number(body.ackBotRevision, 0, 0) >= botRevision && number(body.ackBotMassRevision, 0, 0) >= botMassRevision) {
+      // Only isolated integration tests may inject a world fixture.
+      if (process.env.NODE_ENV === "test" && process.env.SPLITFLUX_TEST_WORLD === "1" && session.isAdmin && session.running && body.world && number(body.ackBotRevision, 0, 0) >= botRevision && number(body.ackBotMassRevision, 0, 0) >= botMassRevision) {
         const sharedEjected = world ? world.ejected : [];
         world = cleanWorld(body.world);
         world.bots = world.bots.filter(bot => !moderation.until([`bot:${bot.botTeam || bot.name}`]));
         world.ejected = sharedEjected;
       }
       // Map boundaries are independent of bot correction acknowledgements.
-      if (session.isAdmin && session.running && body.world && world) {
+      if (process.env.NODE_ENV === "test" && process.env.SPLITFLUX_TEST_WORLD === "1" && session.isAdmin && session.running && body.world && world) {
         world.worldSize = number(body.world.worldSize, world.worldSize, 5200, 1e9);
       }
       addSharedEjected(session, body.ejectedAdditions);
@@ -944,9 +988,11 @@ const server = http.createServer(async (request, response) => {
         isAdmin: session.isAdmin,
         acceptedFeedIds: (Array.isArray(body.ejectedAdditions) ? body.ejectedAdditions : []).filter(pellet => session.feedIds.has(pellet.netId)).map(pellet => pellet.netId),
         teamedBots: [...session.teamedBots],
+        teamRevision:session.teamRevision,
         followedBotTeam: session.followedBotTeam,
         botControllers: botControllers(),
         acceptedBotSplitCommands: (Array.isArray(body.botSplitCommands) ? body.botSplitCommands : []).filter(id => session.botActionIds.has(id)),
+        botSplitError,
         bannedBotTeams: moderation.bannedBotTeams(),
         players,
         playerCount: Math.max(1, activeCount),

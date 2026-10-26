@@ -22,6 +22,7 @@
   let skinSource = null;
   let networkSkin = "";
   let lastSentSkin = null;
+  let teamRevision = 0;
   function updateNetworkSkin() {
     if (skinSource === playerBlobImageData) return;
     skinSource = playerBlobImageData;
@@ -118,6 +119,9 @@
       dirY: pellet.dirY,
       targetX: pellet.targetX,
       targetY: pellet.targetY,
+      sourceX: pellet.sourceX,
+      sourceY: pellet.sourceY,
+      sourceMass: pellet.sourceMass,
       color: pellet.color,
     };
   }
@@ -202,15 +206,11 @@
     if (!preserveLocalMapSize) worldSize = Math.max(5200, Number(world.worldSize) || 5200);
     updateMapSizeLabel();
     if (Array.isArray(world.bots)) {
-      if (isAdmin) {
-        if (forceOwnerCorrection) bots = world.bots.map(bot => ({ ...normalizeNetworkCell(bot), isPlayer: false }));
-      } else {
         const currentBots = new Map(bots.map(bot => [bot.netId, bot]));
         bots = world.bots.map(bot => ({
           ...mergeNetworkCell(currentBots.get(bot.netId), bot),
           isPlayer: false,
         }));
-      }
     }
     if (Array.isArray(world.viruses)) viruses = world.viruses;
     if (Array.isArray(world.ejected)) {
@@ -241,6 +241,8 @@
           _serverConfirmed: true,
         };
         BlobPhysics.moveFeed(shared,networkDelay,worldSize);
+        // Keep the already animated trajectory; snapshots only confirm its lifetime.
+        if (current) for (const key of ["x","y","vx","vy","feedDrag"]) shared[key]=current[key];
         shared.drawX=current?(current.drawX??current.x):shared.x;
         shared.drawY=current?(current.drawY??current.y):shared.y;
         nextEjected.set(shared.netId, shared);
@@ -313,7 +315,7 @@
 
   function smoothNetworkEntities(dt) {
     remotePlayerCells.forEach(cell => smoothNetworkCell(cell, dt));
-    if (!isAdmin) bots.forEach(bot => smoothNetworkCell(bot, dt));
+    bots.forEach(bot => smoothNetworkCell(bot, dt));
   }
 
   function updateAdminAccess() {
@@ -388,6 +390,7 @@
     worldRevision = 0;
     botRevision = 0;
     botMassRevision = 0;
+    teamRevision = 0;
     forceMenuVersion = 0;
     pendingFeedCommands.clear();
     ejected = [];
@@ -432,13 +435,6 @@
           : [],
       };
       if (networkSkin!==lastSentSkin) payload.skin=networkSkin;
-      if (isAdmin && running) {
-        payload.world = {
-          worldSize,
-          bots: cellsForNetwork(bots.filter(bot => bot.alive)),
-          viruses,
-        };
-      }
       const sentMapSize = worldSize;
       const requestAt=performance.now();
       const response = await fetch("/api/state", {
@@ -460,12 +456,16 @@
       networkDelay=Math.min(.15,(performance.now()-requestAt)/2000);
       if (Object.hasOwn(payload,"skin")) lastSentSkin=payload.skin;
       (snapshot.acceptedBotSplitCommands||[]).forEach(id=>pendingBotSplitCommands.delete(id));
+      if (snapshot.botSplitError) showArenaError(new Error(snapshot.botSplitError));
       bannedBotTeams=new Set(snapshot.bannedBotTeams||[]);
       const acceptedFeedIds = new Set(snapshot.acceptedFeedIds || []);
       acceptedFeedIds.forEach(id => pendingFeedCommands.delete(id));
       ejected.forEach(pellet => { if (acceptedFeedIds.has(pellet.netId)) pellet._serverConfirmed = true; });
-      teamedBots = new Set(snapshot.teamedBots || []);
-      followedBotTeam = snapshot.followedBotTeam || null;
+      if ((snapshot.teamRevision||0)>=teamRevision) {
+        teamRevision=snapshot.teamRevision||0;
+        teamedBots = new Set(snapshot.teamedBots || []);
+        followedBotTeam = snapshot.followedBotTeam || null;
+      }
       botFollowTargets = new Map((snapshot.botControllers || []).map(entry => [entry.team, {x:entry.x,y:entry.y}]));
       if (!accountBusy && (session.isAdmin !== snapshot.isAdmin || JSON.stringify(session.account) !== JSON.stringify(snapshot.account))) {
         session.isAdmin = snapshot.isAdmin;
@@ -505,13 +505,9 @@
   }
 
   update = function multiplayerUpdate(dt) {
-    if (!connected || isAdmin) {
-      baseUpdate(dt);
-      smoothNetworkEntities(dt);
-      return;
-    }
     if (!running) return;
     updatePlayer(dt);
+    handleViruses();
     playerCells.filter(cell => cell.alive).forEach(eatFood);
     updateEjected(dt);
     updateParticles(dt);
@@ -568,8 +564,9 @@
     if (!session) throw new Error("Not connected");
     const response = await fetch("/api/team", { method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id: session.id, sessionKey: session.sessionKey, team, enabled }) });
-    if (!response.ok) throw new Error("Team request failed");
     const result = await response.json();
+    if (!response.ok) throw new Error(result.error||"Team request failed");
+    teamRevision=result.teamRevision||0;
     teamedBots = new Set(result.teamedBots);
     followedBotTeam=result.followedBotTeam||null;
   };
@@ -594,6 +591,19 @@
   window.paintSpikesOnline=async(points)=>{
     const result=await adminCommand("paint-spikes",{points});
     viruses=result.viruses;
+    return result;
+  };
+  window.configureArenaOnline=async(command)=>{
+    const result=await adminCommand("arena",command);
+    const oldSize=worldSize;
+    applyWorld(result.world,true);
+    if (worldSize!==oldSize) {
+      const scale=worldSize/oldSize;
+      food.forEach(dot=>{dot.x*=scale;dot.y*=scale;});
+      playerCells.forEach(cell=>{cell.x*=scale;cell.y*=scale;});
+      camera.x*=scale;camera.y*=scale;
+      saveMapSizePreference(worldSize);
+    }
     return result;
   };
 

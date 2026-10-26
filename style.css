@@ -109,7 +109,11 @@ h2 { font-size: 48px; }
 .physics-credit a { color: var(--lime); }
 .account-actions button { justify-content: center; background: #394352; color: var(--text); font-size: 11px; }
 .account-actions button[hidden] { display: none; }
-.bot-team-menu { position: fixed; z-index: 9; top: 80px; left: 20px; width: min(280px, calc(100vw - 40px)); padding: 16px; border: 1px solid var(--lime); background: #0a0e15; }
+.bot-team-menu { position: fixed; z-index: 22; top: 120px; left: 20px; width: min(280px, calc(100vw - 40px)); padding: 16px; border: 1px solid var(--lime); background: #0a0e15; }
+.arena-tool { position: fixed; z-index: 23; top: 72px; left: 50%; transform: translateX(-50%); max-width: calc(100vw - 160px); padding: 10px; background: #0a0e15; border: 1px solid var(--lime); font-size: 12px; }
+.arena-tool.hidden { display: none; }
+.arena-tool button { display: inline-flex; width: auto; margin-left: 12px; padding: 6px; }
+.leaderboard li button { width: 100%; display: flex; justify-content: space-between; padding: 0; background: transparent; color: inherit; border: 0; font: inherit; }
 .bot-team-menu.hidden { display: none; }
 .bot-team-menu button { margin-top: 10px; justify-content: center; }
 .bot-team-menu p { font-size: 12px; color: var(--muted); }

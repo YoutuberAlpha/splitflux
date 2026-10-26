@@ -354,8 +354,10 @@ function resetGame() {
   food = Array.from({ length: FOOD_COUNT }, makeFood);
   particles = [];
   ejected = [];
-  viruses = Array.from({ length: VIRUS_COUNT }, makeVirus);
-  createInitialBots();
+  if (!onlineMode) {
+    viruses = Array.from({ length: VIRUS_COUNT }, makeVirus);
+    createInitialBots();
+  }
   player = makeCell((ui.name.value.trim() || "NOVA").toUpperCase(), true);
   const playerSpawn = findSafeSpawn(player.radius, [...bots, ...remotePlayerCells], 500);
   player.x = playerSpawn.x;
@@ -396,6 +398,7 @@ function spawnBot(name) {
 }
 
 function maintainBotPopulation(dt) {
+  if (onlineMode) return;
   bots = bots.filter(bot => bot.alive);
   if (performance.now() < botRespawnPausedUntil) return;
   botSpawnTimer -= dt;
@@ -420,6 +423,10 @@ function currentBotModeSettings() {
 }
 
 function trimBotsToCurrentMode() {
+  if (onlineMode) {
+    window.configureArenaOnline?.({botCount:currentBotModeSettings().targetTeams}).catch(showArenaError);
+    return;
+  }
   const { targetTeams, pieceCap } = currentBotModeSettings();
   const teams = new Map();
   bots.filter(bot => bot.alive).forEach((bot, index) => {
@@ -681,6 +688,7 @@ function feedMass() {
     cell.radius = radiusForMass(cell.mass);
     const pellet = { ...BlobPhysics.createFeed(cell, target.x - cell.x, target.y - cell.y, target),
       netId: `feed-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`,
+      sourceX:cell.x,sourceY:cell.y,sourceMass:cell.mass,
       color: cell.color, ownerUntil: performance.now() + 700, createdAt: performance.now(), ownerCellId: cell.netId };
     pellet.startX = pellet.x;
     pellet.startY = pellet.y;
@@ -777,7 +785,7 @@ function handleViruses() {
         break;
       }
     }
-    if (!consumed) {
+    if (!consumed && !onlineMode) {
       for (const bot of bots.filter(c => c.alive)) {
         if (distance(bot, virus) < bot.radius + virus.r * .65 && bot.mass > 90) {
           burstBotCell(bot);
@@ -1026,7 +1034,7 @@ function updateEjected(dt) {
     if (onlineMode) continue;
     const eater = cells.find(c => BlobPhysics.catchesFeed(c, pellet, pellet.previousX, pellet.previousY) && (c.netId !== pellet.ownerCellId || performance.now() > pellet.ownerUntil));
     if (eater) {
-      eater.mass = safeMass(eater.mass) + clamp(safeMass(pellet.value), .1, 3);
+      eater.mass = safeMass(eater.mass) + clamp(safeMass(pellet.value), .1, BlobPhysics.feedValue);
       eater.radius = radiusForMass(eater.mass);
       emit(pellet.x, pellet.y, pellet.color, 4);
       ejected.splice(i, 1);
@@ -1094,6 +1102,9 @@ function endGame() {
 
 function returnToMainMenu() {
   running = false;
+  keys.KeyR=false;
+  setSpikePainter(false);
+  document.querySelector("#botTeamMenu").classList.add("hidden");
   gameOver = false;
   ui.admin.classList.add("hidden");
   ui.death.classList.add("hidden");
@@ -1189,13 +1200,11 @@ function drawFood(dot, time) {
 function drawEjected(pellet) {
   const s = worldToScreen(pellet.drawX ?? pellet.x, pellet.drawY ?? pellet.y);
   const r = pellet.r * camera.zoom;
+  if (s.x < -r || s.y < -r || s.x > width+r || s.y > height+r) return;
   ctx.fillStyle = pellet.color;
-  ctx.shadowBlur = efficientGraphics ? 0 : 12;
-  ctx.shadowColor = pellet.color;
   ctx.beginPath();
   ctx.arc(s.x, s.y, Math.max(2, r), 0, Math.PI * 2);
   ctx.fill();
-  ctx.shadowBlur = 0;
 }
 
 function drawVirus(virus) {
@@ -1322,12 +1331,18 @@ function updateUI() {
   ui.score.textContent = score.toLocaleString();
   ui.mass.textContent = Math.round(totalMass);
   ui.rank.textContent = `#${rank}`;
-  document.querySelector("#leaderboard").classList.toggle("moderating", isAdmin);
+  document.querySelector("#leaderboard").classList.toggle("moderating", running);
   ui.list.replaceChildren(...standings.slice(0,8).map(cell => {
     const row=document.createElement("li"), name=document.createElement("span"), mass=document.createElement("strong");
     row.className=cell.isPlayer?"player":"";
     name.textContent=cell.name; mass.textContent=Math.round(cell.mass); row.append(name,mass);
-    if (isAdmin && !cell.isPlayer) row.addEventListener("click",()=>showModeration(cell));
+    if (running && !cell.isPlayer && (!cell.isRemote || isAdmin)) {
+      const button=document.createElement("button");button.type="button";
+      button.append(name,mass);row.replaceChildren(button);
+      const open=()=>cell.isRemote?showModeration(cell):showBotTeam(cell);
+      button.addEventListener("pointerdown",event=>{event.preventDefault();open();});
+      button.addEventListener("click",event=>{if(event.detail===0)open();});
+    }
     return row;
   }));
   document.querySelector("#botCount").textContent = `${bots.filter(bot => bot.alive).length} BOTS`;
@@ -1392,18 +1407,34 @@ document.querySelector("#confirmBan").addEventListener("click",async()=>{
     message.textContent="Ban applied.";
   } catch(error) {message.textContent=error.message;} finally {button.disabled=false;}
 });
-document.querySelector("#spikePainter").addEventListener("click",()=>{
-  if (!isAdmin) return;
-  spikePainter=!spikePainter;
+function showArenaError(error) {
+  document.querySelector("#arenaTool").classList.remove("hidden");
+  document.querySelector("#arenaToolMessage").textContent=error.message||String(error);
+}
+function setSpikePainter(enabled) {
+  spikePainter=Boolean(enabled&&isAdmin&&running);
+  spikePainting=false;
   document.querySelector("#spikePainter").textContent=`SPIKE PAINTER: ${spikePainter?"ON":"OFF"}`;
   canvas.style.cursor=spikePainter?"cell":"crosshair";
+  document.querySelector("#arenaTool").classList.toggle("hidden",!spikePainter);
+  document.querySelector("#arenaToolMessage").textContent="Paint mode: click or drag on empty map space.";
+  if (spikePainter) {ui.admin.classList.add("hidden");document.querySelector("#botTeamMenu").classList.add("hidden");}
+}
+document.querySelector("#stopPainting").addEventListener("click",()=>setSpikePainter(false));
+document.querySelector("#spikePainter").addEventListener("click",()=>{
+  setSpikePainter(!spikePainter);
 });
+let paintRequestPending=false;
 function paintSpike(event) {
-  if (!spikePainter||!isAdmin||!running||performance.now()-lastPaintAt<80) return;
+  if (!spikePainter||!isAdmin||!running||paintRequestPending||performance.now()-lastPaintAt<80) return;
   lastPaintAt=performance.now();
   const point={x:clamp(camera.x+(event.clientX-width/2)/camera.zoom,42,worldSize-42),y:clamp(camera.y+(event.clientY-height/2)/camera.zoom,42,worldSize-42)};
-  if (viruses.length>=200||viruses.some(virus=>Math.hypot(virus.x-point.x,virus.y-point.y)<84)) return;
-  if (onlineMode) window.paintSpikesOnline([point]).catch(error=>{document.querySelector("#moderationMessage").textContent=error.message;});
+  if (viruses.length>=200) {showArenaError(new Error("Spike limit reached (200). Remove spikes before painting more."));return;}
+  if (viruses.some(virus=>Math.hypot(virus.x-point.x,virus.y-point.y)<84)) {showArenaError(new Error("Move farther from the existing spike."));return;}
+  if (onlineMode) {
+    paintRequestPending=true;
+    window.paintSpikesOnline([point]).then(result=>{document.querySelector("#arenaToolMessage").textContent=result.added?"Spike added. Keep clicking or dragging to paint.":"No spike added. Choose clear map space.";}).catch(showArenaError).finally(()=>{paintRequestPending=false;});
+  }
   else viruses.push({...point,r:42,angle:0});
 }
 canvas.addEventListener("pointerdown",event=>{
@@ -1414,7 +1445,7 @@ canvas.addEventListener("pointermove",event=>{if(spikePainting)paintSpike(event)
 canvas.addEventListener("pointerup",()=>{spikePainting=false;});
 canvas.addEventListener("pointercancel",()=>{spikePainting=false;});
 document.querySelector("#playButton").addEventListener("click", resetGame);
-canvas.addEventListener("click", event => {
+canvas.addEventListener("pointerdown", event => {
   if (!running || spikePainter) return;
   const x = camera.x + (event.clientX - width / 2) / camera.zoom;
   const y = camera.y + (event.clientY - height / 2) / camera.zoom;
@@ -1423,19 +1454,25 @@ canvas.addEventListener("click", event => {
   const bot = [...bots].reverse().find(cell => cell.alive && Math.hypot(cell.x - x, cell.y - y) <= cell.radius);
   const menu = document.querySelector("#botTeamMenu");
   if (!bot) { menu.classList.add("hidden"); return; }
+  showBotTeam(bot);
+});
+function showBotTeam(bot) {
+  if (!running || !bot || !bot.alive) return;
+  setSpikePainter(false);
   selectedTeamBot = bot.botTeam || bot.name;
   document.querySelector("#botTeamMessage").textContent = teamedBots.has(selectedTeamBot) ? "Teammate: this bot cannot eat your last blob." : "A teammate cannot eat your last blob.";
   document.querySelector("#botTeamName").textContent = bot.name;
   document.querySelector("#botTeamToggle").textContent = teamedBots.has(selectedTeamBot) ? "STOP TEAMING" : "TEAM WITH BOT";
   document.querySelector("#botBanOptions").hidden = !isAdmin;
-  menu.classList.remove("hidden");
-});
+  document.querySelector("#botTeamMenu").classList.remove("hidden");
+}
 document.querySelector("#closeBotTeam").addEventListener("click", () => document.querySelector("#botTeamMenu").classList.add("hidden"));
-document.querySelector("#botTeamToggle").addEventListener("click", async () => {
+async function toggleSelectedBotTeam() {
   if (!selectedTeamBot || !running) return;
   const team = selectedTeamBot;
   const enabled = !teamedBots.has(team);
   const button = document.querySelector("#botTeamToggle");
+  if (button.disabled) return;
   button.disabled = true;
   try {
     if (onlineMode) await window.setBotTeamOnline(team, enabled);
@@ -1443,9 +1480,10 @@ document.querySelector("#botTeamToggle").addEventListener("click", async () => {
     else { teamedBots.delete(team); followedBotTeam=null; }
     button.textContent = enabled ? "STOP TEAMING" : "TEAM WITH BOT";
     document.querySelector("#botTeamMessage").textContent = enabled ? "Following cursor. Hold R: bot feed. Press 1: bot split. Your last blob is protected." : "No longer teaming.";
-  } catch { document.querySelector("#botTeamMessage").textContent = "Could not update team. Try again."; }
+  } catch(error) { document.querySelector("#botTeamMessage").textContent = error.message||"Could not update team. Try again."; }
   finally { button.disabled = false; }
-});
+}
+document.querySelector("#botTeamToggle").addEventListener("click", toggleSelectedBotTeam);
 document.querySelector("#restartButton").addEventListener("click", resetGame);
 document.querySelector("#adminShortcut").addEventListener("pointerdown", event => {
   event.preventDefault();
@@ -1506,6 +1544,19 @@ addEventListener("wheel", e => {
 }, { passive: false });
 addEventListener("keydown", e => {
   if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLSelectElement) return;
+  if (e.code === "KeyT" && !e.repeat && running) {
+    e.preventDefault();
+    if (followedBotTeam && teamedBots.has(followedBotTeam)) {
+      showBotTeam({name:followedBotTeam,botTeam:followedBotTeam,alive:true});
+    } else {
+      const target=cursorWorldPosition();
+      const bot=[...bots].reverse().find(cell=>cell.alive&&Math.hypot(cell.x-target.x,cell.y-target.y)<=cell.radius+8/camera.zoom);
+      if (!bot) {showArenaError(new Error("Point at a bot and press T to team with it."));return;}
+      showBotTeam(bot);
+    }
+    toggleSelectedBotTeam();
+    return;
+  }
   if (e.code === "KeyP" && !e.repeat) {
     if (running) {
       e.preventDefault();
@@ -1649,6 +1700,7 @@ function dividePlayer(divisor) {
 
 function removeAllSpikes() {
   if (!isAdmin) return;
+  if (onlineMode) { window.configureArenaOnline({clearSpikes:true}).catch(showArenaError); return; }
   viruses = [];
 }
 
@@ -1659,6 +1711,7 @@ function killEveryone() {
 
 function doubleMapSize() {
   if (!isAdmin) return;
+  if (onlineMode) { window.configureArenaOnline({mapScale:2}).catch(showArenaError); return; }
   const oldSize = worldSize;
   const nextSize = worldSize * 2;
   const scale = nextSize / oldSize;
@@ -1688,6 +1741,7 @@ function doubleMapSize() {
 
 function halveMapSize() {
   if (!isAdmin) return;
+  if (onlineMode) { window.configureArenaOnline({mapScale:.5}).catch(showArenaError); return; }
   const oldSize = worldSize;
   worldSize = Math.max(5200, worldSize / 2);
   const clampToWorld = cell => {
@@ -1917,7 +1971,8 @@ document.querySelectorAll("[data-mobile-action]").forEach(button => {
     if (action) action();
   });
 });
-addEventListener("blur", stopMobileFeed);
+function releaseHeldActions() {stopMobileFeed();keys.KeyR=false;spikePainting=false;}
+addEventListener("blur", releaseHeldActions);
 document.addEventListener("visibilitychange", () => {
-  if (document.hidden) stopMobileFeed();
+  if (document.hidden) releaseHeldActions();
 });
