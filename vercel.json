@@ -7,7 +7,7 @@
   "functions": {
     "api/index.js": {
       "maxDuration": 30,
-      "includeFiles": "{server.cjs,accounts.cjs,moderation.cjs,physics.js}"
+      "includeFiles": "{server.cjs,accounts.cjs,moderation.cjs,physics.js,feeding.js}"
     }
   },
   "rewrites": [

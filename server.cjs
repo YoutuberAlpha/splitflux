@@ -49,6 +49,7 @@ const files = {
   "/style.css": ["style.css", "text/css; charset=utf-8"],
   "/game.js": ["game.js", "text/javascript; charset=utf-8"],
   "/physics.js": ["physics.js", "text/javascript; charset=utf-8"],
+  "/feeding.js": ["feeding.js", "text/javascript; charset=utf-8"],
   "/THIRD-PARTY-NOTICES.txt": ["THIRD-PARTY-NOTICES.txt", "text/plain; charset=utf-8"],
   "/licenses/MultiOgar-LICENSE.md": ["licenses/MultiOgar-LICENSE.md", "text/plain; charset=utf-8"],
   "/licenses/agar-io-clone-LICENSE.txt": ["licenses/agar-io-clone-LICENSE.txt", "text/plain; charset=utf-8"],
@@ -246,7 +247,7 @@ function simulateBotFeeding() {
       if (bot.mass <= BlobPhysics.minFeedMass || world.ejected.length >= 700) continue;
       bot.mass -= BlobPhysics.feedCost;
       bot.radius = radiusForMass(bot.mass);
-      const pellet = BlobPhysics.createFeed(bot, session.cursor.x - bot.x, session.cursor.y - bot.y, session.cursor);
+      const pellet = BlobPhysics.createFeed(bot, session.cursor.x - bot.x, session.cursor.y - bot.y, session.cursor,world.worldSize);
       world.ejected.push({ ...pellet, netId: crypto.randomUUID(), color: bot.color, ownerCellId: bot.netId, ownerUntil: now + 700, createdAt: now });
       botMassRevision++;
       worldRevision++;
@@ -288,7 +289,7 @@ function addSharedEjected(session, additions) {
       source.x=raw.sourceX; source.y=raw.sourceY;
       source.mass=number(raw.sourceMass,owner.mass,owner.mass,owner.mass+BlobPhysics.feedCost*80);
     }
-    const launch = BlobPhysics.createFeed(source, target ? target.x - source.x : number(raw.dirX, number(raw.vx)), target ? target.y - source.y : number(raw.dirY, number(raw.vy)), target);
+    const launch = BlobPhysics.createFeed(source, target ? target.x - source.x : number(raw.dirX, number(raw.vx)), target ? target.y - source.y : number(raw.dirY, number(raw.vy)), target,world.worldSize);
     world.ejected.push({
       ...launch,
       netId,
@@ -643,6 +644,46 @@ function simulateServerBots(dt) {
   return true;
 }
 
+function acceptClientCells(session, rawCells, ackRevision) {
+  const incoming=cleanCells(rawCells,session.name,256);
+  if (ackRevision>=session.revision) return incoming;
+  if (session.lastReplyCells && ackRevision>=session.lastReplyRevision) {
+    const current=new Map(session.cells.map(cell=>[cell.netId,cell]));
+    const raw=new Map((Array.isArray(rawCells)?rawCells:[]).map(cell=>[cell.netId,cell]));
+    // Intake since the acknowledged reply must not discard newer movement or splits.
+    for (const previous of session.lastReplyCells) {
+      const serverCell=current.get(previous.netId);
+      const delta=(serverCell?.alive?serverCell.mass:0)-previous.mass;
+      if (!delta) continue;
+      const weights=incoming.map(cell=>number(raw.get(cell.netId)?.massOrigins?.[previous.netId],cell.netId===previous.netId?1:0,0,1));
+      const total=weights.reduce((sum,weight)=>sum+weight,0);
+      for (let i=0;i<incoming.length;i++) {
+        incoming[i].mass+=delta*weights[i]/Math.max(1,total);
+      }
+    }
+    for(const cell of incoming) {
+      cell.alive=cell.alive&&cell.mass>.000001;
+      cell.mass=Math.max(.000001,cell.mass);cell.radius=radiusForMass(cell.mass);
+    }
+    return incoming;
+  }
+  // A lost reply needs a fresh acknowledgement, but movement can still advance safely.
+  const positions=new Map(incoming.map(cell=>[cell.netId,cell]));
+  return session.cells.map(cell=>{
+    const pose=positions.get(cell.netId);
+    return pose?{...cell,x:pose.x,y:pose.y,vx:pose.vx,vy:pose.vy}:cell;
+  });
+}
+
+function collisionDistance(a,b,now) {
+  const ax=a._moveUntil>now?a._moveFromX:a.x, ay=a._moveUntil>now?a._moveFromY:a.y;
+  const bx=b._moveUntil>now?b._moveFromX:b.x, by=b._moveUntil>now?b._moveFromY:b.y;
+  const x=ax-bx,y=ay-by,dx=(a.x-b.x)-x,dy=(a.y-b.y)-y;
+  const length=dx*dx+dy*dy;
+  const t=length?Math.max(0,Math.min(1,-(x*dx+y*dy)/length)):0;
+  return Math.hypot(x+dx*t,y+dy*t);
+}
+
 function resolveCollisions() {
   const active = [...sessions.values()].filter(session => session.running);
   const now = Date.now();
@@ -653,7 +694,7 @@ function resolveCollisions() {
         if (!a.alive || !b.alive) continue;
         const big = a.mass >= b.mass ? a : b;
         const small = big === a ? b : a;
-        if (big.mass > small.mass * 1.18 && distance(big, small) < big.radius - small.radius * 0.28) {
+        if (big.mass > small.mass * 1.18 && collisionDistance(big, small,now) < big.radius - small.radius * 0.28) {
           consume(big, small);
           active[i].revision++;
           active[j].revision++;
@@ -673,7 +714,7 @@ function resolveCollisions() {
         const small = big === cell ? bot : cell;
         if (small === cell && session.immune) continue;
         if (small === cell && session.teamedBots.has(bot.botTeam || bot.name) && session.cells.filter(candidate => candidate.alive).length <= 1) continue;
-        if (big.mass > small.mass * 1.18 && distance(big, small) < big.radius - small.radius * 0.28) {
+        if (big.mass > small.mass * 1.18 && collisionDistance(big, small,now) < big.radius - small.radius * 0.28) {
           consume(big, small);
           session.revision++;
           worldRevision++;
@@ -959,6 +1000,7 @@ const handleRequest = async (request, response) => {
         sendJson(response, 401, { error: "Session expired" });
         return;
       }
+      const previousSeen = session.lastSeen;
       session.lastSeen = Date.now();
       session.account = accounts.fromRequest(request);
       session.isAdmin = Boolean(session.account && session.account.isAdmin);
@@ -982,8 +1024,14 @@ const handleRequest = async (request, response) => {
       session.color = /^#[0-9a-f]{6}$/i.test(body.color) ? body.color : "#55d6ff";
       session.score = number(body.score, 0, 0, 1e15);
       session.immune = session.isAdmin && Boolean(body.immune);
-      if (number(body.ackRevision, 0, 0) >= session.revision) {
-        session.cells = cleanCells(body.cells, session.name, 256);
+      {
+        const previous = new Map(session.cells.map(cell=>[cell.netId,cell]));
+        session.cells = acceptClientCells(session,body.cells,number(body.ackRevision,0,0));
+        if (wasRunning && session.lastSeen-previousSeen<400) for (const cell of session.cells) {
+          const old=previous.get(cell.netId);
+          if (!old || Math.hypot(cell.x-old.x,cell.y-old.y)>Math.max(1600,old.radius*3)) continue;
+          cell._moveFromX=old.x;cell._moveFromY=old.y;cell._moveUntil=session.lastSeen+80;
+        }
       }
       // Only isolated integration tests may inject a world fixture.
       if (process.env.NODE_ENV === "test" && process.env.SPLITFLUX_TEST_WORLD === "1" && session.isAdmin && session.running && body.world && number(body.ackBotRevision, 0, 0) >= botRevision && number(body.ackBotMassRevision, 0, 0) >= botMassRevision) {
@@ -997,11 +1045,14 @@ const handleRequest = async (request, response) => {
         world.worldSize = number(body.world.worldSize, world.worldSize, 5200, 1e9);
       }
       addSharedEjected(session, body.ejectedAdditions);
+      simulateSharedEjected(0);
       if (!wasRunning && session.running) ensureSafeOnlineSpawn(session);
       resolveCollisions();
 
       const players = [...sessions.values()].filter(other => other.id !== session.id).map(sessionView);
       const activeCount = [...sessions.values()].filter(other => other.running).length;
+      session.lastReplyCells=session.cells.filter(cell=>cell.alive).map(cell=>({netId:cell.netId,mass:cell.mass}));
+      session.lastReplyRevision=session.revision;
       sendJson(response, 200, {
         self: sessionView(session),
         account: session.account,
@@ -1064,6 +1115,7 @@ function tickArena(dt) {
   simulateSharedEjected(dt);
   simulateBotFeeding();
   simulateServerBots(dt);
+  resolveCollisions();
   if (world) {
     const before=world.bots.length;
     world.bots=world.bots.filter(bot=>!moderation.until([`bot:${bot.botTeam||bot.name}`]));

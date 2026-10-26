@@ -1,13 +1,12 @@
 /* Split boost decay adapted from MultiOgar Cell.move (Apache-2.0).
  * Copyright 2015 Devin Ryan; Barbosik and MultiOgar contributors.
- * Feed braking adapted from owenashurst/agar.io-clone MassFood.move (MIT).
- * Copyright (c) 2015 Huy Tran; agar.io-clone contributors.
+ * Feeding is implemented separately in feeding.js.
  * Adapted for elapsed seconds and SPLITFLUX units; see THIRD-PARTY-NOTICES.txt.
  */
 (function (root, factory) {
-  if (typeof module === "object" && module.exports) module.exports = factory();
-  else root.BlobPhysics = factory();
-})(typeof globalThis !== "undefined" ? globalThis : this, function () {
+  if (typeof module === "object" && module.exports) module.exports = factory(require("./feeding.js"));
+  else root.BlobPhysics = factory(root.FeedPhysics);
+})(typeof globalThis !== "undefined" ? globalThis : this, function (feeding) {
   const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
   const launchDecay = -Math.log(.9) / .04;
   function radius(mass) { return Math.sqrt(Math.max(.000001, Number(mass) || .000001)) * 4.2 + 8; }
@@ -24,35 +23,11 @@
     body[fieldX] *= damping;
     body[fieldY] *= damping;
   }
-  function createFeed(cell, x, y, target) {
-    const dir = direction(x, y), r = radius(cell.mass);
-    const targetDistance = target ? Math.hypot(target.x - cell.x, target.y - cell.y) : Infinity;
-    const offset = Math.min(r + 10, targetDistance);
-    const range = target ? Math.max(0, targetDistance - offset) : clamp(100 + r * .65, 120, 360);
-    const stopTime = .45;
-    const speed = 2 * range / stopTime;
-    return { x: cell.x + dir.x * offset, y: cell.y + dir.y * offset,
-      vx: dir.x * speed, vy: dir.y * speed, dirX: dir.x, dirY: dir.y, targetX: target?.x, targetY: target?.y,
-      feedDrag: speed / stopTime, value: 22, r: 8 };
-  }
-  function moveFeed(body, dt, size) {
-    const speed = Math.hypot(body.vx, body.vy);
-    if (!speed) return;
-    const drag = Number.isFinite(body.feedDrag) && body.feedDrag > 0 ? body.feedDrag : speed / .45;
-    body.feedDrag = drag;
-    const elapsed = Math.min(Math.max(0, dt), speed / drag);
-    const travel = speed * elapsed - .5 * drag * elapsed * elapsed;
-    const min = Math.min(body.r, size / 2), max = Math.max(min, size - body.r);
-    body.x = clamp(body.x + body.vx / speed * travel, min, max);
-    body.y = clamp(body.y + body.vy / speed * travel, min, max);
-    const remaining = Math.max(0, speed - drag * elapsed);
-    body.vx *= remaining / speed;
-    body.vy *= remaining / speed;
-  }
   function catchesFeed(cell, pellet, previousX = pellet.x, previousY = pellet.y) {
     const dx = pellet.x - previousX, dy = pellet.y - previousY, lengthSquared = dx * dx + dy * dy;
     const t = lengthSquared ? clamp(((cell.x - previousX) * dx + (cell.y - previousY) * dy) / lengthSquared, 0, 1) : 0;
     return Math.hypot(cell.x - previousX - dx * t, cell.y - previousY - dy * t) < cell.radius + pellet.r * .5;
   }
-  return { radius, direction, moveBoost, moveFeed, createFeed, catchesFeed, feedCost: 25, feedValue: 22, minFeedMass: 25 };
+  return { radius, direction, moveBoost, moveFeed:feeding.move, createFeed:feeding.create, catchesFeed,
+    feedCost:feeding.cost, feedValue:feeding.value, minFeedMass:feeding.minimumMass, feeding };
 });

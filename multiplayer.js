@@ -57,6 +57,7 @@
       vx: cell.vx,
       vy: cell.vy,
       mass,
+      massOrigins: { ...(cell._syncMassWeights || { [cell.netId]: 1 }) },
       radius: radiusForMass(mass),
       color: cell.color,
       accent: cell.accent,
@@ -270,7 +271,9 @@
         };
         BlobPhysics.moveFeed(shared,networkDelay,worldSize);
         // Keep the already animated trajectory; snapshots only confirm its lifetime.
-        if (current) for (const key of ["x","y","vx","vy","feedDrag"]) shared[key]=current[key];
+        if (current) for (const key of [...BlobPhysics.feeding.motionFields,"feedDrag"]) {
+          if (current[key] !== undefined) shared[key]=current[key];
+        }
         shared.drawX=current?(current.drawX??current.x):shared.x;
         shared.drawY=current?(current.drawY??current.y):shared.y;
         nextEjected.set(shared.netId, shared);
@@ -337,7 +340,7 @@
     const sizeEase = 1 - Math.exp(-dt * 11);
     const samples = cell._netSamples;
     if (samples?.length > 1) {
-      const renderTime = performance.now()-Math.max(90,Math.min(500,cell._netSpacing*1.2));
+      const renderTime = performance.now()-Math.max(70,Math.min(150,cell._netSpacing*1.2));
       let before=samples[0], after=samples[samples.length-1];
       for (let i=1;i<samples.length;i++) {
         if(samples[i].time>=renderTime){before=samples[i-1];after=samples[i];break;}
@@ -345,7 +348,7 @@
       }
       const span=after.time-before.time;
       const blend=span>0?Math.max(0,Math.min(1,(renderTime-before.time)/span)):1;
-      const ahead=Math.max(0,Math.min(.1,(renderTime-after.time)/1000));
+      const ahead=Math.max(0,Math.min(.2,(renderTime-after.time)/1000));
       cell.x=before.x+(after.x-before.x)*blend+(Number(cell.vx)||0)*ahead;
       cell.y=before.y+(after.y-before.y)*blend+(Number(cell.vy)||0)*ahead;
     } else {

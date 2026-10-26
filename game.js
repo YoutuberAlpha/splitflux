@@ -502,7 +502,7 @@ function updatePlayer(dt) {
       if (!bot.netId) bot.netId = `bot-${Math.random().toString(36).slice(2)}`;
       bot.mass -= BlobPhysics.feedCost;
       bot.radius = radiusForMass(bot.mass);
-      ejected.push({ ...BlobPhysics.createFeed(bot,target.x-bot.x,target.y-bot.y,target),color:bot.color,ownerCellId:bot.netId,ownerUntil:performance.now()+700,createdAt:performance.now() });
+      ejected.push({ ...BlobPhysics.createFeed(bot,target.x-bot.x,target.y-bot.y,target,worldSize),color:bot.color,ownerCellId:bot.netId,ownerUntil:performance.now()+700,createdAt:performance.now() });
     }
   }
   separatePlayerCells();
@@ -698,14 +698,16 @@ function squareSplitPlayer() {
 
 function feedMass() {
   if (!running || feedCooldown > 0) return;
+  if (onlineMode && pendingFeedCommands.size >= BlobPhysics.feeding.maxPending || ejected.length >= 700) return;
   const target = cursorWorldPosition();
   let fed = false;
   for (const cell of playerCells.filter(c => c.alive)) {
+    if (onlineMode && pendingFeedCommands.size >= BlobPhysics.feeding.maxPending) break;
     if (cell.mass <= BlobPhysics.minFeedMass) continue;
     if (!cell.netId) cell.netId = `local-feed-owner-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`;
     cell.mass -= BlobPhysics.feedCost;
     cell.radius = radiusForMass(cell.mass);
-    const pellet = { ...BlobPhysics.createFeed(cell, target.x - cell.x, target.y - cell.y, target),
+    const pellet = { ...BlobPhysics.createFeed(cell, target.x - cell.x, target.y - cell.y, target, worldSize),
       netId: `feed-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`,
       sourceX:cell.x,sourceY:cell.y,sourceMass:cell.mass,
       color: cell.color, ownerUntil: performance.now() + 700, createdAt: performance.now(), ownerCellId: cell.netId };
@@ -718,7 +720,7 @@ function feedMass() {
     }
     fed = true;
   }
-  if (fed) feedCooldown = .011;
+  if (fed) feedCooldown = BlobPhysics.feeding.interval;
 }
 
 function separatePlayerCells() {
