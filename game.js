@@ -1544,19 +1544,6 @@ addEventListener("wheel", e => {
 }, { passive: false });
 addEventListener("keydown", e => {
   if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLSelectElement) return;
-  if (e.code === "KeyT" && !e.repeat && running) {
-    e.preventDefault();
-    if (followedBotTeam && teamedBots.has(followedBotTeam)) {
-      showBotTeam({name:followedBotTeam,botTeam:followedBotTeam,alive:true});
-    } else {
-      const target=cursorWorldPosition();
-      const bot=[...bots].reverse().find(cell=>cell.alive&&Math.hypot(cell.x-target.x,cell.y-target.y)<=cell.radius+8/camera.zoom);
-      if (!bot) {showArenaError(new Error("Point at a bot and press T to team with it."));return;}
-      showBotTeam(bot);
-    }
-    toggleSelectedBotTeam();
-    return;
-  }
   if (e.code === "KeyP" && !e.repeat) {
     if (running) {
       e.preventDefault();
