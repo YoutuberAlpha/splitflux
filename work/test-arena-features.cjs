@@ -28,7 +28,7 @@ async function state(who,extra={}) {
 }
 (async()=>{
  try {
-  processHandle=spawn(process.execPath,[path.join(__dirname,'..','server.cjs')],{env:{...process.env,PORT:'11004',SPLITFLUX_DATA_DIR:directory,SPLITFLUX_OWNER_PASSWORD:'test-owner-password'},stdio:['ignore','pipe','pipe']});
+  processHandle=spawn(process.execPath,[path.join(__dirname,'..','server.cjs')],{env:{...process.env,NODE_ENV:'test',SPLITFLUX_TEST_WORLD:'1',PORT:'11004',SPLITFLUX_DATA_DIR:directory,SPLITFLUX_OWNER_PASSWORD:'test-owner-password'},stdio:['ignore','pipe','pipe']});
   await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(new Error('Startup timeout')),10000);processHandle.once('error',reject);processHandle.once('exit',code=>{clearTimeout(timer);reject(new Error('Early exit '+code));});processHandle.stdout.on('data',data=>{if(data.toString().includes('OWNER PC:')){clearTimeout(timer);resolve();}});});
   const health=await request(client(),'/health');
   assert.equal(health.status,200);assert.deepEqual(health.body,{status:'ok'});
@@ -48,6 +48,11 @@ async function state(who,extra={}) {
   const massBefore=owner.snapshot.world.bots.reduce((sum,bot)=>sum+bot.mass,0);
   await state(owner,{cursor:{x:3000,y:2000},botFeeding:true});await wait(100);await state(owner,{botFeeding:false});
   assert(owner.snapshot.world.bots.reduce((sum,bot)=>sum+bot.mass,0)<massBefore,'R feed command must eject teammate mass');
+  for (const command of ['split-two','split-three','split-four']) await state(owner,{cursor:{x:3500,y:2000},botSplitCommands:[command]});
+  assert.equal(owner.snapshot.world.bots.filter(bot=>bot.botTeam==='Alex').length,16,'Teammate commands must keep splitting below the AI minimum mass');
+  await state(owner,{running:false});
+  await state(owner,{running:true});
+  assert.equal(owner.snapshot.followedBotTeam,'Alex','Returning through the menu must not silently stop teammate control');
   const skin='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=';
   await state(owner,{skin});await state(guest);
   assert(guest.snapshot.players.find(player=>player.id===owner.session.id).skinVersion>0);

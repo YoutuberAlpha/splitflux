@@ -18,7 +18,7 @@ vm.runInContext(fs.readFileSync(path.join(__dirname, "..", "server.cjs"), "utf8"
 const result = vm.runInContext(`
   world = cleanWorld({worldSize: 5200, bots: [], viruses: []});
   const testSession = {id: 'test', running: true, isAdmin: true, lastSeen: Date.now(), revision: 0,
-    cells: [cleanCell({netId:'player', x:1000,y:1000,mass:28,alive:true})], feedIds:new Set(), teamedBots:new Set(), color:'#55d6ff', immune:false, spawnProtectedUntil:0};
+    cells: [cleanCell({netId:'player', x:1000,y:1000,mass:100,alive:true})], feedIds:new Set(), teamedBots:new Set(), color:'#55d6ff', immune:false, spawnProtectedUntil:0};
   sessions.set('test',testSession);
   const bot = cleanCell({netId:'bot',name:'Alex',botTeam:'Alex',x:1060,y:1000,mass:1000,alive:true});
   world.bots = [bot];
@@ -37,8 +37,8 @@ const result = vm.runInContext(`
   resolveCollisions();
   ({fedMass,repeatedMass,survivors,afterUnteam:testSession.cells.filter(cell=>cell.alive).length});
 `, context);
-assert.equal(result.fedMass, 1002.2);
-assert.equal(result.repeatedMass, 1002.2);
+assert.equal(result.fedMass, 1022);
+assert.equal(result.repeatedMass, 1022);
 assert.equal(result.survivors, 1);
 assert.equal(result.afterUnteam, 0);
 

@@ -30,6 +30,14 @@ assert(physics.catchesFeed({x:200,y:100,radius:12}, {x:300,y:100,r:8}, 100, 100)
 assert.deepEqual(physics.direction(0,0), {x:1,y:0});
 
 const source = fs.readFileSync(path.join(__dirname,"..","multiplayer.js"),"utf8");
+const moving={netId:'moving',x:150,y:100,vx:300,vy:0,r:8,value:2.2,feedDrag:1000,createdAt:900,_serverConfirmed:true};
+const visual=vm.createContext({BlobPhysics:physics,worldSize:5200,bots:[],viruses:[],lastWorld:null,
+  updateMapSizeLabel(){},isAdmin:false,normalizeNetworkCell:cell=>cell,mergeNetworkCell:(_,cell)=>cell,
+  ejected:[moving],ejectedCache:new Map([['moving',moving]]),networkDelay:.08,performance:{now:()=>1000},Date});
+vm.runInContext(source.slice(source.indexOf('  function applyWorld('),source.indexOf('  function applyBotMassOnly(')),visual);
+vm.runInContext("applyWorld({worldSize:5200,bots:[],viruses:[],ejected:[{netId:'moving',x:120,y:100,vx:450,vy:0,r:8,value:2.2,feedDrag:1000,createdAt:Date.now()}]});",visual);
+assert.equal(visual.ejected[0].x,150,'Delayed snapshots must not rewind feed animation');
+assert.equal(visual.ejected[0].vx,300,'Delayed snapshots must not restart feed velocity');
 const correctionFunction = source.slice(source.indexOf("  function applyOwnCells("), source.indexOf("  function mergeNetworkCell("));
 const local = vm.createContext({ running:true, normalizeNetworkCell:cell=>({...cell}), radiusForMass:physics.radius,
   playerCells:[{netId:'parent',mass:50,x:110,y:100,alive:true}, {netId:'new-child',mass:50,x:150,y:100,alive:true}], player:null });
@@ -48,7 +56,7 @@ const base = "http://127.0.0.1:11003";
 let server;
 (async()=>{
   try {
-    server = spawn(process.execPath,[path.join(__dirname,"..","server.cjs")],{env:{...process.env,PORT:'11003',SPLITFLUX_OWNER_PASSWORD:'test-owner-password',SPLITFLUX_DATA_DIR:directory},stdio:['ignore','pipe','pipe']});
+    server = spawn(process.execPath,[path.join(__dirname,"..","server.cjs")],{env:{...process.env,NODE_ENV:'test',SPLITFLUX_TEST_WORLD:'1',PORT:'11003',SPLITFLUX_OWNER_PASSWORD:'test-owner-password',SPLITFLUX_DATA_DIR:directory},stdio:['ignore','pipe','pipe']});
     await new Promise((resolve,reject)=>{
       const timeout=setTimeout(()=>reject(new Error('Server startup timed out')),10000);
       server.once('error',reject);
@@ -72,12 +80,12 @@ let server;
     await update([cell('sender',1000,300),cell('recipient',1220,28)]);
     const command={netId:'original-feed',ownerCellId:'sender',dirX:1,dirY:0,x:5000,y:5000,vx:0,vy:0};
     await update([cell('sender',1000,300),cell('recipient',1220,28)],[command]);
-    assert.equal(snapshot.self.cells.find(c=>c.netId==='sender').mass,297.5);
+    assert.equal(snapshot.self.cells.find(c=>c.netId==='sender').mass,275);
     assert(snapshot.world.ejected[0].x<1200,'Server must spawn at sender, ignoring advanced client pellet position');
     await delay(450);
     await update(snapshot.self.cells,[command]);
-    assert.equal(snapshot.self.cells.find(c=>c.netId==='recipient').mass,30.2);
-    assert.equal(snapshot.self.cells.find(c=>c.netId==='sender').mass,297.5);
+    assert.equal(snapshot.self.cells.find(c=>c.netId==='recipient').mass,50);
+    assert.equal(snapshot.self.cells.find(c=>c.netId==='sender').mass,275);
     assert.equal(snapshot.world.ejected.length,0,'Acknowledged pellet must not be respawned on retry');
 
     // A bot feed must survive the owner's next stale bot snapshot.
@@ -86,7 +94,7 @@ let server;
     await update(snapshot.self.cells,[{netId:'bot-feed',ownerCellId:'sender',dirX:1,dirY:0}],[bot]);
     await delay(180);
     await update(snapshot.self.cells,[],[bot]);
-    assert(Math.abs(snapshot.world.bots[0].mass-602.2)<.000001,'Stale owner world must not erase feed growth');
+    assert(Math.abs(snapshot.world.bots[0].mass-622)<.000001,'Stale owner world must not erase feed growth');
     const secondBot={...cell('bot-two',2000,50),name:'Maya',botTeam:'Maya'};
     await update(snapshot.self.cells,[],[...snapshot.world.bots,secondBot]);
     async function follow(team) {

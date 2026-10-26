@@ -41,4 +41,28 @@ sessions.get('controller').followedBotTeam='Maya';
 assert.equal(result.movedRight,true);
 assert.equal(result.controlled.length,1);
 assert.equal(result.controlled[0],'Maya');
+const split=vm.runInContext(`
+world=cleanWorld({worldSize:5200,bots:[{netId:'small',botTeam:'Alex',name:'Alex',x:1000,y:1000,mass:20,alive:true}],viruses:[]});
+splitServerBot(world.bots[0],{x:2000,y:1000,mass:0},1,true);
+({pieces:world.bots.length,mass:world.bots.reduce((sum,bot)=>sum+bot.mass,0),parentBoost:world.bots[0].launchX,childBoost:world.bots[1].launchX});
+`,context);
+assert.equal(split.pieces,2);assert.equal(split.mass,20);
+assert.equal(split.parentBoost,0);assert(split.childBoost>0,'Only the child should launch out of the parent');
+const groupSplit=vm.runInContext(`
+world=cleanWorld({worldSize:5200,bots:Array.from({length:96},(_,i)=>({netId:'piece-'+i,botTeam:i<16?'Alex':'Other-'+i,name:'Bot',x:1000+i*20,y:1000,mass:20,alive:true})),viruses:[]});
+const error=splitTeammate({followedBotTeam:'Alex',cursor:{x:4000,y:1000}});
+({error,count:world.bots.filter(bot=>bot.botTeam==='Alex').length,mass:world.bots.filter(bot=>bot.botTeam==='Alex').reduce((sum,bot)=>sum+bot.mass,0)});
+`,context);
+assert.equal(groupSplit.error,null);assert.equal(groupSplit.count,32,'All teammate pieces must split even when the normal AI cap is full');assert.equal(groupSplit.mass,320);
+let keyHandler, selected=null, toggles=0;
+const shortcuts=vm.createContext({addEventListener:(type,handler)=>{keyHandler=handler;},
+  HTMLInputElement:class {},HTMLTextAreaElement:class {},HTMLSelectElement:class {},running:true,
+  followedBotTeam:null,teamedBots:new Set(),camera:{zoom:1},bots:[{name:'Alex',botTeam:'Alex',alive:true,x:100,y:100,radius:30}],
+  keys:{},cursorWorldPosition:()=>({x:100,y:100}),showBotTeam:bot=>{selected=bot.botTeam;},toggleSelectedBotTeam:()=>{toggles++;},showArenaError:error=>{throw error;}});
+vm.runInContext(game.slice(game.indexOf('\naddEventListener("keydown", e => {'),game.indexOf('\naddEventListener("keyup", e => {')),shortcuts);
+keyHandler({code:'KeyT',target:{},repeat:false,preventDefault(){}});
+assert.equal(selected,null);assert.equal(toggles,0,'T must not start teaming');
+shortcuts.followedBotTeam='Alex';shortcuts.teamedBots.add('Alex');shortcuts.bots=[];
+keyHandler({code:'KeyT',target:{},repeat:false,preventDefault(){}});
+assert.equal(toggles,0,'T must not stop teaming either');
 console.log('PASS: all six split formations start inside the parent and launch outward, preserve mass and IDs; server cursor following moves the selected bot and holds only one selection.');
