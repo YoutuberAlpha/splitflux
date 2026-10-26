@@ -264,7 +264,7 @@
         const shared = {
           ...(current || pellet),
           ...pellet,
-          createdAt: localCreatedAt,
+          createdAt: current?.createdAt ?? localCreatedAt,
           ownerUntil: localOwnerUntil,
           _networkShared: true,
           _serverConfirmed: true,

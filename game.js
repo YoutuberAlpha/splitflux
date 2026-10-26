@@ -1045,10 +1045,12 @@ function updateEjected(dt) {
   for (const pellet of ejected) {
     pellet.previousX = pellet.x;
     pellet.previousY = pellet.y;
+    if (Number.isFinite(pellet.flightX) && Number.isFinite(pellet.createdAt)) {
+      pellet.flightAge = Math.max(pellet.flightAge || 0, (performance.now()-pellet.createdAt)/1000-dt);
+    }
     BlobPhysics.moveFeed(pellet, dt, worldSize);
-    const ease = 1 - Math.exp(-dt * 25);
-    pellet.drawX = Number.isFinite(pellet.drawX) ? pellet.drawX + (pellet.x-pellet.drawX)*ease : pellet.x;
-    pellet.drawY = Number.isFinite(pellet.drawY) ? pellet.drawY + (pellet.y-pellet.drawY)*ease : pellet.y;
+    pellet.drawX = pellet.x;
+    pellet.drawY = pellet.y;
   }
   const cells = [...playerCells, ...bots].filter(c => c.alive);
   for (let i = ejected.length - 1; i >= 0; i--) {
