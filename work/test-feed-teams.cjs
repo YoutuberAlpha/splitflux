@@ -41,6 +41,19 @@ assert.equal(result.fedMass, 1022);
 assert.equal(result.repeatedMass, 1022);
 assert.equal(result.survivors, 1);
 assert.equal(result.afterUnteam, 0);
+const charged=vm.runInContext(`
+  world.ejected=[];
+  testSession.cells=[cleanCell({netId:'left',x:1000,y:1000,mass:20,alive:true}),cleanCell({netId:'right',x:1000,y:1000,mass:20,alive:true})];
+  const splitFeed={netId:'reserved-split-feed',ownerCellId:'parent',dirX:1,dirY:0,debits:[{netId:'left',cost:12.5},{netId:'right',cost:12.5}]};
+  addSharedEjected(testSession,[splitFeed]);
+  addSharedEjected(testSession,[splitFeed]);
+  const paidMass=testSession.cells.reduce((sum,c)=>sum+c.mass,0),pellets=world.ejected.length;
+  addSharedEjected(testSession,[{...splitFeed,netId:'free-food',debits:[{netId:'left',cost:1}]}]);
+  ({paidMass,pellets,afterInvalid:world.ejected.length});
+`,context);
+assert.equal(charged.paidMass,15,'A reserved feed cost must follow split pieces without overdrawing their original parent');
+assert.equal(charged.pellets,1,'Retrying a split feed must not charge or emit twice');
+assert.equal(charged.afterInvalid,1,'A client cannot emit feed without paying the complete cost');
 
 const source = fs.readFileSync(path.join(__dirname, "..", "game.js"), "utf8");
 const updateFeed = source.slice(source.indexOf("function updateEjected(dt)"), source.indexOf("function handleCells()"));

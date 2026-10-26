@@ -53,6 +53,8 @@ assert(Math.abs(local.playerCells[0].mass-102.2)<.000001);
 
 const game = fs.readFileSync(path.join(__dirname, '..', 'game.js'), 'utf8');
 const splitCode = game.slice(game.indexOf('function aimDirection()'), game.indexOf('function feedMass()'));
+const feedCode = game.slice(game.indexOf('function feedMass()'),game.indexOf('function separatePlayerCells()'));
+const serializeCode = source.slice(source.indexOf('  function cellForNetwork('),source.indexOf('  function normalizeNetworkCell('));
 for (const [split, count] of [['splitPlayer',2],['quadSplitPlayer',4],['tripleSplitPlayer',3],['fiveSplitPlayer',5],['sixSplitPlayer',6],['squareSplitPlayer',4]]) {
   const race = vm.createContext({BlobPhysics:physics,running:true,width:1000,height:1000,pointer:{x:900,y:500},worldSize:10000,
     performance:{now:()=>1000},radiusForMass:physics.radius,emit(){},clamp:(v,min,max)=>Math.max(min,Math.min(max,v)),
@@ -75,6 +77,40 @@ for (const [split, count] of [['splitPlayer',2],['quadSplitPlayer',4],['tripleSp
     applyOwnCells([{netId:'parent',mass:1022,x:5000,y:5000,alive:true}],[{netId:'parent',mass:1000}]);`,race);
   assert(Math.abs(race.playerCells[0].mass-272)<.000001);
 }
+
+for (const split of ['splitPlayer','quadSplitPlayer','tripleSplitPlayer','fiveSplitPlayer','sixSplitPlayer','squareSplitPlayer']) {
+  const prediction=vm.createContext({BlobPhysics:physics,running:true,onlineMode:true,width:1000,height:1000,pointer:{x:900,y:500},
+    worldSize:10000,performance:{now:()=>1000},Date,session:{id:'test'},pendingFeedCommands:new Map(),ejected:[],feedCooldown:0,
+    cursorWorldPosition:()=>({x:8000,y:5000}),radiusForMass:physics.radius,emit(){},normalizeNetworkCell:cell=>({...cell}),
+    clamp:(v,min,max)=>Math.max(min,Math.min(max,v)),boundCell:(v,r)=>Math.max(r,Math.min(10000-r,v)),
+    playerCells:[{netId:'parent',x:5000,y:5000,mass:1000,radius:physics.radius(1000),alive:true}],player:null});
+  vm.runInContext(splitCode+feedCode+serializeCode+correctionFunction,prediction);
+  vm.runInContext(`for(let i=0;i<8;i++){feedCooldown=0;feedMass();}
+    const sent=playerCells.map(cellForNetwork);
+    const accepted=[...pendingFeedCommands.keys()];
+    playerCells[0]._syncMassWeights={parent:1};`,prediction);
+  assert.equal(prediction.playerCells[0].mass,800,'Feeding must shrink locally immediately, not in network-sized bursts');
+  vm.runInContext(`${split}(); ${split}();
+    playerCells.forEach(cell=>cell.x+=2000);
+    settleFeedPredictions(accepted);
+    applyOwnCells([{...sent[0],mass:800}],sent);`,prediction);
+  assert(Math.abs(prediction.playerCells.reduce((sum,c)=>sum+c.mass,0)-800)<1e-6,'Acknowledgement must not deduct predicted food twice');
+  assert(prediction.playerCells.every(c=>c.x>6900),'Feeding must not rewind movement during a slow response');
+  assert(prediction.playerCells.every(c=>Object.keys(c._pendingFeedCosts).length===0));
+}
+
+// With high speed, a delayed feed response must not be mistaken for a server teleport.
+local.playerCells=[{netId:'fast',mass:975,x:9000,y:1000,radius:physics.radius(975),alive:true,_syncMassWeights:{fast:1}}];
+vm.runInContext("applyOwnCells([{netId:'fast',mass:1000,x:1000,y:1000,alive:true}],[{netId:'fast',mass:1000,x:1000,y:1000}]);",local);
+assert.equal(local.playerCells[0].x,9000);
+
+const smoothing=vm.createContext({performance:{now:()=>275},Number,Math});
+vm.runInContext(source.slice(source.indexOf('  function mergeNetworkCell('),source.indexOf('  function applyWorld('))+
+  source.slice(source.indexOf('  function smoothNetworkCell('),source.indexOf('  function smoothNetworkEntities(')),smoothing);
+smoothing.cell={x:0,y:0,mass:100,radius:50,vx:100,vy:0,_netTargetX:30,_netTargetY:0,_netTargetMass:100,_netTargetRadius:50,
+  _netSpacing:100,_netSamples:[{time:0,x:0,y:0},{time:100,x:10,y:0},{time:200,x:20,y:0},{time:300,x:30,y:0}]};
+vm.runInContext('smoothNetworkCell(cell,1/60);',smoothing);
+assert(Math.abs(smoothing.cell.x-15.5)<1e-6,'Remote movement must interpolate between snapshots instead of jumping to each packet');
 
 const directory = fs.mkdtempSync(path.join(os.tmpdir(),"tricksplit-feed-"));
 const base = "http://127.0.0.1:11003";
