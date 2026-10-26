@@ -26,6 +26,7 @@ const context=vm.createContext({require(name){
   if(name==='fs')return {mkdirSync(){},existsSync:()=>true,readFileSync:()=>JSON.stringify({key:'test-key'})};
   if(name==='./accounts.cjs')return ()=>({});
   if(name==='./physics.js')return physics;
+  if(name==='./moderation.cjs')return ()=>({until:()=>0,bannedBotTeams:()=>[]});
   return require(name);
 },__dirname:path.join(__dirname,'..'),process:{env:{}},Buffer,module:{exports:{}},console,setInterval:()=>({unref(){}})});
 vm.runInContext(fs.readFileSync(path.join(__dirname,'..','server.cjs'),'utf8'),context);

@@ -8,6 +8,7 @@ const context = vm.createContext({
     if (name === "fs") return { mkdirSync() {}, existsSync: () => true, readFileSync: () => JSON.stringify({ key: "test-key" }) };
     if (name === "./accounts.cjs") return () => ({});
     if (name === "./physics.js") return require("../physics.js");
+    if (name === "./moderation.cjs") return () => ({until:()=>0,bannedBotTeams:()=>[]});
     return require(name);
   },
   __dirname: path.join(__dirname, ".."), process: { env: {} }, Buffer, module: { exports: {} }, console,
