@@ -1,0 +1,19 @@
+Feeding: agar.io-clone, originally by Huy Tran, maintained by Owen Ashurst
+and contributors. https://github.com/owenashurst/agar.io-clone
+Copyright (c) 2015, Huy Tran. MIT License.
+Upstream license: licenses/agar-io-clone-LICENSE.txt.
+physics.js adapts MassFood.move's constant braking and finite stopping time
+to elapsed seconds, a shorter size-scaled range, and swept collisions.
+
+Splitting: MultiOgar by Barbosik and contributors, based on Ogar by the OgarProject.
+https://github.com/Barbosik/MultiOgar
+Copyright 2015 Devin Ryan. Apache License, Version 2.0.
+Upstream license: licenses/MultiOgar-LICENSE.md.
+
+physics.js adapts the decaying boost approach in src/entity/Cell.js for
+frame-independent movement in seconds. Network feed commands, swept collisions,
+trick formations, and game rules are local SPLITFLUX implementations.
+The complete MultiOgar server is not bundled.
+
+This is not the official Agar.io engine. SPLITFLUX is an independent game
+and is not affiliated with Agar.io or Miniclip.

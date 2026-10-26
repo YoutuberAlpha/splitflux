@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SPLITFLUX</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <canvas id="game" aria-label="Tricksplit game arena"></canvas>
+
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-orb"></span>
+        <span>SPLITFLUX</span>
+        <small>BOT ARENA</small>
+      </div>
+      <div class="status-strip">
+        <span id="serverStatus"><i class="status-dot"></i> LOCAL MODE</span>
+        <span>NO AUDIO</span>
+        <span id="botCount">24 BOTS</span>
+      </div>
+    </header>
+
+    <aside id="leaderboard" class="panel leaderboard">
+      <div class="panel-title"><span>LEADERBOARD</span><b>LIVE</b></div>
+      <ol id="leaderboardList"></ol>
+    </aside>
+
+    <aside class="panel stats">
+      <div><span>SCORE</span><strong id="score">0</strong></div>
+      <div><span>MASS</span><strong id="mass">0</strong></div>
+      <div><span>RANK</span><strong id="rank">-</strong></div>
+    </aside>
+
+    <div class="minimap-shell panel">
+      <canvas id="minimap" width="150" height="150"></canvas>
+      <span>SECTOR MAP</span>
+    </div>
+
+    <div id="startScreen" class="overlay">
+      <div class="hero-card">
+        <div class="eyebrow">ENTER THE VOID</div>
+        <h1>Consume.<br /><em>Outgrow.</em> Survive.</h1>
+        <p>Absorb energy and smaller cells. Avoid anything bigger than you. The arena is filled with bots that hunt, flee, and fight each other.</p>
+        <label class="name-field">
+          <span>CALLSIGN</span>
+          <input id="nameInput" maxlength="14" value="NOVA" autocomplete="off" />
+        </label>
+        <label class="color-field">
+          <span>CELL COLOR</span>
+          <input id="colorInput" type="color" value="#b6ff4a" />
+          <strong id="colorValue">#B6FF4A</strong>
+        </label>
+        <label class="fps-field">
+          <span>FPS LIMIT</span>
+          <select id="fpsSelect">
+            <option value="30">30 FPS</option>
+            <option value="60" selected>60 FPS</option>
+            <option value="90">90 FPS</option>
+            <option value="120">120 FPS</option>
+            <option value="144">144 FPS</option>
+            <option value="165">165 FPS</option>
+            <option value="240">240 FPS</option>
+          </select>
+        </label>
+        <label id="imageField" class="image-field">
+          <span>BLOB IMAGE</span>
+          <input id="blobImageInput" type="file" accept="image/png,image/jpeg,image/webp,image/gif" />
+          <button id="clearBlobImage" type="button">CLEAR IMAGE</button>
+          <img id="blobImagePreview" alt="Blob image preview" class="hidden" />
+        </label>
+        <label class="name-field">
+          <span>ACCOUNT USERNAME</span>
+          <input id="accountUsername" maxlength="20" autocomplete="username" placeholder="Username" />
+        </label>
+        <label class="name-field">
+          <span>ACCOUNT PASSWORD</span>
+          <input id="accountPassword" type="password" maxlength="128" autocomplete="current-password" placeholder="Password" />
+        </label>
+        <div class="account-actions">
+          <button id="accountLogin" type="button">SIGN IN</button>
+          <button id="accountRegister" type="button">CREATE ACCOUNT</button>
+          <button id="accountLogout" type="button" hidden>SIGN OUT</button>
+        </div>
+        <p id="adminUnlockStatus" role="status" aria-live="polite"></p>
+        <button id="playButton"><span>DEPLOY CELL</span><kbd>ENTER</kbd></button>
+        <p class="physics-credit">Feeding: <a href="https://github.com/owenashurst/agar.io-clone" target="_blank" rel="noopener">agar.io-clone</a> (MIT). Splitting: <a href="https://github.com/Barbosik/MultiOgar" target="_blank" rel="noopener">MultiOgar / Ogar</a> (Apache-2.0).</p>
+        <div class="controls">
+          <div><b>QUAD SPLIT</b><span>Press Q</span></div>
+          <div><b>TRIPLE SPLIT</b><span>Press E</span></div>
+          <div><b>SPLIT</b><span>Space - 3s merge</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="deathScreen" class="overlay hidden">
+      <div class="death-card">
+        <div class="eyebrow">CELL TERMINATED</div>
+        <h2>You were consumed.</h2>
+        <p>Final score <strong id="finalScore">0</strong></p>
+        <button id="restartButton"><span>REDEPLOY</span><kbd>ENTER</kbd></button>
+      </div>
+    </div>
+
+    <section id="botTeamMenu" class="bot-team-menu hidden">
+      <strong id="botTeamName"></strong>
+      <button id="closeBotTeam" type="button">CLOSE</button>
+      <button id="botTeamToggle" type="button">TEAM WITH BOT</button>
+      <button id="botFollowToggle" type="button">FOLLOW CURSOR</button>
+      <p id="botTeamMessage">A teammate cannot eat your last blob.</p>
+    </section>
+    <section id="adminPanel" class="admin-panel hidden">
+      <div class="admin-header">
+        <div><span>ADMIN CONSOLE</span><small>UNLOCKED</small></div>
+        <div class="admin-window-buttons">
+          <button id="minimizeAdmin" aria-label="Minimize admin panel">-</button>
+          <button id="closeAdmin" aria-label="Close admin panel">X</button>
+        </div>
+      </div>
+      <div id="adminControls" class="admin-controls">
+        <p>Multiply your current mass and score.</p>
+        <label class="admin-speed">
+          <span>PLAYER SPEED</span>
+          <input id="playerSpeedInput" type="number" min="0.000001" step="any" value="235" />
+          <button id="applyPlayerSpeed">APPLY SPEED</button>
+        </label>
+        <div class="admin-actions">
+          <button data-multiplier="2">X2</button>
+          <button data-multiplier="5">X5</button>
+          <button data-multiplier="10">X10</button>
+        </div>
+        <div class="admin-actions admin-shrink">
+          <button data-divisor="2">-X2</button>
+          <button data-divisor="5">-X5</button>
+          <button data-divisor="10">-X10</button>
+        </div>
+        <button id="doubleMap" class="admin-map">DOUBLE MAP SIZE <span id="mapSizeLabel">5,200</span></button>
+        <button id="halveMap" class="admin-map admin-map-small">HALVE MAP SIZE <span>2X SMALLER</span></button>
+        <button id="crazyMode" class="admin-crazy">CRAZY MODE <span id="crazyModeState">OFF</span></button>
+        <button id="xtraCrazyMode" class="admin-xtra">XTRA CRAZY MODE <span id="xtraCrazyModeState">OFF</span></button>
+        <button id="megaCrazyMode" class="admin-mega">MEGA CRAZY MODE <span id="megaCrazyModeState">OFF</span></button>
+        <button id="botImmunity" class="admin-immune">IMMUNITY <span id="botImmunityState">OFF</span></button>
+        <button id="instantMerge" class="admin-merge">INSTANTLY REMERGE</button>
+        <button id="removeSpikes" class="admin-danger">REMOVE ALL SPIKES</button>
+        <button id="killEveryone" class="admin-danger">KILL EVERYONE</button>
+        <div class="admin-shortcuts">
+          <b>KEYBOARD SHORTCUTS</b>
+          <span>2 double size</span><span>O double speed</span><span>N reset speed</span>
+          <span>L immunity</span><span>R remerge</span><span>M menu</span>
+          <span>S clear spikes</span><span>W hold feed</span><span>Space split</span>
+          <span>E triple line</span><span>Q quad line</span><span>A five line</span>
+          <span>Z six line</span><span>X square split</span><span>P admin</span>
+        </div>
+      </div>
+    </section>
+
+    <button id="adminShortcut" class="admin-shortcut">P <span>ADMIN</span></button>
+    <section id="mobileControls" class="mobile-controls" aria-label="Mobile game controls">
+      <div class="mobile-utility">
+        <button id="mobileMenu" type="button">MENU</button>
+        <button id="mobileZoomOut" type="button">ZOOM -</button>
+        <button id="mobileZoomIn" type="button">ZOOM +</button>
+        <span id="mobileRole">SOLO</span>
+      </div>
+      <div id="mobileTricks" class="mobile-tricks hidden">
+        <button type="button" data-mobile-action="triple">3 LINE</button>
+        <button type="button" data-mobile-action="quad">4 LINE</button>
+        <button type="button" data-mobile-action="five">5 LINE</button>
+        <button type="button" data-mobile-action="six">6 LINE</button>
+        <button type="button" data-mobile-action="square">4 SQUARE</button>
+      </div>
+      <button id="mobileTricksToggle" class="mobile-tricks-toggle" type="button">TRICKS</button>
+      <div id="mobileJoystick" class="mobile-joystick" aria-label="Movement joystick">
+        <div id="mobileJoystickKnob" class="mobile-joystick-knob"></div>
+      </div>
+      <div class="mobile-primary">
+        <button id="mobileFeed" class="mobile-feed" type="button"><b>FEED</b><span>HOLD</span></button>
+        <button id="mobileSplit" class="mobile-split" type="button"><b>SPLIT</b><span>3S MERGE</span></button>
+      </div>
+    </section>
+    <div class="hint" id="hint">Pointer - X square split - Z six split - O double speed - N reset speed - L immunity - 2 double size - A five split - Q quad split - E triple split - Space split - W feed - S clear spikes - P admin - R remerge - M menu</div>
+    <script src="physics.js"></script>
+    <script src="game.js"></script>
+    <script src="multiplayer.js"></script>
+  </body>
+</html>

@@ -1,0 +1,548 @@
+(() => {
+  if (!onlineMode) return;
+
+  const status = document.querySelector("#serverStatus");
+  const adminShortcut = document.querySelector("#adminShortcut");
+  const baseUpdate = update;
+  const baseRender = render;
+  const baseUpdateEjected = updateEjected;
+  let session = null;
+  let connected = false;
+  let syncing = false;
+  let lastWorld = null;
+  let lastPlayerCount = 1;
+  let networkRevision = 0;
+  let worldRevision = 0;
+  let botRevision = 0;
+  let botMassRevision = 0;
+  let forceMenuVersion = 0;
+  let remoteCellCache = new Map();
+  let ejectedCache = new Map();
+
+  isAdmin = false;
+  adminShortcut.classList.add("hidden", "inactive");
+  ui.admin.classList.add("hidden");
+  status.innerHTML = '<i class="status-dot"></i> CONNECTING';
+
+  function cellForNetwork(cell) {
+    if (!cell.netId) cell.netId = `${session ? session.id : "local"}-${Math.random().toString(36).slice(2)}`;
+    const splitLineRemaining = Math.max(0, (Number(cell.splitLineUntil) || 0) - performance.now());
+    return {
+      netId: cell.netId,
+      name: cell.name,
+      x: cell.x,
+      y: cell.y,
+      vx: cell.vx,
+      vy: cell.vy,
+      mass: cell.mass,
+      radius: cell.radius,
+      color: cell.color,
+      accent: cell.accent,
+      alive: cell.alive,
+      boost: cell.boost,
+      mergeAt: cell.mergeAt,
+      launchX: cell.launchX,
+      launchY: cell.launchY,
+      botTeam: cell.botTeam,
+      splitCooldown: cell.splitCooldown,
+      splitLineX: cell.splitLineX,
+      splitLineY: cell.splitLineY,
+      splitLineUntil: cell.splitLineUntil,
+      splitLineUntilEpoch: splitLineRemaining ? Date.now() + splitLineRemaining : 0,
+      invulnerableUntil: cell.invulnerableUntil,
+      virusImmuneUntil: cell.virusImmuneUntil,
+      targetX: cell.targetX,
+      targetY: cell.targetY,
+      think: cell.think,
+    };
+  }
+
+  function normalizeNetworkCell(cell) {
+    const normalized = { ...cell };
+    const epochUntil = Number(normalized.splitLineUntilEpoch) || 0;
+    if (epochUntil > 0) {
+      normalized.splitLineUntil = performance.now() + Math.max(0, Math.min(1000, epochUntil - Date.now()));
+    } else if (Number(normalized.splitLineUntil) > Date.now() - 10000) {
+      normalized.splitLineUntil = performance.now() + Math.max(0, Math.min(1000, Number(normalized.splitLineUntil) - Date.now()));
+    }
+    delete normalized.splitLineUntilEpoch;
+    return normalized;
+  }
+
+  function cellsForNetwork(cells) {
+    const usedIds = new Set();
+    return cells.map(cell => {
+      if (!cell.netId || usedIds.has(cell.netId)) {
+        cell.netId = `${session ? session.id : "local"}-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`;
+      }
+      usedIds.add(cell.netId);
+      return cellForNetwork(cell);
+    });
+  }
+
+  function ejectedForNetwork(pellet) {
+    if (!pellet.netId) pellet.netId = `${session.id}-feed-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`;
+    pellet._networkShared = true;
+    pellet._pendingNetworkAt = pellet._pendingNetworkAt || performance.now();
+    return {
+      netId: pellet.netId,
+      x: Number(pellet.x) || 0,
+      y: Number(pellet.y) || 0,
+      vx: Number(pellet.vx) || 0,
+      vy: Number(pellet.vy) || 0,
+      value: Number(pellet.value) || 2.2,
+      r: Number(pellet.r) || 8,
+      startX: Number(pellet.startX) || Number(pellet.x) || 0,
+      startY: Number(pellet.startY) || Number(pellet.y) || 0,
+      ownerCellId: pellet.ownerCellId || "",
+      dirX: pellet.dirX,
+      dirY: pellet.dirY,
+      color: pellet.color,
+    };
+  }
+
+  function applyOwnCells(serverCells, sentCells = []) {
+    if (!Array.isArray(serverCells) || !serverCells.length || !running) return;
+    const current = new Map(playerCells.map(cell => [cell.netId, cell]));
+    const sent = new Map(sentCells.map(cell => [cell.netId, cell]));
+    const unsent = playerCells.filter(cell => cell.alive && !sent.has(cell.netId));
+    let mergedMassCorrection = 0;
+    playerCells = serverCells.filter(serverCell => {
+      if (sent.has(serverCell.netId) && !current.has(serverCell.netId)) {
+        mergedMassCorrection += serverCell.mass - sent.get(serverCell.netId).mass;
+        return false;
+      }
+      return true;
+    }).map(serverCell => {
+      const normalized = normalizeNetworkCell(serverCell);
+      const existing = current.get(normalized.netId);
+      if (existing) {
+        existing.mass = Math.max(.000001, normalized.mass + existing.mass - (sent.get(existing.netId)?.mass ?? existing.mass));
+        existing.radius = radiusForMass(existing.mass);
+        if (Math.hypot(normalized.x - existing.x, normalized.y - existing.y) > Math.max(500, existing.radius * 4)) {
+          existing.x = normalized.x;
+          existing.y = normalized.y;
+        }
+        return {
+          ...existing,
+          vx: existing.vx,
+          vy: existing.vy,
+          alive: normalized.alive,
+          color: normalized.color,
+          accent: normalized.accent,
+          isPlayer: true,
+          botTeam: null,
+        };
+      }
+      return {
+        ...normalized,
+        isPlayer: true,
+        botTeam: null,
+      };
+    });
+    playerCells.push(...unsent.filter(cell => !playerCells.some(other => other.netId === cell.netId)));
+    if (playerCells.length && mergedMassCorrection) {
+      playerCells[0].mass = Math.max(.000001, playerCells[0].mass + mergedMassCorrection);
+      playerCells[0].radius = radiusForMass(playerCells[0].mass);
+    }
+    player = playerCells.find(cell => cell.alive) || playerCells[0] || player;
+  }
+
+  function mergeNetworkCell(current, incoming) {
+    incoming = normalizeNetworkCell(incoming);
+    if (!current) {
+      return {
+        ...incoming,
+        _netTargetX: incoming.x,
+        _netTargetY: incoming.y,
+        _netTargetMass: incoming.mass,
+        _netTargetRadius: incoming.radius,
+      };
+    }
+    const x = current.x;
+    const y = current.y;
+    const mass = current.mass;
+    const radius = current.radius;
+    Object.assign(current, incoming);
+    current.x = x;
+    current.y = y;
+    current.mass = mass;
+    current.radius = radius;
+    current._netTargetX = incoming.x + (Number(incoming.vx) || 0) * .07;
+    current._netTargetY = incoming.y + (Number(incoming.vy) || 0) * .07;
+    current._netTargetMass = incoming.mass;
+    current._netTargetRadius = incoming.radius;
+    return current;
+  }
+
+  function applyWorld(world, forceOwnerCorrection = false, preserveLocalMapSize = false) {
+    if (!world) return;
+    lastWorld = world;
+    if (!preserveLocalMapSize) worldSize = Math.max(5200, Number(world.worldSize) || 5200);
+    updateMapSizeLabel();
+    if (Array.isArray(world.bots)) {
+      if (isAdmin) {
+        if (forceOwnerCorrection) bots = world.bots.map(bot => ({ ...normalizeNetworkCell(bot), isPlayer: false }));
+      } else {
+        const currentBots = new Map(bots.map(bot => [bot.netId, bot]));
+        bots = world.bots.map(bot => ({
+          ...mergeNetworkCell(currentBots.get(bot.netId), bot),
+          isPlayer: false,
+        }));
+      }
+    }
+    if (Array.isArray(world.viruses)) viruses = world.viruses;
+    if (Array.isArray(world.ejected)) {
+      const nextEjected = new Map();
+      const localPending = ejected.filter(pellet => (
+        pellet &&
+        pellet.netId &&
+        !pellet._serverConfirmed &&
+        Number.isFinite(pellet.x) &&
+        Number.isFinite(pellet.y)
+      ));
+      const serverIds = new Set(world.ejected.map(pellet => pellet.netId));
+      ejected = world.ejected.map(pellet => {
+        const current = ejectedCache.get(pellet.netId) || ejected.find(local => local.netId === pellet.netId);
+        const serverCreatedAt = Number(pellet.createdAt) || Date.now();
+        const age = Math.max(0, (Date.now() - serverCreatedAt) / 1000);
+        const serverOwnerUntil = Number(pellet.ownerUntil) || 0;
+        const localCreatedAt = serverCreatedAt > 1000000000000 ? performance.now() - age * 1000 : serverCreatedAt;
+        const localOwnerUntil = serverOwnerUntil > 1000000000000
+          ? performance.now() + Math.max(0, serverOwnerUntil - Date.now())
+          : serverOwnerUntil;
+        const shared = {
+          ...(current || pellet),
+          ...pellet,
+          createdAt: localCreatedAt,
+          ownerUntil: localOwnerUntil,
+          _networkShared: true,
+          _serverConfirmed: true,
+        };
+        if (current) {
+          shared.x = current.x;
+          shared.y = current.y;
+          shared.vx = current.vx;
+          shared.vy = current.vy;
+        } else {
+          const vx = Number(pellet.vx) || 0;
+          const vy = Number(pellet.vy) || 0;
+          shared.x = Number(pellet.x) || 0;
+          shared.y = Number(pellet.y) || 0;
+        }
+        nextEjected.set(shared.netId, shared);
+        return shared;
+      });
+      for (const pellet of localPending) {
+        if (!pellet || !pellet.netId || serverIds.has(pellet.netId)) continue;
+        const pendingAt = Number(pellet._pendingNetworkAt) || Number(pellet.createdAt) || 0;
+        if (performance.now() - pendingAt > 1200) continue;
+        nextEjected.set(pellet.netId, pellet);
+        ejected.push(pellet);
+      }
+      ejectedCache = nextEjected;
+    }
+  }
+
+  function applyBotMassOnly(world) {
+    if (!world || !Array.isArray(world.bots)) return;
+    const byId = new Map(bots.map(bot => [bot.netId, bot]));
+    for (const serverBot of world.bots) {
+      const bot = byId.get(serverBot.netId);
+      if (!bot || !bot.alive) continue;
+      const mass = Number(serverBot.mass);
+      if (!Number.isFinite(mass)) continue;
+      bot.mass = mass;
+      bot.radius = radiusForMass(bot.mass);
+    }
+  }
+
+  function applyRemotePlayers(players) {
+    const nextCache = new Map();
+    const nextCells = [];
+    for (const remote of players || []) {
+      if (!remote.running) continue;
+      for (const cell of remote.cells || []) {
+        if (!cell.alive) continue;
+        const key = `${remote.id}:${cell.netId}`;
+        const networkCell = mergeNetworkCell(remoteCellCache.get(key), cell);
+        Object.assign(networkCell, {
+          name: remote.name || cell.name || "PLAYER",
+          color: remote.color || cell.color,
+          accent: lightenColor(remote.color || cell.color || "#55d6ff", 55),
+          isPlayer: false,
+          isRemote: true,
+          botTeam: `remote-${remote.id}`,
+        });
+        nextCache.set(key, networkCell);
+        nextCells.push(networkCell);
+      }
+    }
+    remoteCellCache = nextCache;
+    remotePlayerCells = nextCells;
+  }
+
+  function smoothNetworkCell(cell, dt) {
+    if (!Number.isFinite(cell._netTargetX)) return;
+    const positionEase = 1 - Math.exp(-dt * 14);
+    const sizeEase = 1 - Math.exp(-dt * 11);
+    cell.x += (cell._netTargetX - cell.x) * positionEase;
+    cell.y += (cell._netTargetY - cell.y) * positionEase;
+    cell.mass += (cell._netTargetMass - cell.mass) * sizeEase;
+    cell.radius += (cell._netTargetRadius - cell.radius) * sizeEase;
+  }
+
+  function smoothNetworkEntities(dt) {
+    remotePlayerCells.forEach(cell => smoothNetworkCell(cell, dt));
+    if (!isAdmin) bots.forEach(bot => smoothNetworkCell(bot, dt));
+  }
+
+  function updateAdminAccess() {
+    isAdmin = Boolean(session && session.isAdmin);
+    updateBlobImageAccess();
+    document.querySelector("#mobileRole").textContent = isAdmin ? "OWNER" : "GUEST";
+    adminShortcut.classList.toggle("hidden", !isAdmin);
+    adminShortcut.classList.toggle("inactive", !isAdmin || !running);
+    if (!isAdmin) ui.admin.classList.add("hidden");
+    const account = session && session.account;
+    document.querySelector("#adminUnlockStatus").textContent = account
+      ? `Signed in as ${account.username}${isAdmin ? " - OWNER / ADMIN" : " - PLAYER"}` : "Playing as guest. Sign in or create an account.";
+    document.querySelector("#accountLogout").hidden = !account;
+    document.querySelector("#accountLogin").hidden = Boolean(account);
+    document.querySelector("#accountRegister").hidden = Boolean(account);
+    document.querySelector("#accountUsername").disabled = Boolean(account);
+    document.querySelector("#accountPassword").disabled = Boolean(account);
+  }
+
+  let accountBusy = false;
+  async function accountAction(action) {
+    const message = document.querySelector("#adminUnlockStatus");
+    if (!session) { message.textContent = "Server is connecting. Try again in a moment."; return; }
+    if (accountBusy) return;
+    accountBusy = true;
+    document.querySelectorAll(".account-actions button").forEach(button => { button.disabled = true; });
+    try {
+      const response = await fetch(`/api/accounts/${action}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: session.id, sessionKey: session.sessionKey,
+          username: document.querySelector("#accountUsername").value,
+          password: document.querySelector("#accountPassword").value }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error);
+      session.isAdmin = result.isAdmin;
+      session.account = result.account;
+      updateAdminAccess();
+      document.querySelector("#accountPassword").value = "";
+    } catch (error) {
+      message.textContent = error.message || "Unable to connect to server.";
+    } finally {
+      accountBusy = false;
+      document.querySelectorAll(".account-actions button").forEach(button => { button.disabled = false; });
+    }
+  }
+  document.querySelector("#accountLogin").addEventListener("click", () => accountAction("login"));
+  document.querySelector("#accountRegister").addEventListener("click", () => accountAction("register"));
+  document.querySelector("#accountLogout").addEventListener("click", () => accountAction("logout"));
+  document.querySelector("#accountPassword").addEventListener("keydown", event => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      event.stopPropagation();
+      accountAction("login");
+    }
+  });
+
+  async function createSession() {
+    const params = new URLSearchParams(location.search);
+    const ownerKey = params.get("owner") || "";
+    const response = await fetch(`/api/session${ownerKey ? `?owner=${encodeURIComponent(ownerKey)}` : ""}`, {
+      cache: "no-store",
+    });
+    if (!response.ok) throw new Error("The room server did not answer.");
+    session = await response.json();
+    networkRevision = 0;
+    worldRevision = 0;
+    botRevision = 0;
+    botMassRevision = 0;
+    forceMenuVersion = 0;
+    pendingFeedCommands.clear();
+    ejected = [];
+    ejectedCache.clear();
+    updateAdminAccess();
+    connected = true;
+    if (isAdmin) {
+      adminShortcut.classList.remove("hidden");
+      if (running) adminShortcut.classList.remove("inactive");
+    } else {
+      adminShortcut.classList.add("hidden", "inactive");
+      ui.admin.classList.add("hidden");
+    }
+    status.innerHTML = `<i class="status-dot"></i> ONLINE - ${isAdmin ? "OWNER" : "GUEST"}`;
+  }
+
+  async function syncRoom() {
+    if (!session || syncing) return;
+    syncing = true;
+    try {
+      const payload = {
+        id: session.id,
+        sessionKey: session.sessionKey,
+        running,
+        name: (player && player.name) || ui.name.value || "PLAYER",
+        color: playerColor,
+        score,
+        immune: isAdmin && botImmunity,
+        cursor: cursorWorldPosition(),
+        ackRevision: networkRevision,
+        ackWorldRevision: worldRevision,
+        ackBotRevision: botRevision,
+        ackBotMassRevision: botMassRevision,
+        cells: running ? cellsForNetwork(playerCells.filter(cell => cell.alive)) : [],
+        ejectedAdditions: running
+          ? [...pendingFeedCommands.values()].slice(0, 80).map(ejectedForNetwork)
+          : [],
+      };
+      if (isAdmin && running) {
+        payload.world = {
+          worldSize,
+          bots: cellsForNetwork(bots.filter(bot => bot.alive)),
+          viruses,
+        };
+      }
+      const sentMapSize = worldSize;
+      const response = await fetch("/api/state", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        cache: "no-store",
+      });
+      if (response.status === 401) {
+        await createSession();
+        return;
+      }
+      if (!response.ok) throw new Error("Room sync failed.");
+      const snapshot = await response.json();
+      const acceptedFeedIds = new Set(snapshot.acceptedFeedIds || []);
+      acceptedFeedIds.forEach(id => pendingFeedCommands.delete(id));
+      ejected.forEach(pellet => { if (acceptedFeedIds.has(pellet.netId)) pellet._serverConfirmed = true; });
+      teamedBots = new Set(snapshot.teamedBots || []);
+      followedBotTeam = snapshot.followedBotTeam || null;
+      botFollowTargets = new Map((snapshot.botControllers || []).map(entry => [entry.team, {x:entry.x,y:entry.y}]));
+      if (!accountBusy && (session.isAdmin !== snapshot.isAdmin || JSON.stringify(session.account) !== JSON.stringify(snapshot.account))) {
+        session.isAdmin = snapshot.isAdmin;
+        session.account = snapshot.account;
+        updateAdminAccess();
+      }
+      connected = true;
+      const receivedNetworkRevision = Number(snapshot.self && snapshot.self.revision) || 0;
+      const receivedWorldRevision = Number(snapshot.worldRevision) || 0;
+      const receivedBotRevision = Number(snapshot.botRevision) || 0;
+      const receivedBotMassRevision = Number(snapshot.botMassRevision) || 0;
+      const hasPlayerCorrection = receivedNetworkRevision > networkRevision;
+      const hasBotCorrection = receivedBotRevision > botRevision;
+      const hasBotMassCorrection = receivedBotMassRevision > botMassRevision;
+      networkRevision = receivedNetworkRevision;
+      worldRevision = receivedWorldRevision;
+      botRevision = receivedBotRevision;
+      botMassRevision = receivedBotMassRevision;
+      const nextForceMenuVersion = Number(snapshot.self && snapshot.self.forceMenuVersion) || 0;
+      if (nextForceMenuVersion > forceMenuVersion) {
+        forceMenuVersion = nextForceMenuVersion;
+        returnToMainMenu();
+      }
+      lastPlayerCount = snapshot.playerCount || 1;
+      if (hasPlayerCorrection) applyOwnCells(snapshot.self && snapshot.self.cells, payload.cells);
+      applyRemotePlayers(snapshot.players);
+      applyWorld(snapshot.world || lastWorld, hasBotCorrection, isAdmin && worldSize !== sentMapSize);
+      if (!hasBotCorrection && hasBotMassCorrection) applyBotMassOnly(snapshot.world || lastWorld);
+      status.innerHTML = `<i class="status-dot"></i> ONLINE - ${lastPlayerCount} PLAYER${lastPlayerCount === 1 ? "" : "S"}`;
+      if (snapshot.self && snapshot.self.dead && running) endGame();
+    } catch (error) {
+      connected = false;
+      status.innerHTML = '<i class="status-dot"></i> RECONNECTING';
+    } finally {
+      syncing = false;
+    }
+  }
+
+  update = function multiplayerUpdate(dt) {
+    if (!connected || isAdmin) {
+      baseUpdate(dt);
+      smoothNetworkEntities(dt);
+      return;
+    }
+    if (!running) return;
+    updatePlayer(dt);
+    playerCells.filter(cell => cell.alive).forEach(eatFood);
+    updateEjected(dt);
+    updateParticles(dt);
+    const center = playerCenter();
+    player = playerCells.find(cell => cell.alive) || player;
+    const naturalZoom = clamp(1.15 / Math.pow(center.mass / 28, .16), .38, 1.05);
+    const targetZoom = Math.max(Number.MIN_VALUE, naturalZoom * manualZoom);
+    camera.zoom += (targetZoom - camera.zoom) * Math.min(1, dt * 3);
+    camera.x += (center.x - camera.x) * Math.min(1, dt * 4);
+    camera.y += (center.y - camera.y) * Math.min(1, dt * 4);
+    smoothNetworkEntities(dt);
+    updateUI();
+  };
+
+  updateEjected = function multiplayerEjectedUpdate(dt) {
+    baseUpdateEjected(dt);
+  };
+
+  render = function multiplayerRender(time) {
+    const localBots = bots;
+    bots = [...localBots, ...remotePlayerCells];
+    baseRender(time);
+    bots = localBots;
+  };
+
+  createSession().catch(() => {
+    status.innerHTML = '<i class="status-dot"></i> SERVER OFFLINE';
+  });
+
+  window.killEveryoneOnline = async function killEveryoneOnline() {
+    if (!session || !isAdmin) return;
+    const button = document.querySelector("#killEveryone");
+    try {
+      const response = await fetch("/api/admin/kill-all", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: session.id, sessionKey: session.sessionKey }),
+        cache: "no-store",
+      });
+      if (!response.ok) throw new Error("Admin command rejected");
+      const result = await response.json();
+      bots = [];
+      botRespawnPausedUntil = performance.now() + 5000;
+      button.textContent = `WIPED ${result.killed} PLAYERS + ${result.botsKilled} BOTS`;
+      setTimeout(() => { button.textContent = "KILL EVERYONE"; }, 1400);
+      syncRoom();
+    } catch {
+      button.textContent = "COMMAND FAILED";
+      setTimeout(() => { button.textContent = "KILL EVERYONE"; }, 1400);
+    }
+  };
+
+  window.setBotTeamOnline = async function(team, enabled) {
+    if (!session) throw new Error("Not connected");
+    const response = await fetch("/api/team", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: session.id, sessionKey: session.sessionKey, team, enabled }) });
+    if (!response.ok) throw new Error("Team request failed");
+    const result = await response.json();
+    teamedBots = new Set(result.teamedBots);
+  };
+
+  window.setBotFollowOnline = async function(team) {
+    if (!session) throw new Error("Not connected");
+    const response = await fetch("/api/follow-bot", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: session.id, sessionKey: session.sessionKey, team }) });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || "Follow request failed");
+    followedBotTeam = result.followedBotTeam;
+  };
+
+  setInterval(syncRoom, 75);
+})();

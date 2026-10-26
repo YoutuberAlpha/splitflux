@@ -1,0 +1,16 @@
+node_modules/
+.vercel/
+.tricksplit-data/
+.splitflux-data/
+.env
+.env.*
+!.env.example
+*.log
+*.exe
+*.hta
+outputs/
+work/admin-persistence-check/
+.DS_Store
+Thumbs.db
+.agents/
+.codex/

@@ -1,0 +1,14 @@
+{
+  "name": "splitflux",
+  "version": "1.0.0",
+  "private": true,
+  "description": "SPLITFLUX multiplayer cell arena",
+  "scripts": {
+    "start": "node server.cjs",
+    "build": "node work/build-vercel.cjs",
+    "test": "node work/test-feed-teams.cjs && node work/test-follow-splits.cjs && node work/test-accounts.cjs && node work/test-physics-network.cjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
