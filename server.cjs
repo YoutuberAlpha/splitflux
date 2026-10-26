@@ -16,6 +16,7 @@ if (!fs.existsSync(adminKeyPath)) {
 }
 const rememberedAdminKey = JSON.parse(fs.readFileSync(adminKeyPath, "utf8")).key;
 const accounts = require("./accounts.cjs")(dataDirectory, rememberedAdminKey, adminPassword);
+const moderation = require("./moderation.cjs")(dataDirectory, rememberedAdminKey);
 
 const sessions = new Map();
 let ownerId = null;
@@ -220,6 +221,36 @@ function botControllers() {
     .map(session => ({ team: session.followedBotTeam, x: session.cursor.x, y: session.cursor.y }));
 }
 
+function playerBanUntil(session) {
+  if (session.account?.isAdmin) return 0;
+  return moderation.until([`device:${session.deviceId}`, ...(session.account ? [`account:${session.account.username}`] : [])]);
+}
+
+function stopBannedPlayer(session) {
+  session.running = false;
+  session.cells = [];
+  session.followedBotTeam = null;
+  session.forceMenuVersion++;
+}
+
+function simulateBotFeeding() {
+  if (!world) return;
+  const now = Date.now();
+  for (const session of sessions.values()) {
+    if (!session.running || !session.botFeeding || !session.followedBotTeam || !session.cursor || now - session.lastSeen > 1500 || now - (session.lastBotFeed || 0) < 60) continue;
+    session.lastBotFeed = now;
+    for (const bot of world.bots.filter(bot => bot.alive && (bot.botTeam || bot.name) === session.followedBotTeam)) {
+      if (bot.mass <= BlobPhysics.minFeedMass || world.ejected.length >= 700) continue;
+      bot.mass -= BlobPhysics.feedCost;
+      bot.radius = radiusForMass(bot.mass);
+      const pellet = BlobPhysics.createFeed(bot, session.cursor.x - bot.x, session.cursor.y - bot.y, session.cursor);
+      world.ejected.push({ ...pellet, netId: crypto.randomUUID(), color: bot.color, ownerCellId: bot.netId, ownerUntil: now + 700, createdAt: now });
+      botMassRevision++;
+      worldRevision++;
+    }
+  }
+}
+
 function addSharedEjected(session, additions) {
   if (!world || !session.running || !Array.isArray(additions) || !additions.length) return;
   const existingIds = new Set(world.ejected.map(pellet => pellet.netId));
@@ -233,7 +264,9 @@ function addSharedEjected(session, additions) {
     owner.mass -= BlobPhysics.feedCost;
     owner.radius = radiusForMass(owner.mass);
     session.revision++;
-    const launch = BlobPhysics.createFeed(owner, number(raw.dirX, number(raw.vx)), number(raw.dirY, number(raw.vy)));
+    const target = Number.isFinite(raw.targetX) && Number.isFinite(raw.targetY)
+      ? { x: number(raw.targetX, owner.x, 0, world.worldSize), y: number(raw.targetY, owner.y, 0, world.worldSize) } : null;
+    const launch = BlobPhysics.createFeed(owner, target ? target.x - owner.x : number(raw.dirX, number(raw.vx)), target ? target.y - owner.y : number(raw.dirY, number(raw.vy)), target);
     world.ejected.push({
       ...launch,
       netId,
@@ -296,7 +329,7 @@ function simulateSharedEjected(dt) {
       break;
     }
     if (!eaten) {
-      const bot = world.bots.find(candidate => candidate.alive && BlobPhysics.catchesFeed(candidate, pellet, previousX, previousY));
+      const bot = world.bots.find(candidate => candidate.alive && (candidate.netId !== pellet.ownerCellId || now >= pellet.ownerUntil) && BlobPhysics.catchesFeed(candidate, pellet, previousX, previousY));
       if (bot) {
         bot.mass = safeMass(bot.mass) + Math.max(.1, Math.min(3, safeMass(pellet.value)));
         bot.radius = radiusForMass(bot.mass);
@@ -623,6 +656,7 @@ function sessionView(session) {
   return {
     id: session.id,
     name: session.name,
+    skinVersion: session.skinVersion || 0,
     color: session.color,
     running: session.running,
     cells: aliveCells,
@@ -668,9 +702,17 @@ function cleanupSessions() {
 const server = http.createServer(async (request, response) => {
   const url = new URL(request.url, `http://${request.headers.host || "localhost"}`);
 
+  if (request.method === "GET" && url.pathname === "/health") {
+    sendJson(response, 200, { status: "ok" });
+    return;
+  }
+
   if (request.method === "GET" && url.pathname === "/api/session") {
     cleanupSessions();
     const account = accounts.fromRequest(request);
+    const deviceId = moderation.device(request, response);
+    const bannedUntil = account?.isAdmin ? 0 : moderation.until([`device:${deviceId}`, ...(account ? [`account:${account.username}`] : [])]);
+    if (bannedUntil) { sendJson(response, 403, { error: "You are banned from this arena.", bannedUntil }); return; }
     const id = crypto.randomUUID();
     const sessionKey = crypto.randomBytes(20).toString("hex");
     const isAdmin = Boolean(account && account.isAdmin);
@@ -682,6 +724,8 @@ const server = http.createServer(async (request, response) => {
       sessionKey,
       isAdmin,
       account,
+      deviceId,
+      botActionIds: new Set(),
       feedIds: new Set(),
       teamedBots: new Set(),
       followedBotTeam: null,
@@ -692,6 +736,8 @@ const server = http.createServer(async (request, response) => {
       score: 0,
       immune: false,
       cells: [],
+      skin: "",
+      skinVersion: 0,
       revision: 0,
       forceMenuVersion: 0,
       spawnProtectedUntil: 0,
@@ -699,6 +745,15 @@ const server = http.createServer(async (request, response) => {
     });
     if (account) accounts.remember(response, account.username);
     sendJson(response, 200, { id, sessionKey, isAdmin, account });
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname.startsWith("/api/skins/")) {
+    const target=sessions.get(url.pathname.slice("/api/skins/".length));
+    const match=target?.skin?.match(/^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=]+)$/);
+    if (!match) {sendJson(response,404,{error:"Skin not found"});return;}
+    response.writeHead(200,{"Content-Type":match[1],"Cache-Control":"private, max-age=60","X-Content-Type-Options":"nosniff"});
+    response.end(Buffer.from(match[2],"base64"));
     return;
   }
 
@@ -711,6 +766,7 @@ const server = http.createServer(async (request, response) => {
         return;
       }
       const account = url.pathname.endsWith("/logout") ? null : await accounts.authenticate(body.username, body.password, url.pathname.endsWith("/register"));
+      if (account && !account.isAdmin && moderation.until([`account:${account.username}`, `device:${session.deviceId}`])) throw new Error("This account or browser is currently banned.");
       session.account = account;
       session.isAdmin = Boolean(account && account.isAdmin);
       if (!session.isAdmin) session.immune = false;
@@ -747,10 +803,53 @@ const server = http.createServer(async (request, response) => {
       if (!session || session.sessionKey !== body.sessionKey) { sendJson(response, 401, { error: "Session expired" }); return; }
       const team = String(body.team || "");
       if (!world || !world.bots.some(bot => bot.alive && (bot.botTeam || bot.name) === team)) { sendJson(response, 404, { error: "Bot is gone" }); return; }
-      if (body.enabled) session.teamedBots.add(team);
-      else session.teamedBots.delete(team);
-      sendJson(response, 200, { teamedBots: [...session.teamedBots] });
+      if (body.enabled) {
+        if ([...sessions.values()].some(other => other !== session && other.running && other.followedBotTeam === team && Date.now() - other.lastSeen < 1500)) { sendJson(response, 409, {error:"Another player is already teaming with this bot."}); return; }
+        session.teamedBots.clear();
+        session.teamedBots.add(team);
+        session.followedBotTeam = team;
+      } else {
+        session.teamedBots.delete(team);
+        if (session.followedBotTeam === team) session.followedBotTeam = null;
+      }
+      sendJson(response, 200, { teamedBots: [...session.teamedBots], followedBotTeam: session.followedBotTeam });
     } catch { sendJson(response, 400, { error: "Invalid team request" }); }
+    return;
+  }
+
+  if (request.method === "POST" && ["/api/admin/ban", "/api/admin/paint-spikes"].includes(url.pathname)) {
+    try {
+      const body = await readBody(request);
+      const admin = sessions.get(String(body.id || ""));
+      const account = accounts.fromRequest(request);
+      if (!admin || admin.sessionKey !== body.sessionKey || !account?.isAdmin) { sendJson(response, 403, { error: "Admin access required" }); return; }
+      if (url.pathname.endsWith("/ban")) {
+        const target = sessions.get(String(body.targetId || ""));
+        const team = typeof body.botTeam === "string" ? body.botTeam : null;
+        if (target) {
+          if (target.id === admin.id || target.account?.isAdmin || target.deviceId===admin.deviceId) { sendJson(response, 403, { error:"The owner cannot be banned." }); return; }
+          const identities = [`device:${target.deviceId}`, ...(target.account ? [`account:${target.account.username}`] : [])];
+          const until = moderation.ban(identities, body.durationMs);
+          for (const session of sessions.values()) if (playerBanUntil(session)) stopBannedPlayer(session);
+          sendJson(response, 200, { bannedUntil: until });
+        } else if (team && world?.bots.some(bot => (bot.botTeam || bot.name) === team)) {
+          const until = moderation.ban([`bot:${team}`], body.durationMs);
+          world.bots = world.bots.filter(bot => (bot.botTeam || bot.name) !== team);
+          botRevision++;
+          sendJson(response, 200, { bannedUntil: until });
+        } else sendJson(response, 404, { error:"Player is no longer in the arena." });
+      } else {
+        if (!world) { sendJson(response, 409, {error:"Start a round first."}); return; }
+        let added = 0;
+        for (const point of (Array.isArray(body.points) ? body.points : []).slice(0, 40)) {
+          const x = number(point.x, 42, 42, world.worldSize - 42), y = number(point.y, 42, 42, world.worldSize - 42);
+          if (world.viruses.length >= 200 || world.viruses.some(virus => Math.hypot(virus.x-x,virus.y-y) < 84)) continue;
+          world.viruses.push({x,y,r:42,angle:Math.random()*Math.PI*2}); added++;
+        }
+        worldRevision++; botRevision++;
+        sendJson(response, 200, {added,viruses:world.viruses});
+      }
+    } catch (error) { sendJson(response, 400, {error:error.message}); }
     return;
   }
 
@@ -799,10 +898,23 @@ const server = http.createServer(async (request, response) => {
       session.lastSeen = Date.now();
       session.account = accounts.fromRequest(request);
       session.isAdmin = Boolean(session.account && session.account.isAdmin);
+      const bannedUntil = playerBanUntil(session);
+      if (bannedUntil) { stopBannedPlayer(session); sendJson(response, 403, {error:"You are banned from this arena.",bannedUntil}); return; }
       const wasRunning = session.running;
       session.running = Boolean(body.running);
       if (!session.running) session.followedBotTeam = null;
       if (body.cursor && world) session.cursor = { x: number(body.cursor.x, 0, 0, world.worldSize), y: number(body.cursor.y, 0, 0, world.worldSize) };
+      session.botFeeding = Boolean(body.botFeeding);
+      if (typeof body.skin==="string" && body.skin.length<=60000 && (body.skin==="" || /^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(body.skin)) && body.skin!==session.skin) {
+        session.skin=body.skin; session.skinVersion=(session.skinVersion||0)+1;
+      }
+      for (const id of (Array.isArray(body.botSplitCommands) ? body.botSplitCommands : []).slice(0, 8)) {
+        if (typeof id !== "string" || id.length > 100 || session.botActionIds.has(id)) continue;
+        session.botActionIds.add(id);
+        if (!session.running || !session.followedBotTeam || !session.cursor || !world) continue;
+        for (const bot of [...world.bots].filter(bot => bot.alive && (bot.botTeam || bot.name) === session.followedBotTeam)) splitServerBot(bot, { ...session.cursor, mass:0 });
+        botRevision++;
+      }
       session.name = cleanText(body.name, "PLAYER", 14);
       session.color = /^#[0-9a-f]{6}$/i.test(body.color) ? body.color : "#55d6ff";
       session.score = number(body.score, 0, 0, 1e15);
@@ -813,6 +925,7 @@ const server = http.createServer(async (request, response) => {
       if (session.isAdmin && session.running && body.world && number(body.ackBotRevision, 0, 0) >= botRevision && number(body.ackBotMassRevision, 0, 0) >= botMassRevision) {
         const sharedEjected = world ? world.ejected : [];
         world = cleanWorld(body.world);
+        world.bots = world.bots.filter(bot => !moderation.until([`bot:${bot.botTeam || bot.name}`]));
         world.ejected = sharedEjected;
       }
       // Map boundaries are independent of bot correction acknowledgements.
@@ -833,6 +946,8 @@ const server = http.createServer(async (request, response) => {
         teamedBots: [...session.teamedBots],
         followedBotTeam: session.followedBotTeam,
         botControllers: botControllers(),
+        acceptedBotSplitCommands: (Array.isArray(body.botSplitCommands) ? body.botSplitCommands : []).filter(id => session.botActionIds.has(id)),
+        bannedBotTeams: moderation.bannedBotTeams(),
         players,
         playerCount: Math.max(1, activeCount),
         world,
@@ -883,7 +998,13 @@ const fallbackTimer = setInterval(() => {
   lastFallbackTick = now;
   cleanupSessions();
   simulateSharedEjected(dt);
+  simulateBotFeeding();
   simulateServerBots(dt);
+  if (world) {
+    const before=world.bots.length;
+    world.bots=world.bots.filter(bot=>!moderation.until([`bot:${bot.botTeam||bot.name}`]));
+    if (world.bots.length!==before) botRevision++;
+  }
 }, 40);
 fallbackTimer.unref();
 

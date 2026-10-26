@@ -113,6 +113,10 @@ h2 { font-size: 48px; }
 .bot-team-menu.hidden { display: none; }
 .bot-team-menu button { margin-top: 10px; justify-content: center; }
 .bot-team-menu p { font-size: 12px; color: var(--muted); }
+.leaderboard.moderating { pointer-events: auto; }
+.leaderboard.moderating li:not(.player) { cursor: pointer; }
+#moderationMenu { z-index: 21; left: auto; right: 20px; }
+#moderationMenu input, #moderationMenu select { width: 100%; margin-top: 8px; padding: 8px; background: #141b26; color: white; border: 1px solid var(--line); }
 #adminUnlockStatus { margin: 8px 0 14px; font-size: 12px; color: var(--lime); }
 .hero-card { max-height: calc(100vh - 24px); overflow-y: auto; }
 .color-field { display: grid; grid-template-columns: 56px 1fr; align-items: center; gap: 10px; margin-bottom: 12px; }

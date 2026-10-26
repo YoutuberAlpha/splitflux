@@ -107,8 +107,16 @@
       <strong id="botTeamName"></strong>
       <button id="closeBotTeam" type="button">CLOSE</button>
       <button id="botTeamToggle" type="button">TEAM WITH BOT</button>
-      <button id="botFollowToggle" type="button">FOLLOW CURSOR</button>
+      <button id="botBanOptions" type="button" hidden>BAN OPTIONS</button>
       <p id="botTeamMessage">A teammate cannot eat your last blob.</p>
+    </section>
+    <section id="moderationMenu" class="bot-team-menu hidden">
+      <strong id="moderationName"></strong>
+      <button id="closeModeration" type="button">CLOSE</button>
+      <label>Ban duration <input id="banDuration" type="number" min="1" step="any" value="5" /></label>
+      <select id="banUnit"><option value="1000">Seconds</option><option value="60000" selected>Minutes</option><option value="3600000">Hours</option><option value="86400000">Days</option><option value="forever">Forever</option></select>
+      <button id="confirmBan" type="button">BAN PLAYER</button>
+      <p id="moderationMessage"></p>
     </section>
     <section id="adminPanel" class="admin-panel hidden">
       <div class="admin-header">
@@ -143,6 +151,8 @@
         <button id="botImmunity" class="admin-immune">IMMUNITY <span id="botImmunityState">OFF</span></button>
         <button id="instantMerge" class="admin-merge">INSTANTLY REMERGE</button>
         <button id="removeSpikes" class="admin-danger">REMOVE ALL SPIKES</button>
+        <button id="spikePainter" type="button">SPIKE PAINTER: OFF</button>
+        <p>Turn on the painter, then click or drag on the map. Team bot: hold R to feed, press 1 to split.</p>
         <button id="killEveryone" class="admin-danger">KILL EVERYONE</button>
         <div class="admin-shortcuts">
           <b>KEYBOARD SHORTCUTS</b>

@@ -37,7 +37,8 @@ module.exports = function createAccounts(directory, signingKey, ownerPassword) {
   }
   function remember(response, username) {
     const value = Buffer.from(JSON.stringify({ username, expires: Date.now() + 315360000000 })).toString("base64url");
-    response.setHeader("Set-Cookie", `tricksplit_account=${value}.${sign(value)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=315360000`);
+    const existing = response.getHeader("Set-Cookie") || [];
+    response.setHeader("Set-Cookie", [...(Array.isArray(existing) ? existing : [existing]), `tricksplit_account=${value}.${sign(value)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=315360000`]);
   }
   function forget(response) {
     response.setHeader("Set-Cookie", [

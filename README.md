@@ -32,8 +32,24 @@ in a standard Vercel Function would not provide a reliable multiplayer world.
 The Vercel frontend build publishes only the game assets and license notices;
 it does not publish account files, server source, logs, or desktop executables.
 
-The Vercel project still needs its GitHub connection and a configured backend;
-these files alone do not create either service.
+These files alone do not create either service.
+
+## Always-On Backend
+
+`render.yaml` defines one paid Node.js web service with a 1 GB persistent disk.
+Review Render's current price before deploying; this configuration is not free.
+Use a single instance because all players share one in-memory arena.
+
+1. In Render, create a Blueprint from this repository and review its resources.
+2. Enter `SPLITFLUX_OWNER_PASSWORD` privately when prompted. Never add it to YAML.
+3. Deploy after approving the hosting cost. `/health` should return HTTP 200.
+4. Put the service's HTTPS origin in Vercel's `SPLITFLUX_BACKEND_ORIGIN`, then
+   redeploy Vercel. Test two players joining through the Vercel address.
+
+Accounts, bans, and signing keys live under `/var/data/splitflux` on the disk.
+The live arena resets on a backend deployment or restart. Cloud accounts start
+separately from local accounts; local private files are not uploaded automatically.
+The backend continues running independently of the owner's browser or PC.
 
 ## Checks
 

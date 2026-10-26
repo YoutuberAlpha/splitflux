@@ -24,13 +24,16 @@
     body[fieldX] *= damping;
     body[fieldY] *= damping;
   }
-  function createFeed(cell, x, y) {
+  function createFeed(cell, x, y, target) {
     const dir = direction(x, y), r = radius(cell.mass);
-    const range = clamp(100 + r * .65, 120, 360);
+    const targetDistance = target ? Math.hypot(target.x - cell.x, target.y - cell.y) : Infinity;
+    const offset = Math.min(r + 10, targetDistance);
+    const range = target ? Math.max(0, targetDistance - offset) : clamp(100 + r * .65, 120, 360);
     const stopTime = .45;
     const speed = 2 * range / stopTime;
-    return { x: cell.x + dir.x * (r + 10), y: cell.y + dir.y * (r + 10),
-      vx: dir.x * speed, vy: dir.y * speed, dirX: dir.x, dirY: dir.y, feedDrag: speed / stopTime, value: 2.2, r: 8 };
+    return { x: cell.x + dir.x * offset, y: cell.y + dir.y * offset,
+      vx: dir.x * speed, vy: dir.y * speed, dirX: dir.x, dirY: dir.y, targetX: target?.x, targetY: target?.y,
+      feedDrag: speed / stopTime, value: 2.2, r: 8 };
   }
   function moveFeed(body, dt, size) {
     const speed = Math.hypot(body.vx, body.vy);

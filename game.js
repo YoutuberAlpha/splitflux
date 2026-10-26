@@ -57,6 +57,15 @@ let teamedBots = new Set();
 let selectedTeamBot = null;
 let followedBotTeam = null;
 let botFollowTargets = new Map();
+const pendingBotSplitCommands = new Set();
+const remoteSkinImages = new Map();
+let bannedBotTeams = new Set();
+let selectedModerationTarget = null;
+let spikePainter = false;
+let spikePainting = false;
+let lastPaintAt = 0;
+let offlineBotFeedCooldown = 0;
+let currentBanUntil = 0;
 
 function cursorWorldPosition() {
   return { x: clamp(camera.x + (pointer.x - width / 2) / camera.zoom, 0, worldSize),
@@ -334,6 +343,7 @@ function createInitialBots() {
 }
 
 function resetGame() {
+  if (currentBanUntil > Date.now()) return;
   pendingFeedCommands.clear();
   if (isAdmin) {
     worldSize = loadMapSizePreference();
@@ -477,6 +487,17 @@ function updatePlayer(dt) {
   playerCells.filter(c => c.alive).forEach(cell => steer(cell, tx, ty, dt));
   feedCooldown = Math.max(0, feedCooldown - dt);
   if (keys.KeyW) feedMass();
+  offlineBotFeedCooldown = Math.max(0, offlineBotFeedCooldown - dt);
+  if (!onlineMode && keys.KeyR && followedBotTeam && !offlineBotFeedCooldown) {
+    offlineBotFeedCooldown = .06;
+    const target = cursorWorldPosition();
+    for (const bot of bots.filter(bot => bot.alive && (bot.botTeam || bot.name) === followedBotTeam && bot.mass > BlobPhysics.minFeedMass)) {
+      if (!bot.netId) bot.netId = `bot-${Math.random().toString(36).slice(2)}`;
+      bot.mass -= BlobPhysics.feedCost;
+      bot.radius = radiusForMass(bot.mass);
+      ejected.push({ ...BlobPhysics.createFeed(bot,target.x-bot.x,target.y-bot.y,target),color:bot.color,ownerCellId:bot.netId,ownerUntil:performance.now()+700,createdAt:performance.now() });
+    }
+  }
   separatePlayerCells();
 }
 
@@ -650,7 +671,7 @@ function squareSplitPlayer() {
 
 function feedMass() {
   if (!running || feedCooldown > 0) return;
-  const dir = aimDirection();
+  const target = cursorWorldPosition();
   let fed = false;
   for (const cell of playerCells.filter(c => c.alive)) {
     const pendingCost = onlineMode ? [...pendingFeedCommands.values()].filter(command => command.ownerCellId === cell.netId).length * BlobPhysics.feedCost : 0;
@@ -658,7 +679,7 @@ function feedMass() {
     if (!cell.netId) cell.netId = `local-feed-owner-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`;
     if (!onlineMode) cell.mass -= BlobPhysics.feedCost;
     cell.radius = radiusForMass(cell.mass);
-    const pellet = { ...BlobPhysics.createFeed(cell, dir.x, dir.y),
+    const pellet = { ...BlobPhysics.createFeed(cell, target.x - cell.x, target.y - cell.y, target),
       netId: `feed-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`,
       color: cell.color, ownerUntil: performance.now() + 700, createdAt: performance.now(), ownerCellId: cell.netId };
     pellet.startX = pellet.x;
@@ -991,6 +1012,9 @@ function updateEjected(dt) {
     pellet.previousX = pellet.x;
     pellet.previousY = pellet.y;
     BlobPhysics.moveFeed(pellet, dt, worldSize);
+    const ease = 1 - Math.exp(-dt * 25);
+    pellet.drawX = Number.isFinite(pellet.drawX) ? pellet.drawX + (pellet.x-pellet.drawX)*ease : pellet.x;
+    pellet.drawY = Number.isFinite(pellet.drawY) ? pellet.drawY + (pellet.y-pellet.drawY)*ease : pellet.y;
   }
   const cells = [...playerCells, ...bots].filter(c => c.alive);
   for (let i = ejected.length - 1; i >= 0; i--) {
@@ -1000,7 +1024,7 @@ function updateEjected(dt) {
       continue;
     }
     if (onlineMode) continue;
-    const eater = cells.find(c => BlobPhysics.catchesFeed(c, pellet, pellet.previousX, pellet.previousY) && (!c.isPlayer || c.netId !== pellet.ownerCellId || performance.now() > pellet.ownerUntil));
+    const eater = cells.find(c => BlobPhysics.catchesFeed(c, pellet, pellet.previousX, pellet.previousY) && (c.netId !== pellet.ownerCellId || performance.now() > pellet.ownerUntil));
     if (eater) {
       eater.mass = safeMass(eater.mass) + clamp(safeMass(pellet.value), .1, 3);
       eater.radius = radiusForMass(eater.mass);
@@ -1079,6 +1103,7 @@ function returnToMainMenu() {
 
 function update(dt) {
   if (!running) return;
+  bots = bots.filter(bot => !bannedBotTeams.has(bot.botTeam || bot.name));
   updatePlayer(dt);
   maintainBotPopulation(dt);
   applyCpuAssistance(dt);
@@ -1162,7 +1187,7 @@ function drawFood(dot, time) {
 }
 
 function drawEjected(pellet) {
-  const s = worldToScreen(pellet.x, pellet.y);
+  const s = worldToScreen(pellet.drawX ?? pellet.x, pellet.drawY ?? pellet.y);
   const r = pellet.r * camera.zoom;
   ctx.fillStyle = pellet.color;
   ctx.shadowBlur = efficientGraphics ? 0 : 12;
@@ -1214,13 +1239,14 @@ function drawCell(cell) {
   ctx.beginPath();
   ctx.arc(s.x, s.y, r, 0, Math.PI * 2);
   ctx.fill();
-  if (cell.isPlayer && playerBlobImage) {
+  const skin = cell.isPlayer ? playerBlobImage : cell.isRemote ? remoteSkinImages.get(cell.remoteSessionId)?.image : null;
+  if (skin && skin.complete && skin.naturalWidth) {
     ctx.save();
     ctx.beginPath();
     ctx.arc(s.x, s.y, r * .94, 0, Math.PI * 2);
     ctx.clip();
     const size = r * 1.9;
-    ctx.drawImage(playerBlobImage, s.x - size / 2, s.y - size / 2, size, size);
+    ctx.drawImage(skin, s.x - size / 2, s.y - size / 2, size, size);
     ctx.restore();
   }
   ctx.shadowBlur = 0;
@@ -1296,7 +1322,14 @@ function updateUI() {
   ui.score.textContent = score.toLocaleString();
   ui.mass.textContent = Math.round(totalMass);
   ui.rank.textContent = `#${rank}`;
-  ui.list.innerHTML = standings.slice(0, 8).map(c => `<li class="${c.isPlayer ? "player" : ""}"><span>${c.name}</span><strong>${Math.round(c.mass)}</strong></li>`).join("");
+  document.querySelector("#leaderboard").classList.toggle("moderating", isAdmin);
+  ui.list.replaceChildren(...standings.slice(0,8).map(cell => {
+    const row=document.createElement("li"), name=document.createElement("span"), mass=document.createElement("strong");
+    row.className=cell.isPlayer?"player":"";
+    name.textContent=cell.name; mass.textContent=Math.round(cell.mass); row.append(name,mass);
+    if (isAdmin && !cell.isPlayer) row.addEventListener("click",()=>showModeration(cell));
+    return row;
+  }));
   document.querySelector("#botCount").textContent = `${bots.filter(bot => bot.alive).length} BOTS`;
 }
 
@@ -1333,11 +1366,60 @@ function loop(time) {
   requestAnimationFrame(loop);
 }
 
+function showModeration(cell) {
+  if (!isAdmin || !cell || cell.isPlayer) return;
+  selectedModerationTarget = {targetId:cell.remoteSessionId || null,botTeam:cell.isRemote?null:cell.botTeam||cell.name,name:cell.name};
+  document.querySelector("#moderationName").textContent=cell.name;
+  document.querySelector("#moderationMessage").textContent="Choose how long this player should be banned.";
+  document.querySelector("#moderationMenu").classList.remove("hidden");
+}
+document.querySelector("#closeModeration").addEventListener("click",()=>document.querySelector("#moderationMenu").classList.add("hidden"));
+document.querySelector("#botBanOptions").addEventListener("click",()=>showModeration(bots.find(bot=>(bot.botTeam||bot.name)===selectedTeamBot)));
+document.querySelector("#confirmBan").addEventListener("click",async()=>{
+  if (!isAdmin || !selectedModerationTarget) return;
+  const unit=document.querySelector("#banUnit").value;
+  const durationMs=unit==="forever"?null:Number(document.querySelector("#banDuration").value)*Number(unit);
+  const message=document.querySelector("#moderationMessage"), button=document.querySelector("#confirmBan");
+  if (durationMs!==null&&(!Number.isFinite(durationMs)||durationMs<1000)) {message.textContent="Choose at least one second.";return;}
+  button.disabled=true;
+  try {
+    if (onlineMode) await window.banPlayerOnline(selectedModerationTarget,durationMs);
+    else if (selectedModerationTarget.botTeam) {
+      const team=selectedModerationTarget.botTeam;
+      bannedBotTeams.add(team); bots=bots.filter(bot=>(bot.botTeam||bot.name)!==team);
+      if (durationMs!==null&&durationMs<2147483647) setTimeout(()=>bannedBotTeams.delete(team),durationMs);
+    }
+    message.textContent="Ban applied.";
+  } catch(error) {message.textContent=error.message;} finally {button.disabled=false;}
+});
+document.querySelector("#spikePainter").addEventListener("click",()=>{
+  if (!isAdmin) return;
+  spikePainter=!spikePainter;
+  document.querySelector("#spikePainter").textContent=`SPIKE PAINTER: ${spikePainter?"ON":"OFF"}`;
+  canvas.style.cursor=spikePainter?"cell":"crosshair";
+});
+function paintSpike(event) {
+  if (!spikePainter||!isAdmin||!running||performance.now()-lastPaintAt<80) return;
+  lastPaintAt=performance.now();
+  const point={x:clamp(camera.x+(event.clientX-width/2)/camera.zoom,42,worldSize-42),y:clamp(camera.y+(event.clientY-height/2)/camera.zoom,42,worldSize-42)};
+  if (viruses.length>=200||viruses.some(virus=>Math.hypot(virus.x-point.x,virus.y-point.y)<84)) return;
+  if (onlineMode) window.paintSpikesOnline([point]).catch(error=>{document.querySelector("#moderationMessage").textContent=error.message;});
+  else viruses.push({...point,r:42,angle:0});
+}
+canvas.addEventListener("pointerdown",event=>{
+  if (!spikePainter||!isAdmin||!running) return;
+  event.preventDefault();spikePainting=true;canvas.setPointerCapture(event.pointerId);lastPaintAt=-Infinity;paintSpike(event);
+});
+canvas.addEventListener("pointermove",event=>{if(spikePainting)paintSpike(event);});
+canvas.addEventListener("pointerup",()=>{spikePainting=false;});
+canvas.addEventListener("pointercancel",()=>{spikePainting=false;});
 document.querySelector("#playButton").addEventListener("click", resetGame);
 canvas.addEventListener("click", event => {
-  if (!running) return;
+  if (!running || spikePainter) return;
   const x = camera.x + (event.clientX - width / 2) / camera.zoom;
   const y = camera.y + (event.clientY - height / 2) / camera.zoom;
+  const remote=remotePlayerCells.find(cell=>cell.alive&&Math.hypot(cell.x-x,cell.y-y)<=cell.radius);
+  if (remote && isAdmin) { showModeration(remote); return; }
   const bot = [...bots].reverse().find(cell => cell.alive && Math.hypot(cell.x - x, cell.y - y) <= cell.radius);
   const menu = document.querySelector("#botTeamMenu");
   if (!bot) { menu.classList.add("hidden"); return; }
@@ -1345,23 +1427,10 @@ canvas.addEventListener("click", event => {
   document.querySelector("#botTeamMessage").textContent = teamedBots.has(selectedTeamBot) ? "Teammate: this bot cannot eat your last blob." : "A teammate cannot eat your last blob.";
   document.querySelector("#botTeamName").textContent = bot.name;
   document.querySelector("#botTeamToggle").textContent = teamedBots.has(selectedTeamBot) ? "STOP TEAMING" : "TEAM WITH BOT";
-  document.querySelector("#botFollowToggle").textContent = followedBotTeam === selectedTeamBot ? "RELEASE BOT" : "FOLLOW CURSOR";
+  document.querySelector("#botBanOptions").hidden = !isAdmin;
   menu.classList.remove("hidden");
 });
 document.querySelector("#closeBotTeam").addEventListener("click", () => document.querySelector("#botTeamMenu").classList.add("hidden"));
-document.querySelector("#botFollowToggle").addEventListener("click", async () => {
-  if (!running || !selectedTeamBot) return;
-  const button = document.querySelector("#botFollowToggle");
-  const team = followedBotTeam === selectedTeamBot ? null : selectedTeamBot;
-  button.disabled = true;
-  try {
-    if (onlineMode) await window.setBotFollowOnline(team);
-    else followedBotTeam = team;
-    button.textContent = followedBotTeam === selectedTeamBot ? "RELEASE BOT" : "FOLLOW CURSOR";
-    document.querySelector("#botTeamMessage").textContent = team ? "This bot follows your cursor. Choosing another replaces it." : "Bot released.";
-  } catch (error) { document.querySelector("#botTeamMessage").textContent = error.message; }
-  finally { button.disabled = false; }
-});
 document.querySelector("#botTeamToggle").addEventListener("click", async () => {
   if (!selectedTeamBot || !running) return;
   const team = selectedTeamBot;
@@ -1370,10 +1439,10 @@ document.querySelector("#botTeamToggle").addEventListener("click", async () => {
   button.disabled = true;
   try {
     if (onlineMode) await window.setBotTeamOnline(team, enabled);
-    else if (enabled) teamedBots.add(team);
-    else teamedBots.delete(team);
+    else if (enabled) { teamedBots.clear(); teamedBots.add(team); followedBotTeam=team; }
+    else { teamedBots.delete(team); followedBotTeam=null; }
     button.textContent = enabled ? "STOP TEAMING" : "TEAM WITH BOT";
-    document.querySelector("#botTeamMessage").textContent = enabled ? "Teammate: this bot cannot eat your last blob." : "No longer teaming.";
+    document.querySelector("#botTeamMessage").textContent = enabled ? "Following cursor. Hold R: bot feed. Press 1: bot split. Your last blob is protected." : "No longer teaming.";
   } catch { document.querySelector("#botTeamMessage").textContent = "Could not update team. Try again."; }
   finally { button.disabled = false; }
 });
@@ -1436,7 +1505,7 @@ addEventListener("wheel", e => {
   manualZoom = Math.max(Number.MIN_VALUE, manualZoom * Math.exp(-e.deltaY * .0012));
 }, { passive: false });
 addEventListener("keydown", e => {
-  if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+  if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLSelectElement) return;
   if (e.code === "KeyP" && !e.repeat) {
     if (running) {
       e.preventDefault();
@@ -1444,8 +1513,18 @@ addEventListener("keydown", e => {
     }
     return;
   }
-  if (e.code === "KeyR" && !e.repeat) {
-    instantlyRemerge();
+  if (e.code === "KeyR") {
+    if (running && followedBotTeam) { e.preventDefault(); keys.KeyR=true; }
+    else if (!e.repeat) instantlyRemerge();
+    return;
+  }
+  if (e.code === "Digit1" && !e.repeat && running && followedBotTeam) {
+    e.preventDefault();
+    if (onlineMode) pendingBotSplitCommands.add(`split-${Date.now()}-${Math.random()}`);
+    else {
+      const target=cursorWorldPosition();
+      for (const bot of [...bots].filter(bot=>(bot.botTeam||bot.name)===followedBotTeam)) splitBot(bot,{...target,mass:0,alive:true});
+    }
     return;
   }
   if (e.code === "KeyM" && !e.repeat) {

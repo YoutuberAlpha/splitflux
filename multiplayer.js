@@ -18,6 +18,25 @@
   let forceMenuVersion = 0;
   let remoteCellCache = new Map();
   let ejectedCache = new Map();
+  let networkDelay = 0;
+  let skinSource = null;
+  let networkSkin = "";
+  let lastSentSkin = null;
+  function updateNetworkSkin() {
+    if (skinSource === playerBlobImageData) return;
+    skinSource = playerBlobImageData;
+    if (!playerBlobImageData) { networkSkin=""; return; }
+    if (!playerBlobImage?.complete || !playerBlobImage.naturalWidth) {skinSource=null;return;}
+    const thumbnail=document.createElement("canvas");thumbnail.width=128;thumbnail.height=128;
+    thumbnail.getContext("2d").drawImage(playerBlobImage,0,0,128,128);
+    networkSkin=thumbnail.toDataURL("image/webp",.75);
+  }
+  function showBan(until) {
+    currentBanUntil=until;
+    returnToMainMenu();
+    document.querySelector("#adminUnlockStatus").textContent=until>=8640000000000000?"You are permanently banned from this arena.":`Banned until ${new Date(until).toLocaleString()}. Refresh after the ban expires.`;
+    connected=false;
+  }
 
   isAdmin = false;
   adminShortcut.classList.add("hidden", "inactive");
@@ -97,6 +116,8 @@
       ownerCellId: pellet.ownerCellId || "",
       dirX: pellet.dirX,
       dirY: pellet.dirY,
+      targetX: pellet.targetX,
+      targetY: pellet.targetY,
       color: pellet.color,
     };
   }
@@ -219,17 +240,9 @@
           _networkShared: true,
           _serverConfirmed: true,
         };
-        if (current) {
-          shared.x = current.x;
-          shared.y = current.y;
-          shared.vx = current.vx;
-          shared.vy = current.vy;
-        } else {
-          const vx = Number(pellet.vx) || 0;
-          const vy = Number(pellet.vy) || 0;
-          shared.x = Number(pellet.x) || 0;
-          shared.y = Number(pellet.y) || 0;
-        }
+        BlobPhysics.moveFeed(shared,networkDelay,worldSize);
+        shared.drawX=current?(current.drawX??current.x):shared.x;
+        shared.drawY=current?(current.drawY??current.y):shared.y;
         nextEjected.set(shared.netId, shared);
         return shared;
       });
@@ -272,8 +285,14 @@
           accent: lightenColor(remote.color || cell.color || "#55d6ff", 55),
           isPlayer: false,
           isRemote: true,
+          remoteSessionId: remote.id,
           botTeam: `remote-${remote.id}`,
         });
+        const cachedSkin=remoteSkinImages.get(remote.id);
+        if (remote.skinVersion && cachedSkin?.version!==remote.skinVersion) {
+          const image=new Image();image.src=`/api/skins/${encodeURIComponent(remote.id)}?v=${remote.skinVersion}`;
+          remoteSkinImages.set(remote.id,{image,version:remote.skinVersion});
+        } else if (!remote.skinVersion) remoteSkinImages.delete(remote.id);
         nextCache.set(key, networkCell);
         nextCells.push(networkCell);
       }
@@ -359,6 +378,10 @@
     const response = await fetch(`/api/session${ownerKey ? `?owner=${encodeURIComponent(ownerKey)}` : ""}`, {
       cache: "no-store",
     });
+    if (response.status===403) {
+      const blocked=await response.json();
+      if (blocked.bannedUntil) {showBan(blocked.bannedUntil);session=null;return;}
+    }
     if (!response.ok) throw new Error("The room server did not answer.");
     session = await response.json();
     networkRevision = 0;
@@ -369,6 +392,7 @@
     pendingFeedCommands.clear();
     ejected = [];
     ejectedCache.clear();
+    lastSentSkin=null;
     updateAdminAccess();
     connected = true;
     if (isAdmin) {
@@ -382,9 +406,11 @@
   }
 
   async function syncRoom() {
+    if (currentBanUntil>Date.now()) return;
     if (!session || syncing) return;
     syncing = true;
     try {
+      updateNetworkSkin();
       const payload = {
         id: session.id,
         sessionKey: session.sessionKey,
@@ -394,6 +420,8 @@
         score,
         immune: isAdmin && botImmunity,
         cursor: cursorWorldPosition(),
+        botFeeding: running && Boolean(followedBotTeam) && Boolean(keys.KeyR),
+        botSplitCommands: [...pendingBotSplitCommands].slice(0,8),
         ackRevision: networkRevision,
         ackWorldRevision: worldRevision,
         ackBotRevision: botRevision,
@@ -403,6 +431,7 @@
           ? [...pendingFeedCommands.values()].slice(0, 80).map(ejectedForNetwork)
           : [],
       };
+      if (networkSkin!==lastSentSkin) payload.skin=networkSkin;
       if (isAdmin && running) {
         payload.world = {
           worldSize,
@@ -411,6 +440,7 @@
         };
       }
       const sentMapSize = worldSize;
+      const requestAt=performance.now();
       const response = await fetch("/api/state", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -421,8 +451,16 @@
         await createSession();
         return;
       }
+      if (response.status===403) {
+        const blocked=await response.json();
+        if (blocked.bannedUntil) {showBan(blocked.bannedUntil);return;}
+      }
       if (!response.ok) throw new Error("Room sync failed.");
       const snapshot = await response.json();
+      networkDelay=Math.min(.15,(performance.now()-requestAt)/2000);
+      if (Object.hasOwn(payload,"skin")) lastSentSkin=payload.skin;
+      (snapshot.acceptedBotSplitCommands||[]).forEach(id=>pendingBotSplitCommands.delete(id));
+      bannedBotTeams=new Set(snapshot.bannedBotTeams||[]);
       const acceptedFeedIds = new Set(snapshot.acceptedFeedIds || []);
       acceptedFeedIds.forEach(id => pendingFeedCommands.delete(id));
       ejected.forEach(pellet => { if (acceptedFeedIds.has(pellet.netId)) pellet._serverConfirmed = true; });
@@ -533,6 +571,7 @@
     if (!response.ok) throw new Error("Team request failed");
     const result = await response.json();
     teamedBots = new Set(result.teamedBots);
+    followedBotTeam=result.followedBotTeam||null;
   };
 
   window.setBotFollowOnline = async function(team) {
@@ -542,6 +581,20 @@
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || "Follow request failed");
     followedBotTeam = result.followedBotTeam;
+  };
+
+  async function adminCommand(route, command) {
+    if (!session || !isAdmin) throw new Error("Admin access required");
+    const response=await fetch(`/api/admin/${route}`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:session.id,sessionKey:session.sessionKey,...command})});
+    const result=await response.json();
+    if (!response.ok) throw new Error(result.error||"Admin command failed");
+    return result;
+  }
+  window.banPlayerOnline=async(target,durationMs)=>adminCommand("ban",{...target,durationMs});
+  window.paintSpikesOnline=async(points)=>{
+    const result=await adminCommand("paint-spikes",{points});
+    viruses=result.viruses;
+    return result;
   };
 
   setInterval(syncRoom, 75);
