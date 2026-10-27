@@ -24,6 +24,7 @@
   let lastSentSkin = null;
   let teamRevision = 0;
   let nextSyncAt = 0;
+  const roomTransport=RoomTransport.create({fetch:(...args)=>fetch(...args),WebSocket});
   function updateNetworkSkin() {
     if (skinSource === playerBlobImageData) return;
     skinSource = playerBlobImageData;
@@ -402,6 +403,7 @@
       if (!response.ok) throw new Error(result.error);
       session.isAdmin = result.isAdmin;
       session.account = result.account;
+      roomTransport.reset();
       updateAdminAccess();
       document.querySelector("#accountPassword").value = "";
     } catch (error) {
@@ -434,6 +436,8 @@
     }
     if (!response.ok) throw new Error("The room server did not answer.");
     session = await response.json();
+    roomTransport.reset();
+    roomTransport.connect(session);
     networkRevision = 0;
     worldRevision = 0;
     botRevision = 0;
@@ -488,12 +492,8 @@
       for (const cell of playerCells) cell._syncMassWeights = { [cell.netId]: 1 };
       const sentMapSize = worldSize;
       const requestAt=performance.now();
-      const response = await fetch("/api/state", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-        cache: "no-store",
-      });
+      if(!roomTransport.realtime)roomTransport.connect(session);
+      const response = await roomTransport.state(payload);
       if (response.status === 401) {
         await createSession();
         return;
@@ -546,7 +546,7 @@
       applyRemotePlayers(snapshot.players);
       applyWorld(snapshot.world || lastWorld, hasBotCorrection, isAdmin && worldSize !== sentMapSize);
       if (!hasBotCorrection && hasBotMassCorrection) applyBotMassOnly(snapshot.world || lastWorld);
-      status.innerHTML = `<i class="status-dot"></i> ONLINE - ${lastPlayerCount} PLAYER${lastPlayerCount === 1 ? "" : "S"}`;
+      status.innerHTML = `<i class="status-dot"></i> ${roomTransport.realtime?"LIVE":"ONLINE"} - ${lastPlayerCount} PLAYER${lastPlayerCount === 1 ? "" : "S"}`;
       if (snapshot.self && snapshot.self.dead && running) endGame();
     } catch (error) {
       connected = false;
@@ -659,5 +659,5 @@
     return result;
   };
 
-  setInterval(syncRoom, 75);
+  setInterval(syncRoom, 50);
 })();

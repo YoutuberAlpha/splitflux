@@ -20,6 +20,7 @@ const accounts = require("./accounts.cjs")(dataDirectory, rememberedAdminKey, ad
 const moderation = require("./moderation.cjs")(dataDirectory, rememberedAdminKey);
 
 const sessions = new Map();
+let realtime=null;
 let ownerId = null;
 let world = null;
 let worldRevision = 0;
@@ -54,6 +55,7 @@ const files = {
   "/licenses/MultiOgar-LICENSE.md": ["licenses/MultiOgar-LICENSE.md", "text/plain; charset=utf-8"],
   "/licenses/agar-io-clone-LICENSE.txt": ["licenses/agar-io-clone-LICENSE.txt", "text/plain; charset=utf-8"],
   "/multiplayer.js": ["multiplayer.js", "text/javascript; charset=utf-8"],
+  "/transport.js": ["transport.js", "text/javascript; charset=utf-8"],
 };
 
 function sendJson(response, status, value) {
@@ -838,6 +840,15 @@ const handleRequest = async (request, response) => {
     return;
   }
 
+  if(request.method==="POST"&&url.pathname==="/api/realtime-ticket") {
+    try {
+      const body=await readBody(request),session=sessions.get(String(body.id||""));
+      if(!session||session.sessionKey!==body.sessionKey){sendJson(response,401,{error:"Session expired"});return;}
+      sendJson(response,200,realtime?realtime.issue(request,session):{available:false});
+    }catch{sendJson(response,400,{error:"Unable to connect"});}
+    return;
+  }
+
   if (request.method === "POST" && ["/api/accounts/login", "/api/accounts/register", "/api/accounts/logout"].includes(url.pathname)) {
     try {
       const body = await readBody(request);
@@ -850,6 +861,7 @@ const handleRequest = async (request, response) => {
       if (account && !account.isAdmin && moderation.until([`account:${account.username}`, `device:${session.deviceId}`])) throw new Error("This account or browser is currently banned.");
       session.account = account;
       session.isAdmin = Boolean(account && account.isAdmin);
+      realtime?.invalidateDevice(session.deviceId);
       if (!session.isAdmin) session.immune = false;
       session.lastSeen = Date.now();
       if (account) accounts.remember(response, account.username);
@@ -1131,6 +1143,12 @@ function advanceArena() {
 const fallbackTimer = cloudMode ? null : setInterval(advanceArena,40);
 fallbackTimer?.unref();
 
+function enableRealtime(target=server,dispatch=handleRequest){
+  realtime=require("./realtime.cjs").attachRealtime(target,{getSession:id=>sessions.get(id),dispatch});
+  return realtime;
+}
+if(!cloudMode&&typeof server.on==="function")enableRealtime();
+
 if (!cloudMode) server.listen(port, "0.0.0.0", () => {
   const addresses = [];
   for (const entries of Object.values(os.networkInterfaces())) {
@@ -1168,4 +1186,4 @@ function importState(state) {
   for (const session of state.sessions) sessions.set(session.id,{...session,feedIds:new Set(session.feedIds),
     botActionIds:new Set(session.botActionIds),teamedBots:new Set(session.teamedBots)});
 }
-module.exports = { server, handleRequest, advanceArena, exportState, importState };
+module.exports = { server, handleRequest, advanceArena, exportState, importState, enableRealtime };

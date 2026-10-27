@@ -6,10 +6,10 @@
   "scripts": {
     "start": "node server.cjs",
     "build": "node work/build-vercel.cjs",
-    "test": "node work/test-feed-teams.cjs && node work/test-follow-splits.cjs && node work/test-accounts.cjs && node work/test-physics-network.cjs && node work/test-arena-features.cjs && node work/test-server-authority.cjs && node work/test-cloud-runtime.cjs"
+    "test": "node work/test-feed-teams.cjs && node work/test-follow-splits.cjs && node work/test-accounts.cjs && node work/test-physics-network.cjs && node work/test-arena-features.cjs && node work/test-server-authority.cjs && node work/test-cloud-runtime.cjs && node work/test-realtime.cjs"
   },
   "engines": {
     "node": "22.x"
   },
-  "dependencies": {"pg":"8.23.1"}
+  "dependencies": {"pg":"8.23.1","ws":"8.22.0"}
 }
