@@ -68,7 +68,7 @@ assert(Math.abs(local.playerCells[0].mass-102.2)<.000001);
 
 const game = fs.readFileSync(path.join(__dirname, '..', 'game.js'), 'utf8');
 const splitCode = game.slice(game.indexOf('function aimDirection()'), game.indexOf('function feedMass()'));
-const feedCode = game.slice(game.indexOf('function feedMass()'),game.indexOf('function separatePlayerCells()'));
+const feedCode = game.slice(game.indexOf('function feedMass()'),game.indexOf('function separatePlayerCells('));
 const serializeCode = source.slice(source.indexOf('  function cellForNetwork('),source.indexOf('  function normalizeNetworkCell('));
 for (const [split, count] of [['splitPlayer',2],['quadSplitPlayer',4],['tripleSplitPlayer',3],['fiveSplitPlayer',5],['sixSplitPlayer',6],['squareSplitPlayer',4]]) {
   const race = vm.createContext({BlobPhysics:physics,running:true,width:1000,height:1000,pointer:{x:900,y:500},worldSize:10000,
@@ -78,10 +78,11 @@ for (const [split, count] of [['splitPlayer',2],['quadSplitPlayer',4],['tripleSp
   vm.runInContext(splitCode + correctionFunction, race);
   vm.runInContext(`${split}(); ${split}();
     playerCells.forEach(cell=>{cell.x+=1200;});
+    beforeCorrection=new Map(playerCells.map(cell=>[cell.netId,cell.mass]));
     applyOwnCells([{netId:'parent',mass:250,x:5000,y:5000,alive:true}],[{netId:'parent',mass:1000}]);`,race);
-  assert.equal(race.playerCells.length,count*count,'Delayed feed response must preserve all new pieces');
+  assert.equal(race.playerCells.length,Math.min(16,count*count),'Delayed feed response must preserve all new pieces (up to the 16-piece limit)');
   for (const cell of race.playerCells) {
-    assert(Math.abs(cell.mass-250/(count*count))<.000001,'Feed cost must be divided across every descendant, not crush the parent');
+    assert(Math.abs(cell.mass-race.beforeCorrection.get(cell.netId)*.25)<.000001,'Feed cost must be divided across every descendant in proportion, not crush the parent');
     assert(cell.x>6000,'A pre-split response must not teleport the parent backward');
     assert(Number.isFinite(cell.launchX||0));
   }

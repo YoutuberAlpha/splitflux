@@ -233,7 +233,9 @@
   function applyWorld(world, forceOwnerCorrection = false, preserveLocalMapSize = false) {
     if (!world) return;
     lastWorld = world;
+    const previousMapSize = worldSize;
     if (!preserveLocalMapSize) worldSize = Math.max(5200, Number(world.worldSize) || 5200);
+    if (worldSize !== previousMapSize) rebuildSharedFood();
     updateMapSizeLabel();
     if (Array.isArray(world.bots)) {
         const currentBots = new Map(bots.map(bot => [bot.netId, bot]));
@@ -289,6 +291,36 @@
       }
       ejectedCache = nextEjected;
     }
+  }
+
+  // Brings the shared food up to date: a full copy when joining, otherwise just the bites since last time.
+  // Bites this player made that the server has not seen yet are kept, so an older update never
+  // brings back a dot that was already eaten here (which would get eaten and counted twice).
+  function applyFoodSync(sync) {
+    if (!sync || !Number.isInteger(sync.seed)) return;
+    const unsent = new Set(foodClaims.map(claim => claim[0]));
+    if (typeof sync.full === "string") {
+      const bytes = Uint8Array.from(atob(sync.full), character => character.charCodeAt(0));
+      sharedFoodSeed = sync.seed;
+      sharedFoodVersions = new Uint8Array(BlobPhysics.food.count);
+      sharedFoodVersions.set(bytes.subarray(0, BlobPhysics.food.count));
+      for (const [index, version] of foodClaims) {
+        if (sharedFoodVersions[index] === version) sharedFoodVersions[index] = (version + 1) & 255;
+      }
+      sharedFoodRevision = sync.revision;
+      rebuildSharedFood();
+      return;
+    }
+    if (sync.seed !== sharedFoodSeed || !sharedFoodVersions) return;
+    for (const change of Array.isArray(sync.changes) ? sync.changes : []) {
+      const index = change[0], version = change[1];
+      if (!(index >= 0 && index < sharedFoodVersions.length) || sharedFoodVersions[index] === version) continue;
+      const localLead = (sharedFoodVersions[index] - version) & 255;
+      if (unsent.has(index) && localLead > 0 && localLead < 128) continue;
+      sharedFoodVersions[index] = version;
+      replaceFoodDot(index, sharedFoodDot(index));
+    }
+    sharedFoodRevision = sync.revision;
   }
 
   function applyBotMassOnly(world) {
@@ -487,6 +519,9 @@
         ejectedAdditions: running
           ? [...pendingFeedCommands.values()].slice(0, 80).map(ejectedForNetwork)
           : [],
+        foodClaims: running ? foodClaims.slice(0, 600) : [],
+        foodSeed: sharedFoodSeed,
+        ackFoodRevision: sharedFoodRevision,
       };
       if (networkSkin!==lastSentSkin) payload.skin=networkSkin;
       for (const cell of playerCells) cell._syncMassWeights = { [cell.netId]: 1 };
@@ -495,7 +530,14 @@
       if(!roomTransport.realtime)roomTransport.connect(session);
       const response = await roomTransport.state(payload);
       if (response.status === 401) {
+        // The server forgot this player (idle tab or restart), so it no longer knows their size.
+        // End the round cleanly instead of silently shrinking them back to a starting cell.
+        const lostRound = running;
         await createSession();
+        if (lostRound && session) {
+          returnToMainMenu();
+          document.querySelector("#adminUnlockStatus").textContent = "Connection to the arena was lost, so that round ended. Deploy again to keep playing.";
+        }
         return;
       }
       if (response.status===403) {
@@ -504,6 +546,10 @@
       }
       if (!response.ok) throw new Error("Room sync failed.");
       const snapshot = await response.json();
+      // These bites reached the server (confirmed or not); never send them twice.
+      const sentClaims = new Set(payload.foodClaims);
+      foodClaims = foodClaims.filter(claim => !sentClaims.has(claim));
+      applyFoodSync(snapshot.food);
       networkDelay=Math.min(.15,(performance.now()-requestAt)/2000);
       if (Object.hasOwn(payload,"skin")) lastSentSkin=payload.skin;
       (snapshot.acceptedBotSplitCommands||[]).forEach(id=>pendingBotSplitCommands.delete(id));
@@ -655,7 +701,8 @@
     applyWorld(result.world,true);
     if (worldSize!==oldSize) {
       const scale=worldSize/oldSize;
-      food.forEach(dot=>{dot.x*=scale;dot.y*=scale;});
+      // Shared food was already re-laid for the new size by applyWorld.
+      if (!sharedFoodVersions) food.forEach(dot=>{dot.x*=scale;dot.y*=scale;});
       playerCells.forEach(cell=>{cell.x*=scale;cell.y*=scale;});
       camera.x*=scale;camera.y*=scale;
       saveMapSizePreference(worldSize);
