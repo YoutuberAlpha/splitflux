@@ -34,6 +34,20 @@ let serverFallbackActive = false;
 let botRespawnBlockedUntil = 0;
 let targetBotTeams = 24;
 let botPieceCap = 96;
+// Each bot gets its own piece limit (like a player's 16), so one shattered bot can't use up
+// every slot. The overall limit only protects the server's speed.
+const BOT_TEAM_PIECES = 16;
+const BOT_COMMANDED_PIECES = 256;
+const BOT_PIECE_HARD_CAP = 512;
+// Bots get a little free growth to keep up with players, but never past what a 2,500-mass
+// player would justify, so the owner's X10 button can't inflate every bot in the arena.
+const BOT_ASSIST_MASS_CAP = 2500;
+// Big blobs slowly shrink so nobody (player or bot) can snowball forever:
+// every second, anything above 400 mass loses 0.2% of the extra.
+const DECAY_START_MASS = 400;
+const DECAY_RATE = .002;
+// New players can't be eaten (and can't eat) for 5 seconds, and bots ignore them meanwhile.
+const SPAWN_PROTECTION_MS = 5000;
 
 // Player anti-cheat limits. The client predicts its own movement for smooth play,
 // but the server decides what is physically possible before trusting it.
@@ -158,13 +172,61 @@ function cleanWorld(raw) {
     worldSize: number(raw.worldSize, 5200, 5200, 1e9),
     bots: cleanCells(raw.bots, "BOT", 220),
     viruses: Array.isArray(raw.viruses) ? raw.viruses.slice(0, 200).map(virus => ({
+      id: cleanText(virus.id, crypto.randomUUID(), 40),
       x: number(virus.x),
       y: number(virus.y),
       r: number(virus.r, 42, 1, 1000),
       angle: number(virus.angle),
     })) : [],
     ejected: [],
+    // Spikes grow back on their own unless the owner turns that off (or removes all spikes).
+    autoSpikes: raw.autoSpikes !== false,
+    nextSpikeAt: 0,
   };
+}
+
+function makeSpike(x, y) {
+  return { id: crypto.randomUUID(), x, y, r: 42, angle: Math.random() * Math.PI * 2 };
+}
+
+// 22 spikes on the normal 5,200 map; bigger maps get proportionally more (max 200).
+function spikeTarget() {
+  return Math.min(200, Math.round(22 * (world.worldSize / 5200) ** 2));
+}
+
+// Adds one spike every 1.5 seconds while the map has fewer than its target,
+// in a clear spot away from every blob and other spikes.
+function respawnSpikes(now) {
+  if (!world || world.autoSpikes === false || world.viruses.length >= spikeTarget() || now < (Number(world.nextSpikeAt) || 0)) return;
+  world.nextSpikeAt = now + 1500;
+  const cells = [...activePlayerCells(), ...world.bots.filter(bot => bot.alive)];
+  for (let attempt = 0; attempt < 30; attempt++) {
+    const x = 120 + Math.random() * (world.worldSize - 240), y = 120 + Math.random() * (world.worldSize - 240);
+    if (cells.some(cell => Math.hypot(cell.x - x, cell.y - y) < cell.radius + 160)) continue;
+    if (world.viruses.some(virus => Math.hypot(virus.x - x, virus.y - y) < 200)) continue;
+    world.viruses.push(makeSpike(x, y));
+    worldRevision++;
+    return;
+  }
+}
+
+// A player's game reports which spikes it popped; the server removes a spike only if one of that
+// player's pieces big enough to pop it (over 90 mass) really passed over it.
+function popSpikes(paths, rawPops) {
+  if (!world || !Array.isArray(rawPops) || !paths.length) return 0;
+  let popped = 0;
+  for (const raw of rawPops.slice(0, 16)) {
+    const index = world.viruses.findIndex(virus => virus.id === String(raw ?? ""));
+    if (index < 0) continue;
+    const virus = world.viruses[index];
+    const hit = paths.some(path => path.mass > 90 &&
+      distanceToPath(virus.x, virus.y, path.fromX, path.fromY, path.toX, path.toY) < path.radius + virus.r * .65 + path.margin);
+    if (!hit) continue;
+    world.viruses.splice(index, 1);
+    worldRevision++;
+    popped++;
+  }
+  return popped;
 }
 
 function distance(a, b) {
@@ -325,38 +387,44 @@ function ensureSafeOnlineSpawn(session) {
   const groupRadius = Math.max(...session.cells.map(cell => (
     Math.hypot(cell.x - center.x, cell.y - center.y) + cell.radius
   )));
-  const avoidCells = [];
+  // Only blobs big enough to eat the newcomer are dangerous. Each one gets a danger circle:
+  // its own size plus how far it can travel while the newcomer is protected, plus a margin.
+  const smallest = Math.min(...session.cells.map(cell => cell.mass));
+  const threats = [];
   for (const other of sessions.values()) {
     if (other.id === session.id || !other.running) continue;
-    avoidCells.push(...other.cells.filter(cell => cell.alive));
+    threats.push(...other.cells.filter(cell => cell.alive && cell.mass > smallest * 1.18));
   }
-  if (world) avoidCells.push(...world.bots.filter(bot => bot.alive));
+  if (world) threats.push(...world.bots.filter(bot => bot.alive && bot.mass > smallest * 1.18));
   const viruses = world ? world.viruses : [];
+  const danger = cell => cell.radius + playerSpeedFor(cell.mass) * SPAWN_PROTECTION_MS / 1000 + 150;
 
+  // How far a spot is outside every danger circle (negative = inside one).
   function clearanceAt(x, y) {
     let clearance = Infinity;
-    for (const cell of avoidCells) {
-      clearance = Math.min(clearance, Math.hypot(x - cell.x, y - cell.y) - groupRadius - cell.radius);
+    for (const cell of threats) {
+      clearance = Math.min(clearance, Math.hypot(x - cell.x, y - cell.y) - groupRadius - danger(cell));
     }
     for (const virus of viruses) {
-      clearance = Math.min(clearance, Math.hypot(x - virus.x, y - virus.y) - groupRadius - virus.r);
+      clearance = Math.min(clearance, Math.hypot(x - virus.x, y - virus.y) - groupRadius - virus.r - 40);
     }
     return clearance;
   }
 
-  if (clearanceAt(center.x, center.y) >= 220) {
-    session.spawnProtectedUntil = Date.now() + 2500;
+  if (clearanceAt(center.x, center.y) >= 0) {
+    session.spawnProtectedUntil = Date.now() + SPAWN_PROTECTION_MS;
     return;
   }
 
+  // Try up to 400 random spots and keep the safest one.
   const margin = Math.min(size / 2, Math.max(100, groupRadius + 100));
   let best = { x: size / 2, y: size / 2, clearance: -Infinity };
-  for (let attempt = 0; attempt < 180; attempt++) {
+  for (let attempt = 0; attempt < 400; attempt++) {
     const x = margin + Math.random() * Math.max(1, size - margin * 2);
     const y = margin + Math.random() * Math.max(1, size - margin * 2);
     const clearance = clearanceAt(x, y);
     if (clearance > best.clearance) best = { x, y, clearance };
-    if (clearance >= 220) break;
+    if (clearance >= 0) break;
   }
   const dx = best.x - center.x;
   const dy = best.y - center.y;
@@ -366,7 +434,30 @@ function ensureSafeOnlineSpawn(session) {
   }
   session.revision++;
   session.positionGraceUntil = Date.now() + 1500;
-  session.spawnProtectedUntil = Date.now() + 2500;
+  session.spawnProtectedUntil = Date.now() + SPAWN_PROTECTION_MS;
+}
+
+// Shrinks one blob by the decay for `seconds`; returns true if it changed.
+function decayCell(cell, seconds) {
+  if (!cell.alive || cell.mass <= DECAY_START_MASS || seconds <= 0) return false;
+  cell.mass -= (cell.mass - DECAY_START_MASS) * (1 - Math.exp(-DECAY_RATE * seconds));
+  cell.radius = Math.sqrt(cell.mass) * 4.2 + 8;
+  return true;
+}
+
+// Player decay is applied by the server once a second, like being eaten: the player's game
+// receives it as a small correction, so both sides always agree on the size.
+function decayPlayers(now) {
+  for (const session of sessions.values()) {
+    if (!session.running) { session.lastDecayAt = now; continue; }
+    const last = Number(session.lastDecayAt) || now;
+    if (now - last < 1000) { session.lastDecayAt = last; continue; }
+    const seconds = Math.min(2, (now - last) / 1000);
+    session.lastDecayAt = now;
+    let changed = false;
+    for (const cell of session.cells) if (decayCell(cell, seconds)) changed = true;
+    if (changed) session.revision++;
+  }
 }
 
 function ownerIsDrivingWorld() {
@@ -531,11 +622,14 @@ function simulateSharedEjected(dt) {
 }
 
 function splitServerBot(bot, target, burstPieces = 1, commanded = false) {
-  const limit = commanded ? Math.max(512,botPieceCap) : botPieceCap;
-  if (!world || !bot.alive || bot.mass < (commanded ? .000002 : 44) || world.bots.length >= limit) return;
-  const pieces = Math.max(1, Math.min(burstPieces, limit - world.bots.length));
+  if (!world || !bot.alive || bot.mass < (commanded ? .000002 : 44)) return 0;
+  const team = bot.botTeam || bot.name;
+  const teamPieces = world.bots.filter(other => other.alive && (other.botTeam || other.name) === team).length;
+  const room = Math.min((commanded ? BOT_COMMANDED_PIECES : BOT_TEAM_PIECES) - teamPieces, BOT_PIECE_HARD_CAP - world.bots.length);
+  if (room < 1) return 0;
+  const pieces = Math.max(1, Math.min(burstPieces, room));
   const pieceMass = bot.mass / (pieces + 1);
-  if (target && pieces === 1 && pieceMass < target.mass * 1.18) return;
+  if (target && pieces === 1 && pieceMass < target.mass * 1.18) return 0;
   bot.mass = pieceMass;
   bot.radius = Math.sqrt(pieceMass) * 4.2 + 8;
   bot.splitCooldown = pieces === 1 ? 1.15 + Math.random() * 1.2 : 3;
@@ -583,11 +677,12 @@ function splitServerBot(bot, target, burstPieces = 1, commanded = false) {
     };
     world.bots.push(child);
   }
+  return pieces;
 }
 
 function splitTeammate(session) {
   const pieces=world.bots.filter(bot=>bot.alive&&(bot.botTeam||bot.name)===session.followedBotTeam);
-  if (pieces.length*2>256 || world.bots.length+pieces.length>Math.max(512,botPieceCap)) return "Bot split limit reached. Wait for the pieces to merge.";
+  if (pieces.length*2>BOT_COMMANDED_PIECES || world.bots.length+pieces.length>BOT_PIECE_HARD_CAP) return "Bot split limit reached. Wait for the pieces to merge.";
   for (const bot of pieces) splitServerBot(bot,{...session.cursor,mass:0},1,true);
   botRevision++;
   return null;
@@ -610,8 +705,7 @@ function spawnServerBot() {
   const livingTeams = new Set(world.bots.filter(bot => bot.alive).map(bot => bot.botTeam));
   let name = SERVER_BOT_NAMES[serverBotCounter++ % SERVER_BOT_NAMES.length];
   while (livingTeams.has(name)) name = `${SERVER_BOT_NAMES[serverBotCounter++ % SERVER_BOT_NAMES.length]} ${Math.floor(serverBotCounter / SERVER_BOT_NAMES.length) + 1}`;
-  const largestPlayer = Math.max(28, ...players.map(cell => cell.mass));
-  const mass = 18 + Math.random() * Math.max(24, largestPlayer * .12);
+  const mass = 18 + Math.random() * Math.max(24, assistReferenceMass() * .12);
   const radius = Math.sqrt(mass) * 4.2 + 8;
   let best = { x: world.worldSize / 2, y: world.worldSize / 2, clearance: -Infinity };
   const avoid = [...players, ...world.bots.filter(bot => bot.alive)];
@@ -650,9 +744,15 @@ function spawnServerBot() {
   });
 }
 
-function resolveServerBotCollisions() {
+// The size bots are allowed to catch up to: the biggest player piece, capped.
+function assistReferenceMass() {
+  return Math.min(BOT_ASSIST_MASS_CAP, Math.max(28, ...activePlayerCells().map(cell => cell.mass)));
+}
+
+function resolveServerBotCollisions(dt = .04) {
   if (!world) return;
   const now = Date.now();
+  const pullStep = 270 * dt, pullShare = 1 - Math.exp(-1.08 * dt);
   for (let i = 0; i < world.bots.length; i++) {
     const a = world.bots[i];
     if (!a.alive) continue;
@@ -674,6 +774,11 @@ function resolveServerBotCollisions() {
           const dy=separation ? (b.y-a.y)/separation : 0;
           const push=Math.min(30,(a.radius+b.radius-separation)*.2);
           a.x-=dx*push;a.y-=dy*push;b.x+=dx*push;b.y+=dy*push;
+        } else if (a.alive && b.alive && separation > 0) {
+          // Pieces that may merge drift toward each other (same pull players' pieces have).
+          const pull = Math.min(pullStep, separation * pullShare);
+          const dx = (b.x - a.x) / separation, dy = (b.y - a.y) / separation;
+          a.x += dx * pull; a.y += dy * pull; b.x -= dx * pull; b.y -= dy * pull;
         }
         continue;
       }
@@ -700,14 +805,29 @@ function simulateServerBots(dt) {
   const size = world.worldSize;
   const players = activePlayerCells();
   const allTargets = [...players, ...world.bots];
-  const largestPlayer = Math.max(28, ...players.map(cell => cell.mass));
+  const reference = assistReferenceMass();
   const controllers = new Map(botControllers().map(entry => [entry.team, entry]));
+  // One "brain" per bot: its biggest piece decides where to go, the other pieces follow it
+  // (and head straight for it once they are allowed to merge back together).
+  const leaders = new Map();
+  for (const bot of world.bots) {
+    if (!bot.alive) continue;
+    const team = bot.botTeam || bot.name, leader = leaders.get(team);
+    if (!leader || bot.mass > leader.mass) leaders.set(team, bot);
+  }
+  const now = Date.now();
+  const protectedCells = new Set();
+  for (const session of sessions.values()) {
+    if (session.running && session.spawnProtectedUntil > now) for (const cell of session.cells) protectedCells.add(cell);
+  }
 
   for (const bot of world.bots) {
     if (!bot.alive) continue;
     bot.splitCooldown = Math.max(0, bot.splitCooldown - dt);
     const controller = controllers.get(bot.botTeam || bot.name);
-    const splitLineActive = !controller && Date.now() < (bot.splitLineUntil || 0);
+    const splitLineActive = !controller && now < (bot.splitLineUntil || 0);
+    const leader = leaders.get(bot.botTeam || bot.name);
+    const follower = !controller && !splitLineActive && leader && leader !== bot;
     if (controller) {
       bot.splitLineUntil = 0;
       bot.targetX = controller.x;
@@ -715,21 +835,26 @@ function simulateServerBots(dt) {
     } else if (splitLineActive) {
       bot.targetX = Math.max(0, Math.min(size, bot.x + (Number(bot.splitLineX) || 0) * 1800));
       bot.targetY = Math.max(0, Math.min(size, bot.y + (Number(bot.splitLineY) || 0) * 1800));
+    } else if (follower) {
+      const regroup = now >= (bot.serverMergeAt || 0) && now >= (leader.serverMergeAt || 0);
+      bot.targetX = regroup ? leader.x : leader.targetX;
+      bot.targetY = regroup ? leader.y : leader.targetY;
     } else {
       bot.think -= dt;
     }
-    if (bot.mass < largestPlayer * .42) {
-      bot.mass += Math.min(largestPlayer * .42 - bot.mass, Math.max(.5, largestPlayer * .005) * dt);
+    if (bot.mass < reference * .42) {
+      bot.mass += Math.min(reference * .42 - bot.mass, Math.max(.5, reference * .005) * dt);
       bot.radius = Math.sqrt(bot.mass) * 4.2 + 8;
     }
-    if (!controller && !splitLineActive && bot.think <= 0) {
+    decayCell(bot, dt);
+    if (!controller && !splitLineActive && !follower && bot.think <= 0) {
       bot.think = .18 + Math.random() * .3;
       let threat = null;
       let prey = null;
       let threatDistance = Infinity;
       let preyDistance = Infinity;
       for (const other of allTargets) {
-        if (!other.alive || other === bot || (other.botTeam && other.botTeam === bot.botTeam)) continue;
+        if (!other.alive || other === bot || (other.botTeam && other.botTeam === bot.botTeam) || protectedCells.has(other)) continue;
         const separation = distance(bot, other);
         if (other.mass > bot.mass * 1.2 && separation < threatDistance && separation < 760) {
           threat = other;
@@ -793,14 +918,15 @@ function simulateServerBots(dt) {
       candidate.alive && candidate.mass > 90 && distance(candidate, virus) < candidate.radius + virus.r * .65
     ));
     if (!bot) continue;
-    splitServerBot(bot, null, Math.min(6, botPieceCap - world.bots.length));
+    // If the bot can't split (piece limit reached) it just passes through and the spike stays.
+    if (!splitServerBot(bot, null, 6)) continue;
     world.viruses.splice(index, 1);
   }
 
-  resolveServerBotCollisions();
+  resolveServerBotCollisions(dt);
   resolveCollisions();
   const livingTeams = new Set(world.bots.filter(bot => bot.alive).map(bot => bot.botTeam));
-  if (Date.now() >= botRespawnBlockedUntil && livingTeams.size < targetBotTeams && world.bots.length < botPieceCap) spawnServerBot();
+  if (Date.now() >= botRespawnBlockedUntil && livingTeams.size < targetBotTeams && world.bots.length < BOT_PIECE_HARD_CAP) spawnServerBot();
   worldRevision++;
   botRevision++;
   return true;
@@ -867,7 +993,7 @@ function keepInsideWorld(cell, size) {
 // - total mass can only grow by the shared food the server confirms each piece reached,
 // - at most MAX_PLAYER_CELLS pieces.
 // Any correction bumps the session revision so the player's game snaps to the server's version.
-function validateClientCells(session, previousCells, cells, rawCells, spawning, now, rawClaims = [], rejectedFood = new Set()) {
+function validateClientCells(session, previousCells, cells, rawCells, spawning, now, rawClaims = [], rejectedFood = new Set(), rawPops = []) {
   const size = world ? world.worldSize : 5200;
   let corrected = false;
   const alive = cells.filter(cell => cell && cell.alive && Number.isFinite(cell.mass) && cell.mass > 0);
@@ -961,7 +1087,8 @@ function validateClientCells(session, previousCells, cells, rawCells, spawning, 
     // Speed and reach use the trusted size: claiming to be tiny does not make a piece faster,
     // and claiming to be huge does not let it reach far-away food.
     const speed = playerSpeedFor(Math.max(MIN_SPEED_MASS, Math.min(cell.mass, trusted), trusted * .25));
-    const reachRadius = cellRadius(Math.min(cell.mass, trusted * 1.2 + 30));
+    const pathMass = Math.min(cell.mass, trusted * 1.2 + 30);
+    const reachRadius = cellRadius(pathMass);
     cell.radius = reachRadius;
     // Movement allowance builds up over real time, so sending updates faster gains nothing.
     // Extra allowance for pieces pulling together / pushing apart only applies with several pieces.
@@ -998,19 +1125,21 @@ function validateClientCells(session, previousCells, cells, rawCells, spawning, 
     // so use a circle instead.
     const radius = reachRadius;
     entry.paths = grace
-      ? [{ id: cell.netId, fromX: cell.x, fromY: cell.y, toX: cell.x, toY: cell.y, radius, margin: 60 + speed * elapsed }]
-      : [{ id: cell.netId, fromX: ref.x, fromY: ref.y, toX: cell.x, toY: cell.y, radius, margin: 14 + radius * (severalPieces ? .35 : .1) }];
+      ? [{ id: cell.netId, fromX: cell.x, fromY: cell.y, toX: cell.x, toY: cell.y, radius, mass: pathMass, margin: 60 + speed * elapsed }]
+      : [{ id: cell.netId, fromX: ref.x, fromY: ref.y, toX: cell.x, toY: cell.y, radius, mass: pathMass, margin: 14 + radius * (severalPieces ? .35 : .1) }];
     // Pieces that merged into this one ate food on their own way in.
     for (const id of Object.keys(origins.get(cell.netId) || {})) {
       const merged = previous.get(id);
       if (merged && merged !== ref) entry.paths.push({ id, fromX: merged.x, fromY: merged.y, toX: cell.x, toY: cell.y,
-        radius: reachRadius, margin: 14 + reachRadius * .35 });
+        radius: reachRadius, mass: pathMass, margin: 14 + reachRadius * .35 });
     }
   }
 
   // Mass is exactly what the server already knew plus the food it just confirmed.
   // (Being eaten, eating others and feeding are applied by the server itself.)
-  const earned = claimFood(entries.flatMap(entry => entry.paths), rawClaims, rejectedFood);
+  const paths = entries.flatMap(entry => entry.paths);
+  const earned = claimFood(paths, rawClaims, rejectedFood);
+  popSpikes(paths, rawPops);
   const kept = entries.map(entry => entry.cell);
   const previousTotal = [...previous.values()].reduce((sum, cell) => sum + cell.mass, 0);
   const total = kept.reduce((sum, cell) => sum + cell.mass, 0);
@@ -1027,14 +1156,15 @@ function validateClientCells(session, previousCells, cells, rawCells, spawning, 
   return kept;
 }
 
-// The owner's own size is trusted, but bites still have to be near one of their pieces.
-function claimFoodForOwner(previousCells, cells, rawClaims, rejectedFood) {
+// The owner's own size is trusted, but bites and spike pops still have to be near one of their pieces.
+function ownerActions(previousCells, cells, rawClaims, rejectedFood, rawPops) {
   const previous = new Map((previousCells || []).map(cell => [cell.netId, cell]));
   const paths = cells.filter(cell => cell.alive).map(cell => {
     const from = previous.get(cell.netId) || cell;
-    return { id: cell.netId, fromX: from.x, fromY: from.y, toX: cell.x, toY: cell.y, radius: cell.radius, margin: 120 };
+    return { id: cell.netId, fromX: from.x, fromY: from.y, toX: cell.x, toY: cell.y, radius: cell.radius, mass: cell.mass, margin: 120 };
   });
   claimFood(paths, rawClaims, rejectedFood);
+  popSpikes(paths, rawPops);
 }
 
 function collisionDistance(a,b,now) {
@@ -1311,12 +1441,13 @@ const handleRequest = async (request, response) => {
         }
         if ([24,48,96,192].includes(body.botCount)) {
           targetBotTeams = body.botCount;
-          botPieceCap = Math.max(96, targetBotTeams * 2);
+          botPieceCap = Math.min(BOT_PIECE_HARD_CAP, targetBotTeams * BOT_TEAM_PIECES);
           const teams = [...new Set(world.bots.map(bot=>bot.botTeam||bot.name))];
           const keep = new Set(teams.slice(0,targetBotTeams));
           world.bots = world.bots.filter(bot=>keep.has(bot.botTeam||bot.name)).slice(0,botPieceCap);
         }
-        if (body.clearSpikes) world.viruses = [];
+        if (body.clearSpikes) { world.viruses = []; world.autoSpikes = false; }
+        if (typeof body.autoSpikes === "boolean") { world.autoSpikes = body.autoSpikes; world.nextSpikeAt = 0; }
         worldRevision++; botRevision++;
         sendJson(response,200,{world, self:sessionView(admin), botRevision});
       } else if (url.pathname.endsWith("/ban")) {
@@ -1340,7 +1471,7 @@ const handleRequest = async (request, response) => {
         for (const point of (Array.isArray(body.points) ? body.points : []).slice(0, 40)) {
           const x = number(point.x, 42, 42, world.worldSize - 42), y = number(point.y, 42, 42, world.worldSize - 42);
           if (world.viruses.length >= 200 || world.viruses.some(virus => Math.hypot(virus.x-x,virus.y-y) < 84)) continue;
-          world.viruses.push({x,y,r:42,angle:Math.random()*Math.PI*2}); added++;
+          world.viruses.push(makeSpike(x,y)); added++;
         }
         worldRevision++; botRevision++;
         sendJson(response, 200, {added,viruses:world.viruses});
@@ -1424,8 +1555,8 @@ const handleRequest = async (request, response) => {
         if (!session.running) session.cells = proposed;
         else if (session.isAdmin || trustClientForTests) {
           session.cells = proposed;
-          claimFoodForOwner(previousCells, proposed, body.foodClaims, rejectedFood);
-        } else session.cells = validateClientCells(session, previousCells, proposed, body.cells, !wasRunning, session.lastSeen, body.foodClaims, rejectedFood);
+          ownerActions(previousCells, proposed, body.foodClaims, rejectedFood, body.virusPops);
+        } else session.cells = validateClientCells(session, previousCells, proposed, body.cells, !wasRunning, session.lastSeen, body.foodClaims, rejectedFood, body.virusPops);
         if (wasRunning && session.lastSeen-previousSeen<400) for (const cell of session.cells) {
           const old=previous.get(cell.netId);
           if (!old || Math.hypot(cell.x-old.x,cell.y-old.y)>Math.max(1600,old.radius*3)) continue;
@@ -1501,12 +1632,7 @@ const handleRequest = async (request, response) => {
 };
 const server = http.createServer(handleRequest);
 
-world = cleanWorld({ worldSize: 5200, bots: [], viruses: Array.from({ length: 22 }, () => ({
-  x: 100 + Math.random() * 5000,
-  y: 100 + Math.random() * 5000,
-  r: 42,
-  angle: Math.random() * Math.PI * 2,
-})) });
+world = cleanWorld({ worldSize: 5200, bots: [], viruses: Array.from({ length: 22 }, () => makeSpike(100 + Math.random() * 5000, 100 + Math.random() * 5000)) });
 for (let index = 0; index < 24; index++) spawnServerBot();
 
 let lastFallbackTick = Date.now();
@@ -1515,6 +1641,8 @@ function tickArena(dt) {
   simulateSharedEjected(dt);
   simulateBotFeeding();
   simulateServerBots(dt);
+  respawnSpikes(Date.now());
+  decayPlayers(Date.now());
   resolveCollisions();
   if (world) {
     const before=world.bots.length;
@@ -1566,7 +1694,8 @@ function exportState() {
 }
 function importState(state) {
   if (!state || !state.world || !Array.isArray(state.sessions)) throw new Error("Invalid shared arena state");
-  world=state.world; foodState=importFoodState(state.food); signInGuard=importSignInGuard(state.signInGuard); worldRevision=state.worldRevision||0; botRevision=state.botRevision||0;
+  world=state.world; for (const virus of world.viruses || []) if (!virus.id) virus.id=crypto.randomUUID();
+  foodState=importFoodState(state.food); signInGuard=importSignInGuard(state.signInGuard); worldRevision=state.worldRevision||0; botRevision=state.botRevision||0;
   botMassRevision=state.botMassRevision||0; serverBotCounter=state.serverBotCounter||0;
   serverFallbackActive=Boolean(state.serverFallbackActive);botRespawnBlockedUntil=state.botRespawnBlockedUntil||0;
   targetBotTeams=state.targetBotTeams||24;botPieceCap=state.botPieceCap||96;

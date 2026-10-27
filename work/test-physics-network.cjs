@@ -46,7 +46,7 @@ assert.deepEqual(physics.direction(0,0), {x:1,y:0});
 
 const source = fs.readFileSync(path.join(__dirname,"..","multiplayer.js"),"utf8");
 const moving={netId:'moving',x:150,y:100,vx:300,vy:0,r:8,value:2.2,feedDrag:1000,createdAt:900,_serverConfirmed:true};
-const visual=vm.createContext({BlobPhysics:physics,worldSize:5200,bots:[],viruses:[],lastWorld:null,
+const visual=vm.createContext({BlobPhysics:physics,worldSize:5200,bots:[],viruses:[],lastWorld:null,poppedVirusIds:new Map(),autoSpikesOn:true,setAutoSpikesLabel(){},
   updateMapSizeLabel(){},isAdmin:false,normalizeNetworkCell:cell=>cell,mergeNetworkCell:(_,cell)=>cell,
   ejected:[moving],ejectedCache:new Map([['moving',moving]]),networkDelay:.08,performance:{now:()=>1000},Date});
 vm.runInContext(source.slice(source.indexOf('  function applyWorld('),source.indexOf('  function applyBotMassOnly(')),visual);

@@ -244,7 +244,12 @@
           isPlayer: false,
         }));
     }
-    if (Array.isArray(world.viruses)) viruses = world.viruses;
+    if (Array.isArray(world.viruses)) {
+      const now = performance.now();
+      for (const [id, until] of poppedVirusIds) if (until < now) poppedVirusIds.delete(id);
+      viruses = world.viruses.filter(virus => !poppedVirusIds.has(virus.id));
+    }
+    if (typeof world.autoSpikes === "boolean" && world.autoSpikes !== autoSpikesOn) setAutoSpikesLabel(world.autoSpikes);
     if (Array.isArray(world.ejected)) {
       const nextEjected = new Map();
       const localPending = ejected.filter(pellet => (
@@ -520,6 +525,7 @@
           ? [...pendingFeedCommands.values()].slice(0, 80).map(ejectedForNetwork)
           : [],
         foodClaims: running ? foodClaims.slice(0, 600) : [],
+        virusPops: running ? virusPops.slice(0, 16) : [],
         foodSeed: sharedFoodSeed,
         ackFoodRevision: sharedFoodRevision,
       };
@@ -549,6 +555,8 @@
       // These bites reached the server (confirmed or not); never send them twice.
       const sentClaims = new Set(payload.foodClaims);
       foodClaims = foodClaims.filter(claim => !sentClaims.has(claim));
+      const sentPops = new Set(payload.virusPops);
+      virusPops = virusPops.filter(id => !sentPops.has(id));
       applyFoodSync(snapshot.food);
       networkDelay=Math.min(.15,(performance.now()-requestAt)/2000);
       if (Object.hasOwn(payload,"skin")) lastSentSkin=payload.skin;
