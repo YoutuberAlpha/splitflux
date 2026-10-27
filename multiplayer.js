@@ -585,9 +585,13 @@
     bots = localBots;
   };
 
-  createSession().catch(() => {
-    status.innerHTML = '<i class="status-dot"></i> SERVER OFFLINE';
-  });
+  async function joinRoom(){
+    try{await createSession();}catch{
+      status.innerHTML = '<i class="status-dot"></i> WAKING SERVER - RETRYING';
+      setTimeout(joinRoom,3000);
+    }
+  }
+  joinRoom();
 
   window.killEveryoneOnline = async function killEveryoneOnline() {
     if (!session || !isAdmin) return;

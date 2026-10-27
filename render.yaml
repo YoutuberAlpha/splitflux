@@ -2,22 +2,16 @@ services:
   - type: web
     name: splitflux-server
     runtime: node
-    plan: 0.5c-512mb
-    region: ohio
+    plan: free
+    region: virginia
     numInstances: 1
-    buildCommand: node --check server.cjs
-    startCommand: node server.cjs
+    buildCommand: npm install --omit=dev
+    startCommand: node live-runtime.cjs
     healthCheckPath: /health
     envVars:
       - key: NODE_ENV
         value: production
       - key: NODE_VERSION
         value: 22
-      - key: SPLITFLUX_DATA_DIR
-        value: /var/data/splitflux
-      - key: SPLITFLUX_OWNER_PASSWORD
+      - key: DATABASE_URL
         sync: false
-    disk:
-      name: splitflux-data
-      mountPath: /var/data
-      sizeGB: 1

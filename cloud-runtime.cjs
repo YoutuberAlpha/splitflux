@@ -50,6 +50,11 @@ function createCloudHandler(pool, options={}) {
       const results=await client.query("BEGIN; SET LOCAL statement_timeout = '8s'; SET LOCAL lock_timeout = '5s'; SELECT payload FROM splitflux_arena WHERE id=1 FOR UPDATE");
       const result=Array.isArray(results)?results[results.length-1]:results;
       const snapshot=result.rows[0].payload;
+      if(snapshot?.liveOrigin){
+        await client.query("COMMIT");
+        await require("./backend-proxy.cjs").proxyBackend(request,response,snapshot.liveOrigin);
+        return;
+      }
       const engine=makeEngine(snapshot,directory);
       engine.advanceArena();
       const captured=captureResponse();
