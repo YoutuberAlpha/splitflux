@@ -34,6 +34,11 @@ let foodClaims = [];
 let ejected = [];
 const pendingFeedCommands = new Map();
 let viruses = [];
+// Online, spikes belong to the server. Pops are reported in virusPops, and a popped spike stays
+// hidden here for a moment so it doesn't flash back before the server confirms it is gone.
+let virusPops = [];
+const poppedVirusIds = new Map();
+let autoSpikesOn = true;
 let particles = [];
 let camera = { x: worldSize / 2, y: worldSize / 2, zoom: 1 };
 let pointer = { x: width / 2, y: height / 2 };
@@ -358,6 +363,7 @@ function resetGame() {
   playerColor = ui.colorInput.value;
   saveNamePreference(ui.name.value.trim());
   foodClaims = [];
+  virusPops = [];
   // Shared food is already up to date; only offline play makes a fresh random batch.
   if (!(sharedFoodVersions && onlineMode)) food = Array.from({ length: FOOD_COUNT }, makeFood);
   particles = [];
@@ -491,14 +497,9 @@ function steer(cell, tx, ty, dt) {
 
 function updatePlayer(dt) {
   const center = playerCenter();
-  let tx = center.x + (pointer.x - width / 2) / camera.zoom;
-  let ty = center.y + (pointer.y - height / 2) / camera.zoom;
-  const keyX = (keys.KeyD || keys.ArrowRight ? 1 : 0) - (keys.KeyA || keys.ArrowLeft ? 1 : 0);
-  const keyY = (keys.KeyS || keys.ArrowDown ? 1 : 0) - (keys.ArrowUp ? 1 : 0);
-  if (keyX || keyY) {
-    tx = center.x + keyX * 500;
-    ty = center.y + keyY * 500;
-  }
+  // Movement always follows the mouse (or the joystick on phones, which moves the same pointer).
+  const tx = center.x + (pointer.x - width / 2) / camera.zoom;
+  const ty = center.y + (pointer.y - height / 2) / camera.zoom;
   playerCells.filter(c => c.alive).forEach(cell => steer(cell, tx, ty, dt));
   feedCooldown = Math.max(0, feedCooldown - dt);
   if (keys.KeyW) feedMass();
@@ -774,6 +775,10 @@ function handleViruses() {
     for (const cell of playerCells.filter(c => c.alive)) {
       if (!botImmunity && performance.now() >= cell.virusImmuneUntil && distance(cell, virus) < cell.radius + virus.r * .65 && cell.mass > 90) {
         burstPlayerCell(cell);
+        if (onlineMode && virus.id) {
+          virusPops.push(virus.id);
+          poppedVirusIds.set(virus.id, performance.now() + 2500);
+        }
         consumed = true;
         break;
       }
@@ -1111,6 +1116,36 @@ function endGame() {
   document.querySelector("#adminShortcut").classList.add("inactive");
   ui.finalScore.textContent = score.toLocaleString();
   setTimeout(() => ui.death.classList.remove("hidden"), 500);
+}
+
+// Leaving a round needs two presses within 1.5 seconds, so one accidental tap doesn't end it.
+let menuArmedUntil = 0;
+function requestMainMenu(message) {
+  if (!running) return;
+  const now = performance.now();
+  if (now < menuArmedUntil) {
+    menuArmedUntil = 0;
+    showGameNotice("", 0);
+    returnToMainMenu();
+    return;
+  }
+  menuArmedUntil = now + 1500;
+  showGameNotice(message, 1500);
+}
+
+function showGameNotice(text, milliseconds) {
+  let notice = document.querySelector("#gameNotice");
+  if (!notice) {
+    notice = document.createElement("div");
+    notice.id = "gameNotice";
+    notice.className = "game-notice";
+    notice.setAttribute("role", "status");
+    document.body.append(notice);
+  }
+  notice.textContent = text;
+  notice.classList.toggle("visible", Boolean(text && milliseconds));
+  clearTimeout(showGameNotice.timer);
+  if (milliseconds) showGameNotice.timer = setTimeout(() => notice.classList.remove("visible"), milliseconds);
 }
 
 function returnToMainMenu() {
@@ -1539,6 +1574,7 @@ document.querySelector("#clearBlobImage").addEventListener("click", () => {
 });
 document.querySelector("#instantMerge").addEventListener("pointerdown", instantlyRemerge);
 document.querySelector("#removeSpikes").addEventListener("pointerdown", removeAllSpikes);
+document.querySelector("#autoSpikes").addEventListener("pointerdown", toggleAutoSpikes);
 document.querySelector("#killEveryone").addEventListener("pointerdown", killEveryone);
 document.querySelectorAll("[data-multiplier]").forEach(button => button.addEventListener("pointerdown", () => multiplyPlayer(Number(button.dataset.multiplier))));
 document.querySelectorAll("[data-divisor]").forEach(button => button.addEventListener("pointerdown", () => dividePlayer(Number(button.dataset.divisor))));
@@ -1583,10 +1619,11 @@ addEventListener("keydown", e => {
   }
   if (e.code === "KeyM" && !e.repeat) {
     e.preventDefault();
-    returnToMainMenu();
+    requestMainMenu("Press M again to leave this round");
     return;
   }
-  if (e.code === "KeyS" && !e.repeat) {
+  // Owner shortcut is Shift+S so a stray S press can't wipe every spike in the arena.
+  if (e.code === "KeyS" && e.shiftKey && !e.repeat) {
     e.preventDefault();
     removeAllSpikes();
     return;
@@ -1705,6 +1742,22 @@ function removeAllSpikes() {
   if (!isAdmin) return;
   if (onlineMode) { window.configureArenaOnline({clearSpikes:true}).catch(showArenaError); return; }
   viruses = [];
+  setAutoSpikesLabel(false);
+}
+
+// Owner switch: should spikes grow back after being popped or removed?
+function toggleAutoSpikes() {
+  if (!isAdmin) return;
+  if (onlineMode) { window.configureArenaOnline({autoSpikes:!autoSpikesOn}).catch(showArenaError); return; }
+  setAutoSpikesLabel(!autoSpikesOn);
+  while (autoSpikesOn && viruses.length < VIRUS_COUNT) viruses.push(makeVirus());
+}
+
+function setAutoSpikesLabel(on) {
+  autoSpikesOn = on;
+  const state = document.querySelector("#autoSpikesState");
+  if (state) state.textContent = on ? "ON" : "OFF";
+  document.querySelector("#autoSpikes")?.classList.toggle("active", on);
 }
 
 function killEveryone() {
@@ -1951,7 +2004,7 @@ function bindMobilePointerPress(selector, action) {
 }
 
 bindMobilePointerPress("#mobileSplit", splitPlayer);
-bindMobilePointerPress("#mobileMenu", returnToMainMenu);
+bindMobilePointerPress("#mobileMenu", () => requestMainMenu("Tap MENU again to leave this round"));
 bindMobilePointerPress("#mobileZoomOut", () => {
   manualZoom = Math.max(Number.MIN_VALUE, manualZoom * .62);
 });
@@ -1975,7 +2028,8 @@ document.querySelectorAll("[data-mobile-action]").forEach(button => {
     if (action) action();
   });
 });
-function releaseHeldActions() {stopMobileFeed();keys.KeyT=false;spikePainting=false;}
+// When the window loses focus the browser never sends the key-up, so forget every held key.
+function releaseHeldActions() {stopMobileFeed();keys={};spikePainting=false;}
 addEventListener("blur", releaseHeldActions);
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) releaseHeldActions();

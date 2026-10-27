@@ -49,7 +49,7 @@ async function state(handler,who,extra={}) {
   await state(second,owner);
   assert.equal(owner.snapshot.isAdmin,true,"Remembered owner login must work on another instance");
   const bot={netId:"fixture-bot",name:"Alex",botTeam:"Alex",x:2000,y:2000,mass:200,alive:true};
-  await state(first,owner,{world:{worldSize:5200,bots:[bot],viruses:[]}});
+  await state(first,owner,{world:{worldSize:5200,bots:[bot],viruses:[],autoSpikes:false}});
   await state(second,guest);
   assert.equal(guest.snapshot.world.bots[0].netId,"fixture-bot");
   assert.equal((await request(second,guest,"/api/team",{...credentials(guest),team:"Alex",enabled:true})).status,200);
