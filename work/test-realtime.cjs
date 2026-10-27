@@ -31,7 +31,7 @@ async function state(connection,payload){
 (async()=>{
   const sockets=[];
   try{
-    processHandle=spawn(process.execPath,[path.join(__dirname,"..","server.cjs")],{env:{...process.env,PORT:"11008",SPLITFLUX_DATA_DIR:directory,SPLITFLUX_OWNER_PASSWORD:"test-owner-password"},stdio:["ignore","pipe","pipe"]});
+    processHandle=spawn(process.execPath,[path.join(__dirname,"..","server.cjs")],{env:{...process.env,NODE_ENV:"test",SPLITFLUX_TEST_TRUST_CLIENT:"1",PORT:"11008",SPLITFLUX_DATA_DIR:directory,SPLITFLUX_OWNER_PASSWORD:"test-owner-password"},stdio:["ignore","pipe","pipe"]});
     await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(new Error("Server did not start")),10000);processHandle.once("error",reject);processHandle.stdout.on("data",chunk=>{if(chunk.toString().includes("OWNER PC:")){clearTimeout(timer);resolve();}});});
     const first=client(),second=client();
     first.session=(await request(first,"/api/session")).body;second.session=(await request(second,"/api/session")).body;

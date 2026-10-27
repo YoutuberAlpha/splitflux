@@ -25,6 +25,12 @@ let player;
 let playerCells = [];
 let bots = [];
 let food = [];
+// Online, food is shared: the server sends a seed plus a version per slot and every dot's spot is
+// computed with BlobPhysics.food.at(). Bites are reported in foodClaims for the server to confirm.
+let sharedFoodSeed = null;
+let sharedFoodVersions = null;
+let sharedFoodRevision = -1;
+let foodClaims = [];
 let ejected = [];
 const pendingFeedCommands = new Map();
 let viruses = [];
@@ -351,7 +357,9 @@ function resetGame() {
   }
   playerColor = ui.colorInput.value;
   saveNamePreference(ui.name.value.trim());
-  food = Array.from({ length: FOOD_COUNT }, makeFood);
+  foodClaims = [];
+  // Shared food is already up to date; only offline play makes a fresh random batch.
+  if (!(sharedFoodVersions && onlineMode)) food = Array.from({ length: FOOD_COUNT }, makeFood);
   particles = [];
   ejected = [];
   if (!onlineMode) {
@@ -505,7 +513,7 @@ function updatePlayer(dt) {
       ejected.push({ ...BlobPhysics.createFeed(bot,target.x-bot.x,target.y-bot.y,target,worldSize),color:bot.color,ownerCellId:bot.netId,ownerUntil:performance.now()+700,createdAt:performance.now() });
     }
   }
-  separatePlayerCells();
+  separatePlayerCells(dt);
 }
 
 function playerCenter() {
@@ -538,14 +546,33 @@ function combineMassCorrections(target, source) {
   }
 }
 
+// Split rules (same idea as agar.io): a piece must keep at least MIN_SPLIT_PIECE_MASS
+// (so a cell needs 35 mass to split in two) and a player can have at most MAX_PLAYER_CELLS pieces.
+// The biggest pieces split first; when the limit is close, a trick split makes as many pieces as fit.
+const MAX_PLAYER_CELLS = 16;
+const MIN_SPLIT_PIECE_MASS = 17.5;
+
+function splittablePieces(cell, wanted, cellCount) {
+  const byCount = MAX_PLAYER_CELLS - cellCount + 1;
+  const byMass = Math.floor(cell.mass / MIN_SPLIT_PIECE_MASS);
+  return Math.max(1, Math.min(wanted, byCount, byMass));
+}
+
+function cellsBySize() {
+  return playerCells.filter(c => c.alive).sort((a, b) => b.mass - a.mass);
+}
+
 function splitPlayer() {
   if (!running) return;
   const dir = aimDirection();
   const now = performance.now();
   const newCells = [];
-  for (const cell of playerCells.filter(c => c.alive)) {
+  let count = playerCells.filter(c => c.alive).length;
+  for (const cell of cellsBySize()) {
+    if (splittablePieces(cell, 2, count) < 2) continue;
+    count++;
     partitionMassCorrection(cell, 2);
-    cell.mass = Math.max(cell.mass / 2, .000001);
+    cell.mass = cell.mass / 2;
     cell.radius = radiusForMass(cell.mass);
     cell.mergeAt = now + 3000;
     const child = { ...cell, netId: `cell-${Math.random().toString(36).slice(2)}` };
@@ -562,24 +589,28 @@ function splitPlayer() {
   player = playerCells.find(c => c.alive) || player;
 }
 
-function quadSplitPlayer() {
+// Shared by the triple/quad/five/six "line" tricks: pieces launch one behind another.
+function lineSplitPlayer(wanted, launchBase, launchStep) {
   if (!running) return;
-  const original = playerCells.filter(c => c.alive);
   const dir = aimDirection();
   const now = performance.now();
   const result = [];
-  for (const cell of original) {
-    partitionMassCorrection(cell, 4);
-    const pieceMass = Math.max(cell.mass / 4, .000001);
+  let count = playerCells.filter(c => c.alive).length;
+  for (const cell of cellsBySize()) {
+    const pieces = splittablePieces(cell, wanted, count);
+    if (pieces < 2) continue;
+    count += pieces - 1;
+    partitionMassCorrection(cell, pieces);
+    const pieceMass = cell.mass / pieces;
     cell.mass = pieceMass;
     cell.radius = radiusForMass(pieceMass);
     cell.mergeAt = now + 3000;
-    for (let i = 1; i <= 3; i++) {
+    for (let i = 1; i < pieces; i++) {
       const child = { ...cell, netId: `cell-${Math.random().toString(36).slice(2)}` };
       child.x = boundCell(cell.x + dir.x * Math.min(4, cell.radius * .04) * i, cell.radius);
       child.y = boundCell(cell.y + dir.y * Math.min(4, cell.radius * .04) * i, cell.radius);
-      child.launchX = dir.x * (520 + i * 120) * Math.max(1, cell.radius / 70);
-      child.launchY = dir.y * (520 + i * 120) * Math.max(1, cell.radius / 70);
+      child.launchX = dir.x * (launchBase + i * launchStep) * Math.max(1, cell.radius / 70);
+      child.launchY = dir.y * (launchBase + i * launchStep) * Math.max(1, cell.radius / 70);
       child.splitBirthAt = now;
       result.push(child);
     }
@@ -587,89 +618,22 @@ function quadSplitPlayer() {
   playerCells.push(...result);
 }
 
-function tripleSplitPlayer() {
-  if (!running) return;
-  const original = playerCells.filter(c => c.alive);
-  const dir = aimDirection();
-  const now = performance.now();
-  const result = [];
-  for (const cell of original) {
-    partitionMassCorrection(cell, 3);
-    const pieceMass = Math.max(cell.mass / 3, .000001);
-    cell.mass = pieceMass;
-    cell.radius = radiusForMass(pieceMass);
-    cell.mergeAt = now + 3000;
-    for (let i = 1; i <= 2; i++) {
-      const child = { ...cell, netId: `cell-${Math.random().toString(36).slice(2)}` };
-      child.x = boundCell(cell.x + dir.x * Math.min(4, cell.radius * .04) * i, cell.radius);
-      child.y = boundCell(cell.y + dir.y * Math.min(4, cell.radius * .04) * i, cell.radius);
-      child.launchX = dir.x * (560 + i * 140) * Math.max(1, cell.radius / 70);
-      child.launchY = dir.y * (560 + i * 140) * Math.max(1, cell.radius / 70);
-      child.splitBirthAt = now;
-      result.push(child);
-    }
-  }
-  playerCells.push(...result);
-}
-
-function fiveSplitPlayer() {
-  if (!running) return;
-  const original = playerCells.filter(c => c.alive);
-  const dir = aimDirection();
-  const now = performance.now();
-  const result = [];
-  for (const cell of original) {
-    partitionMassCorrection(cell, 5);
-    const pieceMass = Math.max(cell.mass / 5, .000001);
-    cell.mass = pieceMass;
-    cell.radius = radiusForMass(pieceMass);
-    cell.mergeAt = now + 3000;
-    for (let i = 1; i <= 4; i++) {
-      const child = { ...cell, netId: `cell-${Math.random().toString(36).slice(2)}` };
-      child.x = boundCell(cell.x + dir.x * Math.min(4, cell.radius * .04) * i, cell.radius);
-      child.y = boundCell(cell.y + dir.y * Math.min(4, cell.radius * .04) * i, cell.radius);
-      child.launchX = dir.x * (500 + i * 115) * Math.max(1, cell.radius / 70);
-      child.launchY = dir.y * (500 + i * 115) * Math.max(1, cell.radius / 70);
-      child.splitBirthAt = now;
-      result.push(child);
-    }
-  }
-  playerCells.push(...result);
-}
-
-function sixSplitPlayer() {
-  if (!running) return;
-  const original = playerCells.filter(c => c.alive);
-  const dir = aimDirection();
-  const now = performance.now();
-  const result = [];
-  for (const cell of original) {
-    partitionMassCorrection(cell, 6);
-    const pieceMass = Math.max(cell.mass / 6, .000001);
-    cell.mass = pieceMass;
-    cell.radius = radiusForMass(pieceMass);
-    cell.mergeAt = now + 3000;
-    for (let i = 1; i <= 5; i++) {
-      const child = { ...cell, netId: `cell-${Math.random().toString(36).slice(2)}` };
-      child.x = boundCell(cell.x + dir.x * Math.min(4, cell.radius * .04) * i, cell.radius);
-      child.y = boundCell(cell.y + dir.y * Math.min(4, cell.radius * .04) * i, cell.radius);
-      child.launchX = dir.x * (480 + i * 105) * Math.max(1, cell.radius / 70);
-      child.launchY = dir.y * (480 + i * 105) * Math.max(1, cell.radius / 70);
-      child.splitBirthAt = now;
-      result.push(child);
-    }
-  }
-  playerCells.push(...result);
-}
+function quadSplitPlayer() { lineSplitPlayer(4, 520, 120); }
+function tripleSplitPlayer() { lineSplitPlayer(3, 560, 140); }
+function fiveSplitPlayer() { lineSplitPlayer(5, 500, 115); }
+function sixSplitPlayer() { lineSplitPlayer(6, 480, 105); }
 
 function squareSplitPlayer() {
   if (!running) return;
-  const original = playerCells.filter(c => c.alive);
   const now = performance.now();
   const result = [];
-  for (const cell of original) {
-    partitionMassCorrection(cell, 4);
-    const pieceMass = Math.max(cell.mass / 4, .000001);
+  let count = playerCells.filter(c => c.alive).length;
+  for (const cell of cellsBySize()) {
+    const pieces = splittablePieces(cell, 4, count);
+    if (pieces < 2) continue;
+    count += pieces - 1;
+    partitionMassCorrection(cell, pieces);
+    const pieceMass = cell.mass / pieces;
     const centerX = cell.x;
     const centerY = cell.y;
     cell.mass = pieceMass;
@@ -680,7 +644,7 @@ function squareSplitPlayer() {
       { x: 1, y: -1 },
       { x: -1, y: 1 },
       { x: 1, y: 1 },
-    ];
+    ].slice(0, pieces);
     for (const offset of offsets) {
       const piece = offset.original ? cell : { ...cell, netId: `cell-${Math.random().toString(36).slice(2)}` };
       piece.x = boundCell(centerX + offset.x * cell.radius * .08, cell.radius);
@@ -723,8 +687,11 @@ function feedMass() {
   if (fed) feedCooldown = BlobPhysics.feeding.interval;
 }
 
-function separatePlayerCells() {
+// Pull/push strength is per second (tuned to match the old 60 fps feel), so a 240 fps
+// screen no longer merges or separates pieces four times faster than a 60 fps one.
+function separatePlayerCells(dt = 1 / 60) {
   const now = performance.now();
+  const pullStep = 270 * dt, pullShare = 1 - Math.exp(-1.08 * dt), pushShare = 1 - Math.exp(-3.4 * dt);
   for (let i = 0; i < playerCells.length; i++) for (let j = i + 1; j < playerCells.length; j++) {
     const a = playerCells[i], b = playerCells[j];
     if (!a.alive || !b.alive) continue;
@@ -741,14 +708,14 @@ function separatePlayerCells() {
       continue;
     }
     if (canMerge) {
-      const pull = Math.min(4.5, d * .018);
+      const pull = Math.min(pullStep, d * pullShare);
       a.x += dx / d * pull; a.y += dy / d * pull;
       b.x -= dx / d * pull; b.y -= dy / d * pull;
       continue;
     }
     const overlap = a.radius + b.radius - d;
     if (overlap > 0) {
-      const push = overlap * .055;
+      const push = overlap * pushShare;
       a.x -= dx / d * push; a.y -= dy / d * push;
       b.x += dx / d * push; b.y += dy / d * push;
     }
@@ -757,8 +724,8 @@ function separatePlayerCells() {
 }
 
 function burstPlayerCell(cell) {
-  if (!cell.alive || cell.mass < 90 || playerCells.length >= 16) return;
-  const pieces = Math.min(6, 16 - playerCells.length);
+  if (!cell.alive || cell.mass < 90 || playerCells.length >= MAX_PLAYER_CELLS) return;
+  const pieces = Math.min(6, MAX_PLAYER_CELLS - playerCells.length);
   partitionMassCorrection(cell, pieces + 1);
   const pieceMass = cell.mass / (pieces + 1);
   cell.mass = pieceMass;
@@ -1022,13 +989,31 @@ function eatFood(cell) {
       cell.mass += food[i].value;
       if (cell.isPlayer) score += Math.ceil(food[i].value * 3);
       if (food.length <= 12000 || cell.isPlayer) emit(food[i].x, food[i].y, food[i].color, food.length > 12000 ? 1 : 2);
-      const oldKey = foodBucketKey(food[i]);
-      foodBuckets.get(oldKey)?.delete(i);
-      if (!foodBuckets.get(oldKey)?.size) foodBuckets.delete(oldKey);
-      food[i] = makeFood();
-      addFoodIndex(i);
+      if (sharedFoodVersions && onlineMode) {
+        if (cell.isPlayer) foodClaims.push([i, sharedFoodVersions[i], cell.netId || ""]);
+        sharedFoodVersions[i] = (sharedFoodVersions[i] + 1) & 255;
+        replaceFoodDot(i, sharedFoodDot(i));
+      } else replaceFoodDot(i, makeFood());
     }
   }
+}
+
+function replaceFoodDot(index, dot) {
+  const oldKey = foodBucketKey(food[index]);
+  foodBuckets.get(oldKey)?.delete(index);
+  if (!foodBuckets.get(oldKey)?.size) foodBuckets.delete(oldKey);
+  food[index] = dot;
+  addFoodIndex(index);
+}
+
+function sharedFoodDot(index) {
+  const dot = BlobPhysics.food.at(sharedFoodSeed, index, sharedFoodVersions[index], worldSize);
+  return { x: dot.x, y: dot.y, r: dot.r, value: dot.value, color: COLORS[dot.colorIndex], pulse: dot.pulse };
+}
+
+function rebuildSharedFood() {
+  if (!sharedFoodVersions) return;
+  food = Array.from({ length: sharedFoodVersions.length }, (_, index) => sharedFoodDot(index));
 }
 
 function updateEjected(dt) {

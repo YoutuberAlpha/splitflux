@@ -23,6 +23,9 @@ const sessions = new Map();
 let realtime=null;
 let ownerId = null;
 let world = null;
+// Shared food: one seed for the arena plus how many times each slot was eaten (0-255).
+// Positions come from BlobPhysics.food.at(), so only these small numbers are stored and sent.
+let foodState = null;
 let worldRevision = 0;
 let botRevision = 0;
 let botMassRevision = 0;
@@ -31,6 +34,33 @@ let serverFallbackActive = false;
 let botRespawnBlockedUntil = 0;
 let targetBotTeams = 24;
 let botPieceCap = 96;
+
+// Player anti-cheat limits. The client predicts its own movement for smooth play,
+// but the server decides what is physically possible before trusting it.
+// Food is dense, so a new cell (28 mass) can eat a little before its first update reaches the server.
+const SPAWN_MASS_LIMIT = 50;
+const MAX_PLAYER_CELLS = 16;
+const PLAYER_BASE_SPEED = 235;
+// The smallest piece the rules can make is a spike burst (90 mass into 7 = ~12.9).
+// Speed is never computed below this, so made-up tiny pieces cannot zip across the map.
+const MIN_SPEED_MASS = 12;
+const FOOD_COUNT = BlobPhysics.food.count;
+const FOOD_LOG_LIMIT = 1500;
+const MAX_FOOD_CLAIMS = 600;
+// Only isolated tests that are not about anti-cheat may skip these checks.
+const trustClientForTests = process.env.NODE_ENV === "test" && process.env.SPLITFLUX_TEST_TRUST_CLIENT === "1";
+foodState = createFoodState();
+
+// Sign-in protection against password guessing (bug 4). Wrong passwords are counted per account
+// (works even if an attacker keeps clearing cookies), per browser, and across the whole server.
+const SIGN_IN_WINDOW_MS = 15 * 60_000;
+const ACCOUNT_FREE_FAILURES = 5;
+const DEVICE_FREE_FAILURES = 10;
+const SERVER_FAILURE_LIMIT = 100;
+const SERVER_FAILURE_WINDOW_MS = 10 * 60_000;
+const DEVICE_REGISTRATIONS_PER_HOUR = 3;
+const SERVER_REGISTRATIONS_PER_HOUR = 40;
+let signInGuard = createSignInGuard();
 
 const SERVER_BOT_NAMES = [
   "Alex", "Maya", "Jordan", "Sofia", "Ethan", "Chloe", "Noah", "Ava",
@@ -141,6 +171,135 @@ function distance(a, b) {
   return Math.hypot(a.x - b.x, a.y - b.y);
 }
 
+function createSignInGuard() {
+  return { accounts: Object.create(null), devices: Object.create(null), failures: [], registrations: [] };
+}
+
+function importSignInGuard(saved) {
+  const guard = createSignInGuard();
+  if (!saved || typeof saved !== "object") return guard;
+  for (const key of ["accounts", "devices"]) Object.assign(guard[key], saved[key] && typeof saved[key] === "object" ? saved[key] : {});
+  if (Array.isArray(saved.failures)) guard.failures = saved.failures.filter(Number.isFinite);
+  if (Array.isArray(saved.registrations)) guard.registrations = saved.registrations.filter(entry => entry && Number.isFinite(entry.time));
+  return guard;
+}
+
+function pruneSignInGuard(now) {
+  for (const map of [signInGuard.accounts, signInGuard.devices]) {
+    for (const [key, entry] of Object.entries(map)) {
+      if (now - entry.first > SIGN_IN_WINDOW_MS && now >= (entry.lockedUntil || 0)) delete map[key];
+    }
+  }
+  signInGuard.failures = signInGuard.failures.filter(time => now - time < SERVER_FAILURE_WINDOW_MS);
+  signInGuard.registrations = signInGuard.registrations.filter(entry => now - entry.time < 3_600_000);
+}
+
+function signInKey(username) {
+  return String(username || "").trim().toLowerCase().slice(0, 40);
+}
+
+// Milliseconds until this sign-in may be tried again (0 = allowed now).
+function signInWait(username, deviceId, now) {
+  pruneSignInGuard(now);
+  const waits = [signInGuard.accounts[signInKey(username)]?.lockedUntil, signInGuard.devices[deviceId]?.lockedUntil]
+    .map(until => (Number(until) || 0) - now);
+  if (signInGuard.failures.length >= SERVER_FAILURE_LIMIT) waits.push(signInGuard.failures[0] + SERVER_FAILURE_WINDOW_MS - now);
+  return Math.max(0, ...waits);
+}
+
+function recordSignInFailure(username, deviceId, now) {
+  signInGuard.failures.push(now);
+  const lock = (map, key, free, longest) => {
+    const entry = map[key] || (map[key] = { first: now, failures: 0, lockedUntil: 0 });
+    entry.failures++;
+    // After the free tries, each extra wrong password doubles the wait: 1, 2, 4 ... minutes.
+    if (entry.failures >= free) entry.lockedUntil = now + Math.min(longest, 60_000 * 2 ** (entry.failures - free));
+  };
+  lock(signInGuard.accounts, signInKey(username), ACCOUNT_FREE_FAILURES, 60 * 60_000);
+  lock(signInGuard.devices, deviceId, DEVICE_FREE_FAILURES, 15 * 60_000);
+}
+
+function recordSignInSuccess(username, deviceId) {
+  delete signInGuard.accounts[signInKey(username)];
+  delete signInGuard.devices[deviceId];
+}
+
+function registrationWait(deviceId, now) {
+  pruneSignInGuard(now);
+  const mine = signInGuard.registrations.filter(entry => entry && entry.device === deviceId);
+  if (mine.length >= DEVICE_REGISTRATIONS_PER_HOUR) return mine[0].time + 3_600_000 - now;
+  if (signInGuard.registrations.length >= SERVER_REGISTRATIONS_PER_HOUR) return signInGuard.registrations[0].time + 3_600_000 - now;
+  return 0;
+}
+
+function tryAgainMessage(wait) {
+  const minutes = Math.ceil(wait / 60_000);
+  return `Too many attempts. Try again in ${minutes} minute${minutes === 1 ? "" : "s"}.`;
+}
+
+function createFoodState() {
+  return { seed: crypto.randomInt(1, 2 ** 31), versions: new Uint8Array(FOOD_COUNT), revision: 0, log: [] };
+}
+
+function exportFoodState() {
+  return { seed: foodState.seed, versions: Buffer.from(foodState.versions).toString("base64"), revision: foodState.revision, log: foodState.log };
+}
+
+function importFoodState(saved) {
+  if (!saved || !Number.isInteger(saved.seed) || typeof saved.versions !== "string") return createFoodState();
+  const versions = new Uint8Array(FOOD_COUNT);
+  versions.set(Buffer.from(saved.versions, "base64").subarray(0, FOOD_COUNT));
+  return { seed: saved.seed, versions, revision: Number(saved.revision) || 0, log: Array.isArray(saved.log) ? saved.log.slice(-FOOD_LOG_LIMIT) : [] };
+}
+
+function eatFoodSlot(index) {
+  const version = (foodState.versions[index] + 1) & 255;
+  foodState.versions[index] = version;
+  foodState.revision++;
+  foodState.log.push([index, version]);
+  if (foodState.log.length > FOOD_LOG_LIMIT) foodState.log.splice(0, foodState.log.length - FOOD_LOG_LIMIT);
+}
+
+// What a player needs to bring their copy of the food up to date.
+function foodSyncFor(body, rejected) {
+  const ack = Number(body.ackFoodRevision);
+  const behind = foodState.revision - ack;
+  if (body.foodSeed !== foodState.seed || !Number.isInteger(ack) || behind < 0 || behind > foodState.log.length) {
+    return { seed: foodState.seed, revision: foodState.revision, full: Buffer.from(foodState.versions).toString("base64") };
+  }
+  const changes = behind ? foodState.log.slice(foodState.log.length - behind) : [];
+  for (const index of rejected) changes.push([index, foodState.versions[index]]);
+  return { seed: foodState.seed, revision: foodState.revision, changes };
+}
+
+function distanceToPath(x, y, fromX, fromY, toX, toY) {
+  const dx = toX - fromX, dy = toY - fromY, length = dx * dx + dy * dy;
+  const t = length ? Math.max(0, Math.min(1, ((x - fromX) * dx + (y - fromY) * dy) / length)) : 0;
+  return Math.hypot(x - fromX - dx * t, y - fromY - dy * t);
+}
+
+// Each claim is [slot, version the player saw, piece id]. A bite counts only if that dot still exists
+// and lies on the path a piece actually travelled since the last update. Returns the mass earned.
+function claimFood(paths, rawClaims, rejected) {
+  if (!Array.isArray(rawClaims) || !paths.length) return 0;
+  const size = world ? world.worldSize : 5200;
+  const byId = new Map(paths.map(path => [path.id, path]));
+  let earned = 0;
+  for (const claim of rawClaims.slice(0, MAX_FOOD_CLAIMS)) {
+    if (!Array.isArray(claim)) continue;
+    const index = Number(claim[0]), version = Number(claim[1]);
+    if (!Number.isInteger(index) || index < 0 || index >= FOOD_COUNT || !Number.isInteger(version)) continue;
+    if (foodState.versions[index] !== (version & 255)) { rejected.add(index); continue; }
+    const dot = BlobPhysics.food.at(foodState.seed, index, version, size);
+    const named = byId.get(String(claim[2]));
+    const reaches = path => distanceToPath(dot.x, dot.y, path.fromX, path.fromY, path.toX, path.toY) <= path.radius + dot.r + path.margin;
+    if (!(named && reaches(named)) && !paths.some(reaches)) { rejected.add(index); continue; }
+    eatFoodSlot(index);
+    earned += dot.value;
+  }
+  return earned;
+}
+
 function safeMass(value) {
   return Math.max(1, Number.isFinite(Number(value)) ? Number(value) : 1);
 }
@@ -206,6 +365,7 @@ function ensureSafeOnlineSpawn(session) {
     cell.y = Math.max(cell.radius, Math.min(size - cell.radius, cell.y + dy));
   }
   session.revision++;
+  session.positionGraceUntil = Date.now() + 1500;
   session.spawnProtectedUntil = Date.now() + 2500;
 }
 
@@ -648,6 +808,9 @@ function simulateServerBots(dt) {
 
 function acceptClientCells(session, rawCells, ackRevision) {
   const incoming=cleanCells(rawCells,session.name,256);
+  // A client can only acknowledge a revision this server actually sent it.
+  // Claiming a newer one used to make the server forget that the player was eaten.
+  if (ackRevision>(Number(session.lastReplyRevision)||0)) ackRevision=-1;
   if (ackRevision>=session.revision) return incoming;
   if (session.lastReplyCells && ackRevision>=session.lastReplyRevision) {
     const current=new Map(session.cells.map(cell=>[cell.netId,cell]));
@@ -675,6 +838,203 @@ function acceptClientCells(session, rawCells, ackRevision) {
     const pose=positions.get(cell.netId);
     return pose?{...cell,x:pose.x,y:pose.y,vx:pose.vx,vy:pose.vy}:cell;
   });
+}
+
+function cellRadius(mass) {
+  return Math.sqrt(Math.max(.000001, mass)) * 4.2 + 8;
+}
+
+function playerSpeedFor(mass) {
+  return PLAYER_BASE_SPEED / Math.pow(Math.max(.000001, mass) / 25, .18);
+}
+
+// Pieces that grow or get pushed apart can poke slightly past the wall for a frame before the
+// game clamps them, so small overshoots are fixed quietly; only real escapes count as a correction.
+function keepInsideWorld(cell, size) {
+  const x = cell.x, y = cell.y;
+  if (cell.radius * 2 >= size) { cell.x = size / 2; cell.y = size / 2; }
+  else {
+    cell.x = Math.max(cell.radius, Math.min(size - cell.radius, cell.x));
+    cell.y = Math.max(cell.radius, Math.min(size - cell.radius, cell.y));
+  }
+  return Math.hypot(cell.x - x, cell.y - y) > 40 + cell.radius * .5;
+}
+
+// Checks a guest/player update against what the game rules allow:
+// - a new round starts at the normal starting size,
+// - pieces stay inside the map and cannot move faster than their speed (plus split boosts),
+// - new pieces must come from a living piece (an eaten piece cannot come back),
+// - total mass can only grow by the shared food the server confirms each piece reached,
+// - at most MAX_PLAYER_CELLS pieces.
+// Any correction bumps the session revision so the player's game snaps to the server's version.
+function validateClientCells(session, previousCells, cells, rawCells, spawning, now, rawClaims = [], rejectedFood = new Set()) {
+  const size = world ? world.worldSize : 5200;
+  let corrected = false;
+  const alive = cells.filter(cell => cell && cell.alive && Number.isFinite(cell.mass) && cell.mass > 0);
+  const elapsed = Math.min(2, Math.max(0, (now - (Number(session.lastValidatedAt) || now)) / 1000));
+  session.lastValidatedAt = now;
+
+  if (spawning) {
+    const group = alive.slice(0, MAX_PLAYER_CELLS);
+    if (!group.length) return [];
+    const total = group.reduce((sum, cell) => sum + cell.mass, 0);
+    const scale = total > SPAWN_MASS_LIMIT ? SPAWN_MASS_LIMIT / total : 1;
+    if (scale !== 1 || group.length !== alive.length) corrected = true;
+    const anchor = group[0];
+    for (const cell of group) {
+      cell.mass *= scale;
+      cell.radius = cellRadius(cell.mass);
+      if (cell !== anchor && Math.hypot(cell.x - anchor.x, cell.y - anchor.y) > 400) {
+        cell.x = anchor.x; cell.y = anchor.y; corrected = true;
+      }
+      if (keepInsideWorld(cell, size)) corrected = true;
+      cell._travelCredit = 0;
+      cell._boostCredit = 0;
+    }
+    // Bites taken before this first update are removed from the map; the size cap above already
+    // covers the mass they were worth.
+    claimFood(group.map(cell => ({ id: cell.netId, fromX: cell.x, fromY: cell.y, toX: cell.x, toY: cell.y, radius: cell.radius, margin: 60 })), rawClaims, rejectedFood);
+    if (corrected) session.revision++;
+    return group;
+  }
+
+  const previous = new Map();
+  for (const cell of previousCells || []) if (cell && cell.alive) previous.set(cell.netId, cell);
+  if (!previous.size) {
+    // Every piece was eaten (or never existed); nothing the client sends can bring it back.
+    if (alive.length) session.revision++;
+    return [];
+  }
+  const origins = new Map();
+  for (const raw of Array.isArray(rawCells) ? rawCells : []) {
+    if (raw && typeof raw === "object" && raw.massOrigins && typeof raw.massOrigins === "object") {
+      origins.set(cleanText(raw.netId, "", 80), raw.massOrigins);
+    }
+  }
+
+  const entries = [];
+  const splitParents = new Set();
+  for (const cell of alive) {
+    let ref = previous.get(cell.netId), isNew = false;
+    if (!ref) {
+      isNew = true;
+      let living = 0, lost = 0, best = null, bestWeight = 0;
+      for (const [id, value] of Object.entries(origins.get(cell.netId) || {})) {
+        const weight = Number(value);
+        if (!Number.isFinite(weight) || weight <= 0) continue;
+        const parent = previous.get(id);
+        if (parent) {
+          living += weight;
+          if (weight > bestWeight) { best = parent; bestWeight = weight; }
+        } else lost += weight;
+      }
+      // Made-up pieces, and pieces mostly made of an eaten piece, are rejected.
+      if (!best || lost > living) { corrected = true; continue; }
+      ref = best;
+      splitParents.add(best.netId);
+    }
+    entries.push({ cell, ref, isNew });
+  }
+
+  if (entries.length > MAX_PLAYER_CELLS) {
+    // Keep existing pieces first, then the biggest new ones. Extra mass goes back to the
+    // largest kept piece so an old client that over-splits does not lose size.
+    entries.sort((a, b) => (a.isNew - b.isNew) || (b.cell.mass - a.cell.mass));
+    const dropped = entries.splice(MAX_PLAYER_CELLS);
+    const extra = dropped.reduce((sum, entry) => sum + entry.cell.mass, 0);
+    const largest = entries.reduce((best, entry) => entry.cell.mass > best.cell.mass ? entry : best, entries[0]);
+    largest.cell.mass += extra;
+    corrected = true;
+  }
+
+  const grace = now < (Number(session.positionGraceUntil) || 0);
+  const severalPieces = entries.length > 1 || previous.size > 1;
+  for (const entry of entries) {
+    const { cell, ref, isNew } = entry;
+    // How big this piece really is as far as the server knows: its share of the pieces it came from.
+    let trusted = 0;
+    for (const [id, value] of Object.entries(origins.get(cell.netId) || {})) {
+      const weight = Number(value), origin = previous.get(id);
+      if (origin && Number.isFinite(weight) && weight > 0) trusted += origin.mass * Math.min(1, weight);
+    }
+    if (!(trusted > 0)) trusted = isNew ? ref.mass / 2 : ref.mass;
+    // Speed and reach use the trusted size: claiming to be tiny does not make a piece faster,
+    // and claiming to be huge does not let it reach far-away food.
+    const speed = playerSpeedFor(Math.max(MIN_SPEED_MASS, Math.min(cell.mass, trusted), trusted * .25));
+    const reachRadius = cellRadius(Math.min(cell.mass, trusted * 1.2 + 30));
+    cell.radius = reachRadius;
+    // Movement allowance builds up over real time, so sending updates faster gains nothing.
+    // Extra allowance for pieces pulling together / pushing apart only applies with several pieces.
+    let travelCredit = Math.min((Number(ref._travelCredit) || 0) + (speed * 1.3 + (severalPieces ? 320 : 0)) * elapsed, speed * 1.2 + 150);
+    let boostCredit = (Number(ref._boostCredit) || 0) * Math.exp(-elapsed / 1.2);
+    const parentRadius = Number(ref.radius) || cellRadius(ref.mass);
+    if (isNew) boostCredit += 400 * Math.max(1, parentRadius / 70) + parentRadius * 2 + 120;
+    else if (splitParents.has(cell.netId)) boostCredit += parentRadius * 2 + 120;
+    const dx = cell.x - ref.x, dy = cell.y - ref.y;
+    const distance = Math.hypot(dx, dy);
+    let moved = Number.isFinite(distance) ? distance : 0;
+    if (grace) {
+      travelCredit = 0;
+      boostCredit = 0;
+    } else {
+      const allowed = travelCredit + boostCredit;
+      if (moved > allowed + 1) {
+        const keep = allowed / moved;
+        cell.x = ref.x + dx * keep;
+        cell.y = ref.y + dy * keep;
+        moved = allowed;
+        corrected = true;
+      }
+      const fromTravel = Math.min(moved, travelCredit);
+      travelCredit -= fromTravel;
+      boostCredit = Math.max(0, boostCredit - (moved - fromTravel));
+    }
+    if (keepInsideWorld(cell, size)) corrected = true;
+    cell._travelCredit = travelCredit;
+    cell._boostCredit = boostCredit;
+    // The stretch of map this piece covered since the last update. Pieces of one player jostle
+    // sideways as they push apart and pull together, hence the wider margin when there are several.
+    // While the server itself is moving the player (spawn spot, map resize) the route is unknown,
+    // so use a circle instead.
+    const radius = reachRadius;
+    entry.paths = grace
+      ? [{ id: cell.netId, fromX: cell.x, fromY: cell.y, toX: cell.x, toY: cell.y, radius, margin: 60 + speed * elapsed }]
+      : [{ id: cell.netId, fromX: ref.x, fromY: ref.y, toX: cell.x, toY: cell.y, radius, margin: 14 + radius * (severalPieces ? .35 : .1) }];
+    // Pieces that merged into this one ate food on their own way in.
+    for (const id of Object.keys(origins.get(cell.netId) || {})) {
+      const merged = previous.get(id);
+      if (merged && merged !== ref) entry.paths.push({ id, fromX: merged.x, fromY: merged.y, toX: cell.x, toY: cell.y,
+        radius: reachRadius, margin: 14 + reachRadius * .35 });
+    }
+  }
+
+  // Mass is exactly what the server already knew plus the food it just confirmed.
+  // (Being eaten, eating others and feeding are applied by the server itself.)
+  const earned = claimFood(entries.flatMap(entry => entry.paths), rawClaims, rejectedFood);
+  const kept = entries.map(entry => entry.cell);
+  const previousTotal = [...previous.values()].reduce((sum, cell) => sum + cell.mass, 0);
+  const total = kept.reduce((sum, cell) => sum + cell.mass, 0);
+  const expected = previousTotal + earned;
+  const tolerance = .05 + expected * 1e-6;
+  if (total > 0 && Math.abs(total - expected) > tolerance) {
+    const scale = expected / total;
+    for (const cell of kept) cell.mass *= scale;
+    // Reporting less than the server knows only happens after a lost reply; no snap needed then.
+    if (total > expected) corrected = true;
+  }
+  for (const cell of kept) cell.radius = cellRadius(cell.mass);
+  if (corrected) session.revision++;
+  return kept;
+}
+
+// The owner's own size is trusted, but bites still have to be near one of their pieces.
+function claimFoodForOwner(previousCells, cells, rawClaims, rejectedFood) {
+  const previous = new Map((previousCells || []).map(cell => [cell.netId, cell]));
+  const paths = cells.filter(cell => cell.alive).map(cell => {
+    const from = previous.get(cell.netId) || cell;
+    return { id: cell.netId, fromX: from.x, fromY: from.y, toX: cell.x, toY: cell.y, radius: cell.radius, margin: 120 };
+  });
+  claimFood(paths, rawClaims, rejectedFood);
 }
 
 function collisionDistance(a,b,now) {
@@ -857,7 +1217,26 @@ const handleRequest = async (request, response) => {
         sendJson(response, 401, { error: "Refresh the game before signing in." });
         return;
       }
-      const account = url.pathname.endsWith("/logout") ? null : await accounts.authenticate(body.username, body.password, url.pathname.endsWith("/register"));
+      const registering = url.pathname.endsWith("/register");
+      let account = null;
+      if (!url.pathname.endsWith("/logout")) {
+        const now = Date.now();
+        const wait = registering ? registrationWait(session.deviceId, now) : signInWait(body.username, session.deviceId, now);
+        if (wait > 0) {
+          sendJson(response, 429, { error: tryAgainMessage(wait), retryAfter: Math.ceil(wait / 1000) });
+          return;
+        }
+        // New accounts need 8+ characters; older accounts with shorter passwords can still sign in.
+        if (registering && String(body.password || "").length < 8) throw new Error("Use a password with at least 8 characters.");
+        try {
+          account = await accounts.authenticate(body.username, body.password, registering);
+        } catch (error) {
+          if (!registering && error.message === "Incorrect username or password.") recordSignInFailure(body.username, session.deviceId, Date.now());
+          throw error;
+        }
+        if (registering) signInGuard.registrations.push({ time: Date.now(), device: session.deviceId });
+        else recordSignInSuccess(body.username, session.deviceId);
+      }
       if (account && !account.isAdmin && moderation.until([`account:${account.username}`, `device:${session.deviceId}`])) throw new Error("This account or browser is currently banned.");
       session.account = account;
       session.isAdmin = Boolean(account && account.isAdmin);
@@ -928,7 +1307,7 @@ const handleRequest = async (request, response) => {
             if (Number.isFinite(item.targetY)) item.targetY *= scale;
           }
           world.worldSize = nextSize;
-          for (const player of sessions.values()) player.revision++;
+          for (const player of sessions.values()) {player.revision++;player.positionGraceUntil=Date.now()+1500;}
         }
         if ([24,48,96,192].includes(body.botCount)) {
           targetBotTeams = body.botCount;
@@ -1013,6 +1392,7 @@ const handleRequest = async (request, response) => {
         return;
       }
       const previousSeen = session.lastSeen;
+      const rejectedFood = new Set();
       session.lastSeen = Date.now();
       session.account = accounts.fromRequest(request);
       session.isAdmin = Boolean(session.account && session.account.isAdmin);
@@ -1037,8 +1417,15 @@ const handleRequest = async (request, response) => {
       session.score = number(body.score, 0, 0, 1e15);
       session.immune = session.isAdmin && Boolean(body.immune);
       {
-        const previous = new Map(session.cells.map(cell=>[cell.netId,cell]));
-        session.cells = acceptClientCells(session,body.cells,number(body.ackRevision,0,0));
+        const previousCells = session.cells;
+        const previous = new Map(previousCells.map(cell=>[cell.netId,cell]));
+        const proposed = acceptClientCells(session,body.cells,number(body.ackRevision,0,0));
+        // The owner keeps admin powers (size multipliers, speed, instant remerge); everyone else is checked.
+        if (!session.running) session.cells = proposed;
+        else if (session.isAdmin || trustClientForTests) {
+          session.cells = proposed;
+          claimFoodForOwner(previousCells, proposed, body.foodClaims, rejectedFood);
+        } else session.cells = validateClientCells(session, previousCells, proposed, body.cells, !wasRunning, session.lastSeen, body.foodClaims, rejectedFood);
         if (wasRunning && session.lastSeen-previousSeen<400) for (const cell of session.cells) {
           const old=previous.get(cell.netId);
           if (!old || Math.hypot(cell.x-old.x,cell.y-old.y)>Math.max(1600,old.radius*3)) continue;
@@ -1077,6 +1464,7 @@ const handleRequest = async (request, response) => {
         acceptedBotSplitCommands: (Array.isArray(body.botSplitCommands) ? body.botSplitCommands : []).filter(id => session.botActionIds.has(id)),
         botSplitError,
         bannedBotTeams: moderation.bannedBotTeams(),
+        food: foodSyncFor(body, rejectedFood),
         players,
         playerCount: Math.max(1, activeCount),
         world,
@@ -1171,14 +1559,14 @@ if (!cloudMode) server.listen(port, "0.0.0.0", () => {
 });
 
 function exportState() {
-  return {world,worldRevision,botRevision,botMassRevision,serverBotCounter,serverFallbackActive,
+  return {world,food:exportFoodState(),signInGuard,worldRevision,botRevision,botMassRevision,serverBotCounter,serverFallbackActive,
     botRespawnBlockedUntil,targetBotTeams,botPieceCap,lastFallbackTick,ownerId,
     sessions:[...sessions.values()].map(session=>({...session,feedIds:[...session.feedIds],
       botActionIds:[...session.botActionIds],teamedBots:[...session.teamedBots]}))};
 }
 function importState(state) {
   if (!state || !state.world || !Array.isArray(state.sessions)) throw new Error("Invalid shared arena state");
-  world=state.world; worldRevision=state.worldRevision||0; botRevision=state.botRevision||0;
+  world=state.world; foodState=importFoodState(state.food); signInGuard=importSignInGuard(state.signInGuard); worldRevision=state.worldRevision||0; botRevision=state.botRevision||0;
   botMassRevision=state.botMassRevision||0; serverBotCounter=state.serverBotCounter||0;
   serverFallbackActive=Boolean(state.serverFallbackActive);botRespawnBlockedUntil=state.botRespawnBlockedUntil||0;
   targetBotTeams=state.targetBotTeams||24;botPieceCap=state.botPieceCap||96;
