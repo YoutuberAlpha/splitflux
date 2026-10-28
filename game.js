@@ -661,6 +661,20 @@ function squareSplitPlayer() {
   playerCells.push(...result);
 }
 
+// Trick keys. Holding Shift does the trick twice in the same instant (a "double" trick):
+// the second round splits the pieces the first round just made, as far as the split rules allow.
+const TRICKS = {
+  Space: splitPlayer, KeyQ: quadSplitPlayer, KeyE: tripleSplitPlayer,
+  KeyA: fiveSplitPlayer, KeyZ: sixSplitPlayer, KeyX: squareSplitPlayer,
+};
+function performTrick(code, doubled) {
+  const trick = TRICKS[code];
+  if (!trick) return false;
+  trick();
+  if (doubled) trick();
+  return true;
+}
+
 function feedMass() {
   if (!running || feedCooldown > 0) return;
   if (onlineMode && pendingFeedCommands.size >= BlobPhysics.feeding.maxPending || ejected.length >= 700) return;
@@ -1649,33 +1663,13 @@ addEventListener("keydown", e => {
   }
   keys[e.code] = true;
   if (e.code === "Enter" && (!running || gameOver)) resetGame();
-  if (e.code === "Space") {
-    e.preventDefault();
-    if (!e.repeat) splitPlayer();
-  }
   if (e.code === "KeyW") {
     e.preventDefault();
     if (!e.repeat) feedMass();
   }
-  if (e.code === "KeyQ") {
+  if (TRICKS[e.code]) {
     e.preventDefault();
-    if (!e.repeat) quadSplitPlayer();
-  }
-  if (e.code === "KeyE") {
-    e.preventDefault();
-    if (!e.repeat) tripleSplitPlayer();
-  }
-  if (e.code === "KeyA") {
-    e.preventDefault();
-    if (!e.repeat) fiveSplitPlayer();
-  }
-  if (e.code === "KeyZ") {
-    e.preventDefault();
-    if (!e.repeat) sixSplitPlayer();
-  }
-  if (e.code === "KeyX") {
-    e.preventDefault();
-    if (!e.repeat) squareSplitPlayer();
+    if (!e.repeat) performTrick(e.code, e.shiftKey);
   }
   if (e.code === "Digit2" || e.code === "Numpad2") {
     e.preventDefault();
