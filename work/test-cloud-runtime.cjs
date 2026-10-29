@@ -1,12 +1,20 @@
 const assert=require("assert/strict");
 const fs=require("fs"), os=require("os"), path=require("path");
-const {createCloudHandler,captureResponse}=require("../cloud-runtime.cjs");
+const {createCloudHandler,captureResponse,arenaOf,LIVE_TAKEOVER_MS}=require("../cloud-runtime.cjs");
 const directory=fs.mkdtempSync(path.join(os.tmpdir(),"splitflux-cloud-test-"));
 const savedEnv={...process.env};
 const store={payload:null,tail:Promise.resolve(),failCommit:false};
 const copy=value=>value==null?null:JSON.parse(JSON.stringify(value));
 function fakePool() {
-  return {async query(){return {rows:[]};},async connect(){
+  // Small stand-ins for the few direct queries about the live server's note.
+  return {async query(sql,values){
+    const payload=store.payload||{};
+    if(sql.startsWith("SELECT payload->>'liveOrigin'"))return {rows:[{origin:payload.liveOrigin??null,epoch:payload.liveEpoch??null,failing:payload.liveFailingSince??null}]};
+    if(sql.includes("'{liveFailingSince}'")){if(payload.liveEpoch===values[1]&&!("liveFailingSince" in payload))store.payload={...payload,liveFailingSince:values[0]};return {rows:[]};}
+    if(sql.includes("payload-'liveOrigin'")){if(payload.liveEpoch===values[0]){const {liveOrigin,liveEpoch,liveFailingSince,...rest}=payload;store.payload=rest;}return {rows:[]};}
+    if(sql.includes("payload-'liveFailingSince'")){if(payload.liveEpoch===values[0]){const {liveFailingSince,...rest}=payload;store.payload=rest;}return {rows:[]};}
+    return {rows:[]};
+  },async connect(){
     let unlock, pending, locked=false;
     return {async query(sql,values){
       if(sql.includes("FOR UPDATE")) {
@@ -44,7 +52,8 @@ async function state(handler,who,extra={}) {
   const owner=player(),guest=player();
   const sessions=await Promise.all([request(first,owner,"/api/session"),request(second,guest,"/api/session")]);
   owner.session=sessions[0].body;guest.session=sessions[1].body;
-  assert.equal(store.payload.arena.sessions.length,2,"Concurrent instances must keep both sessions");
+  assert.equal(arenaOf(store.payload).sessions.length,2,"Concurrent instances must keep both sessions");
+  assert.equal(store.payload.arena,undefined,"The arena is saved compressed");
   assert.equal((await request(first,owner,"/api/accounts/login",{...credentials(owner),username:"alpha",password:"test-owner-password"})).status,200);
   await state(second,owner);
   assert.equal(owner.snapshot.isAdmin,true,"Remembered owner login must work on another instance");
@@ -69,7 +78,36 @@ async function state(handler,who,extra={}) {
   assert.equal(failed.status,503);assert.equal(failed.response.getHeader("Set-Cookie"),undefined,"A failed commit must not send a successful session cookie");
   assert.equal(JSON.stringify(store.payload),stable,"Failed transactions must not replace committed game data");
   store.failCommit=false;assert.equal((await request(second,player(),"/api/session")).status,200);
-  console.log("PASS: concurrent cloud instances share one arena, owner cookies and keys survive cold starts, teams/splits/spikes persist, failed commits roll back before responding.");
+
+  // A live server is running: Vercel passes requests on to it.
+  store.payload={...store.payload,liveOrigin:"https://live.example",liveEpoch:"epoch-1"};
+  let liveUp=true,forwards=0;
+  const viaVercel=createCloudHandler(fakePool(),{directory:path.join(directory,"vercel"),async forwardRequest(){
+    forwards++;if(!liveUp)throw new Error("unreachable");
+    return {status:200,headers:{"content-type":"application/json"},cookies:[],body:Buffer.from(JSON.stringify({live:true}))};
+  }});
+  assert.equal((await request(viaVercel,player(),"/api/session")).body.live,true,"Requests go to the live server");
+  // It stops answering: players are told it is waking up, and the time it went quiet is noted.
+  liveUp=false;
+  let waking=await request(viaVercel,player(),"/api/session");
+  assert.equal(waking.status,503);assert.match(waking.body.error,/waking up/);
+  const quietSince=Number(store.payload.liveFailingSince);assert(quietSince>0,"The first failure is noted");
+  // It comes back within the grace time: the note is cleared and nothing changes.
+  liveUp=true;await request(viaVercel,player(),"/api/session");
+  assert.equal(store.payload.liveFailingSince,undefined,"A working live server clears the note");
+  // Down for longer than the grace time: Vercel runs the arena from the database instead.
+  liveUp=false;await request(viaVercel,player(),"/api/session");
+  const realNow=Date.now;
+  try {
+    Date.now=()=>realNow()+LIVE_TAKEOVER_MS+1000;
+    const takenOver=await request(viaVercel,player(),"/api/session");
+    assert.equal(takenOver.status,200,"After the grace time the database answers");assert(takenOver.body.id,"A real session from the database arena");
+    assert.equal(store.payload.liveOrigin,undefined,"The live server's note is removed");assert.equal(store.payload.liveEpoch,undefined);
+    const before=forwards;
+    assert.equal((await request(viaVercel,player(),"/api/session")).status,200);
+    assert.equal(forwards,before,"Later requests no longer wait for the dead live server");
+  } finally {Date.now=realNow;}
+  console.log("PASS: concurrent cloud instances share one arena, owner cookies and keys survive cold starts, teams/splits/spikes persist, failed commits roll back before responding, saves are compressed, a live server that stays down for 150 s is replaced by the database arena.");
  } finally {
   for(const key of Object.keys(process.env))if(!(key in savedEnv))delete process.env[key];
   Object.assign(process.env,savedEnv);

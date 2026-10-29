@@ -48,6 +48,11 @@ async function state(connection,payload){
     const start=performance.now();
     for(let i=0;i<15;i++)result=await state(a,{running:true,cells:result.self.cells,ackRevision:result.self.revision});
     const average=(performance.now()-start)/15;
+    // Updates are compressed and the server keeps its compression memory between them (much smaller repeats).
+    assert(a.ws.extensions.includes("permessage-deflate"),"Socket updates must be compressed");
+    assert(!a.ws.extensions.includes("server_no_context_takeover"),"The server must keep compression memory between updates");
+    const compact=await state(a,{running:true,cells:result.self.cells,ackRevision:result.self.revision,view:2});
+    assert(Array.isArray(compact.world.bots)&&compact.world.teamsSig&&compact.world.spikesSig,"Compact updates work over the socket");
     const replay=new WebSocket(base.replace("http:","ws:")+"/realtime",{origin:base});sockets.push(replay);replay.on("error",()=>{});
     const rejected=new Promise(resolve=>replay.once("close",code=>resolve(code)));
     replay.on("open",()=>replay.send(JSON.stringify({type:"auth",ticket:a.ticket})));

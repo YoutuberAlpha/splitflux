@@ -38,10 +38,12 @@ function createServer({world = "cleanWorld({worldSize: 5200, bots: [], viruses: 
     const who = {session, owner, snapshot: null, food: null};
     who.state = async (extra = {}) => {
       const result = await call("/api/state", {id: session.id, sessionKey: session.sessionKey, running: true, name: "T", color: "#55d6ff",
-        ackRevision: who.snapshot?.self.revision || 0, cells: who.snapshot?.self.cells || [],
+        ackRevision: who.snapshot?.self.revision || 0, cells: who.cells || [],
         foodSeed: who.food?.seed ?? null, ackFoodRevision: who.food?.revision ?? -1, ...extra}, owner);
       assert.equal(result.status, 200, JSON.stringify(result.body));
       who.snapshot = result.body;
+      // Compact updates only include the player's own pieces when the server changed them.
+      if (result.body.self.cells) who.cells = result.body.self.cells;
       applyFood(who, result.body.food);
       return result.body;
     };
