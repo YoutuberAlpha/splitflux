@@ -22,8 +22,15 @@
   let skinSource = null;
   let networkSkin = "";
   let lastSentSkin = null;
+  let skinResentAt = -Infinity;
   let teamRevision = 0;
-  let nextSyncAt = 0;
+  let lastSyncAt = -Infinity;
+  // Compact updates: the server only resends the bot team table and the spike list when they change,
+  // so the game keeps its copies and tells the server which version it has (a short fingerprint).
+  let botTeamInfo = new Map();
+  let teamsSig = "";
+  let spikesSig = "";
+  let serverViruses = [];
   const roomTransport=RoomTransport.create({fetch:(...args)=>fetch(...args),WebSocket});
   function updateNetworkSkin() {
     if (skinSource === playerBlobImageData) return;
@@ -230,6 +237,28 @@
     return current;
   }
 
+  // A compact bot is [id, team, x, y, mass, vx, vy]; its name and colours come from the team table.
+  function decodeBot(entry) {
+    if (!Array.isArray(entry)) return entry;
+    const [netId, team, x, y, mass, vx, vy] = entry;
+    const [name, color, accent] = botTeamInfo.get(team) || [team, "#55d6ff", "#ffffff"];
+    return { netId, botTeam: team, name, color, accent, x, y, mass, radius: radiusForMass(mass), vx, vy, alive: true };
+  }
+
+  // A compact piece of another player is [id, x, y, mass, vx, vy].
+  function decodeRemoteCell(entry) {
+    if (!Array.isArray(entry)) return entry;
+    const [netId, x, y, mass, vx, vy] = entry;
+    return { netId, x, y, mass, radius: radiusForMass(mass), vx, vy, alive: true };
+  }
+
+  // Tells the server the newest pellet this game already has, so it only sends newer ones.
+  function newestPelletSeq() {
+    let newest = 0;
+    for (const pellet of ejected) if (pellet && pellet._serverConfirmed && Number(pellet.seq) > newest) newest = Number(pellet.seq);
+    return newest;
+  }
+
   function applyWorld(world, forceOwnerCorrection = false, preserveLocalMapSize = false) {
     if (!world) return;
     lastWorld = world;
@@ -237,17 +266,26 @@
     if (!preserveLocalMapSize) worldSize = Math.max(5200, Number(world.worldSize) || 5200);
     if (worldSize !== previousMapSize) rebuildSharedFood();
     updateMapSizeLabel();
+    if (world.teams && typeof world.teams === "object") {
+      botTeamInfo = new Map(Object.entries(world.teams));
+      teamsSig = String(world.teamsSig || "");
+    }
     if (Array.isArray(world.bots)) {
         const currentBots = new Map(bots.map(bot => [bot.netId, bot]));
-        bots = world.bots.map(bot => ({
+        bots = world.bots.map(decodeBot).map(bot => ({
           ...mergeNetworkCell(currentBots.get(bot.netId), bot),
           isPlayer: false,
         }));
     }
+    // The spike list only comes when it changed; spikes this player just popped stay hidden until the server agrees.
     if (Array.isArray(world.viruses)) {
+      serverViruses = world.viruses;
+      spikesSig = String(world.spikesSig || "");
+    }
+    {
       const now = performance.now();
       for (const [id, until] of poppedVirusIds) if (until < now) poppedVirusIds.delete(id);
-      viruses = world.viruses.filter(virus => !poppedVirusIds.has(virus.id));
+      viruses = serverViruses.filter(virus => !poppedVirusIds.has(virus.id));
     }
     if (typeof world.autoSpikes === "boolean" && world.autoSpikes !== autoSpikesOn) setAutoSpikesLabel(world.autoSpikes);
     if (Array.isArray(world.ejected)) {
@@ -260,7 +298,11 @@
         Number.isFinite(pellet.y)
       ));
       const serverIds = new Set(world.ejected.map(pellet => pellet.netId));
-      ejected = world.ejected.map(pellet => {
+      // Compact updates only send new pellets plus the numbers of all pellets still in the air:
+      // keep the ones we already have that are still in the air.
+      const live = Array.isArray(world.ejectedLive) ? new Set(world.ejectedLive) : null;
+      const kept = live ? ejected.filter(pellet => pellet && pellet._serverConfirmed && live.has(pellet.seq) && !serverIds.has(pellet.netId)) : [];
+      const fresh = world.ejected.map(pellet => {
         const current = ejectedCache.get(pellet.netId) || ejected.find(local => local.netId === pellet.netId);
         const serverCreatedAt = Number(pellet.createdAt) || Date.now();
         const age = Math.max(0, (Date.now() - serverCreatedAt) / 1000);
@@ -287,6 +329,8 @@
         nextEjected.set(shared.netId, shared);
         return shared;
       });
+      for (const pellet of kept) nextEjected.set(pellet.netId, pellet);
+      ejected = [...kept, ...fresh];
       for (const pellet of localPending) {
         if (!pellet || !pellet.netId || serverIds.has(pellet.netId)) continue;
         const pendingAt = Number(pellet._pendingNetworkAt) || Number(pellet.createdAt) || 0;
@@ -331,7 +375,8 @@
   function applyBotMassOnly(world) {
     if (!world || !Array.isArray(world.bots)) return;
     const byId = new Map(bots.map(bot => [bot.netId, bot]));
-    for (const serverBot of world.bots) {
+    for (const entry of world.bots) {
+      const serverBot = Array.isArray(entry) ? { netId: entry[0], mass: entry[4] } : entry;
       const bot = byId.get(serverBot.netId);
       if (!bot || !bot.alive) continue;
       const mass = Number(serverBot.mass);
@@ -345,8 +390,8 @@
     const nextCache = new Map();
     const nextCells = [];
     for (const remote of players || []) {
-      if (!remote.running) continue;
-      for (const cell of remote.cells || []) {
+      if (remote.running === false) continue;
+      for (const cell of (remote.cells || []).map(decodeRemoteCell)) {
         if (!cell.alive) continue;
         const key = `${remote.id}:${cell.netId}`;
         const networkCell = mergeNetworkCell(remoteCellCache.get(key), cell);
@@ -415,6 +460,8 @@
     document.querySelector("#adminUnlockStatus").textContent = account
       ? `Signed in as ${account.username}${isAdmin ? " - OWNER / ADMIN" : " - PLAYER"}` : "Playing as guest. Sign in or create an account.";
     document.querySelector("#accountLogout").hidden = !account;
+    document.querySelector("#accountTools").hidden = !account;
+    document.querySelector("#ownerReset").hidden = !(account && isAdmin);
     document.querySelector("#accountLogin").hidden = Boolean(account);
     document.querySelector("#accountRegister").hidden = Boolean(account);
     document.querySelector("#accountUsername").disabled = Boolean(account);
@@ -450,6 +497,38 @@
       document.querySelectorAll(".account-actions button").forEach(button => { button.disabled = false; });
     }
   }
+  async function passwordAction(route, fields, done) {
+    const message = document.querySelector("#adminUnlockStatus");
+    if (!session) { message.textContent = "Server is connecting. Try again in a moment."; return; }
+    if (accountBusy) return;
+    accountBusy = true;
+    try {
+      const response = await fetch(route, {method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({id: session.id, sessionKey: session.sessionKey, ...fields})});
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error);
+      done(result);
+    } catch (error) {
+      message.textContent = error.message || "Unable to connect to server.";
+    } finally {
+      accountBusy = false;
+    }
+  }
+  document.querySelector("#changePassword").addEventListener("click", () => passwordAction("/api/accounts/password", {
+    currentPassword: document.querySelector("#currentPassword").value, newPassword: document.querySelector("#newPassword").value,
+  }, () => {
+    document.querySelector("#currentPassword").value = "";
+    document.querySelector("#newPassword").value = "";
+    document.querySelector("#accountTools").open = false;
+    roomTransport.reset();
+    document.querySelector("#adminUnlockStatus").textContent = "Password changed. Any other browser signed in to this account is now signed out.";
+  }));
+  document.querySelector("#resetPlayerPassword").addEventListener("click", () => passwordAction("/api/admin/reset-password", {
+    username: document.querySelector("#resetUsername").value, newPassword: document.querySelector("#resetPassword").value,
+  }, result => {
+    document.querySelector("#resetPassword").value = "";
+    document.querySelector("#adminUnlockStatus").textContent = `Password for ${result.reset} was reset. Give them the temporary password and ask them to change it.`;
+  }));
   document.querySelector("#accountLogin").addEventListener("click", () => accountAction("login"));
   document.querySelector("#accountRegister").addEventListener("click", () => accountAction("register"));
   document.querySelector("#accountLogout").addEventListener("click", () => accountAction("logout"));
@@ -471,7 +550,10 @@
       const blocked=await response.json();
       if (blocked.bannedUntil) {showBan(blocked.bannedUntil);session=null;return;}
     }
-    if (!response.ok) throw new Error("The room server did not answer.");
+    if (!response.ok) {
+      const answer = await response.json().catch(() => ({}));
+      throw Object.assign(new Error(answer.error || "The room server did not answer."), {full: Boolean(answer.full)});
+    }
     session = await response.json();
     roomTransport.reset();
     roomTransport.connect(session);
@@ -484,6 +566,9 @@
     pendingFeedCommands.clear();
     ejected = [];
     ejectedCache.clear();
+    botTeamInfo = new Map();
+    teamsSig = "";
+    spikesSig = "";
     lastSentSkin=null;
     updateAdminAccess();
     connected = true;
@@ -500,8 +585,12 @@
   async function syncRoom() {
     if (currentBanUntil>Date.now()) return;
     if (!session || syncing) return;
-    if (!running && performance.now() < nextSyncAt) return;
-    nextSyncAt = performance.now() + (running ? 75 : 1500);
+    // About 10 updates a second while playing (the game smooths movement in between), one every 1.5 s on
+    // the menu, and one every 3 s while the tab is hidden: enough to keep the place in the arena.
+    // Without the live connection (backup mode: every update is a Vercel call plus a database save) it is 5 a second.
+    const interval = document.hidden ? 3000 : running ? (roomTransport.realtime ? 100 : 200) : 1500;
+    if (performance.now() - lastSyncAt < interval) return;
+    lastSyncAt = performance.now();
     syncing = true;
     try {
       updateNetworkSkin();
@@ -528,6 +617,10 @@
         virusPops: running ? virusPops.slice(0, 16) : [],
         foodSeed: sharedFoodSeed,
         ackFoodRevision: sharedFoodRevision,
+        view: 2,
+        ackTeams: teamsSig,
+        ackSpikes: spikesSig,
+        ackEjected: newestPelletSeq(),
       };
       if (networkSkin!==lastSentSkin) payload.skin=networkSkin;
       for (const cell of playerCells) cell._syncMassWeights = { [cell.netId]: 1 };
@@ -539,7 +632,8 @@
         // The server forgot this player (idle tab or restart), so it no longer knows their size.
         // End the round cleanly instead of silently shrinking them back to a starting cell.
         const lostRound = running;
-        await createSession();
+        // If the arena is full or waking up, wait 3 s before asking again instead of every update.
+        try { await createSession(); } catch (error) { lastSyncAt = performance.now() + 3000; throw error; }
         if (lostRound && session) {
           returnToMainMenu();
           document.querySelector("#adminUnlockStatus").textContent = "Connection to the arena was lost, so that round ended. Deploy again to keep playing.";
@@ -560,6 +654,11 @@
       applyFoodSync(snapshot.food);
       networkDelay=Math.min(.15,(performance.now()-requestAt)/2000);
       if (Object.hasOwn(payload,"skin")) lastSentSkin=payload.skin;
+      // A restarted server doesn't keep skin pictures; send ours again (at most every 10 s).
+      if (networkSkin && snapshot.self && !snapshot.self.skinVersion && performance.now() - skinResentAt > 10000) {
+        skinResentAt = performance.now();
+        lastSentSkin = null;
+      }
       (snapshot.acceptedBotSplitCommands||[]).forEach(id=>pendingBotSplitCommands.delete(id));
       if (snapshot.botSplitError) showArenaError(new Error(snapshot.botSplitError));
       bannedBotTeams=new Set(snapshot.bannedBotTeams||[]);
@@ -640,8 +739,8 @@
   };
 
   async function joinRoom(){
-    try{await createSession();}catch{
-      status.innerHTML = '<i class="status-dot"></i> WAKING SERVER - RETRYING';
+    try{await createSession();}catch(error){
+      status.innerHTML = `<i class="status-dot"></i> ${error.full ? "ARENA FULL" : "WAKING SERVER"} - RETRYING`;
       setTimeout(joinRoom,3000);
     }
   }
@@ -692,7 +791,7 @@
 
   async function adminCommand(route, command) {
     if (!session || !isAdmin) throw new Error("Admin access required");
-    const response=await fetch(`/api/admin/${route}`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:session.id,sessionKey:session.sessionKey,...command})});
+    const response=await fetch(`/api/admin/${route}`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:session.id,sessionKey:session.sessionKey,view:2,...command})});
     const result=await response.json();
     if (!response.ok) throw new Error(result.error||"Admin command failed");
     return result;
@@ -700,6 +799,7 @@
   window.banPlayerOnline=async(target,durationMs)=>adminCommand("ban",{...target,durationMs});
   window.paintSpikesOnline=async(points)=>{
     const result=await adminCommand("paint-spikes",{points});
+    serverViruses=result.viruses;
     viruses=result.viruses;
     return result;
   };
