@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.cjs",
     "build": "node work/build-vercel.cjs",
-    "test": "node work/test-feed-teams.cjs && node work/test-follow-splits.cjs && node work/test-accounts.cjs && node work/test-physics-network.cjs && node work/test-arena-features.cjs && node work/test-server-authority.cjs && node work/test-cloud-runtime.cjs && node work/test-realtime.cjs && node work/test-live-runtime.cjs && node work/test-backend-proxy.cjs && node work/test-anti-cheat.cjs && node work/test-split-rules.cjs && node work/test-sign-in-guard.cjs && node work/test-controls.cjs && node work/test-spikes.cjs && node work/test-bots.cjs && node work/test-balance.cjs"
+    "test": "node work/test-feed-teams.cjs && node work/test-follow-splits.cjs && node work/test-accounts.cjs && node work/test-physics-network.cjs && node work/test-arena-features.cjs && node work/test-server-authority.cjs && node work/test-cloud-runtime.cjs && node work/test-realtime.cjs && node work/test-live-runtime.cjs && node work/test-backend-proxy.cjs && node work/test-anti-cheat.cjs && node work/test-split-rules.cjs && node work/test-sign-in-guard.cjs && node work/test-controls.cjs && node work/test-spikes.cjs && node work/test-bots.cjs && node work/test-balance.cjs && node work/test-bandwidth.cjs && node work/test-account-safety.cjs"
   },
   "engines": {
     "node": "22.x"

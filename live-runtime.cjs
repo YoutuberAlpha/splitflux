@@ -1,37 +1,48 @@
 const fs=require("fs"),os=require("os"),path=require("path"),crypto=require("crypto"),http=require("http");
-const {createEngine,captureResponse}=require("./cloud-runtime.cjs");
+const {createEngine,captureResponse,packSnapshot,BACKUP_TABLE,backupFiles,filesChanged,checkAccountsKept}=require("./cloud-runtime.cjs");
 const privateFiles=["admin-key.json","accounts.json","bans.json"];
 
 async function createLiveRuntime(pool,options={}) {
   const directory=options.directory||fs.mkdtempSync(path.join(os.tmpdir(),"splitflux-live-"));
   const epoch=crypto.randomUUID(),origin=options.origin||process.env.RENDER_EXTERNAL_URL;
-  const client=await pool.connect();let engine;
+  await pool.query(BACKUP_TABLE);
+  const client=await pool.connect();let engine,savedFiles;
   try {
     await client.query("BEGIN");
     const result=await client.query("SELECT payload FROM splitflux_arena WHERE id=1 FOR UPDATE");
     const snapshot=result.rows[0]?.payload;
     if(!snapshot?.files?.["accounts.json"])throw new Error("Initialize the cloud accounts before starting the live server");
     engine=(options.createEngine||createEngine)(snapshot,directory);
-    await client.query("UPDATE splitflux_arena SET payload=$1::jsonb,updated_at=now() WHERE id=1",[JSON.stringify({...snapshot,liveEpoch:epoch,liveOrigin:origin})]);
+    savedFiles=snapshot.files;
+    await client.query("UPDATE splitflux_arena SET payload=$1::jsonb,updated_at=now() WHERE id=1",[JSON.stringify({...snapshot,liveEpoch:epoch,liveOrigin:origin,liveFailingSince:undefined})]);
     await client.query("COMMIT");
   }catch(error){await client.query("ROLLBACK");throw error;}finally{client.release();}
-  let writes=Promise.resolve(),requests=Promise.resolve(),lost=false;
+  let writes=Promise.resolve(),requests=Promise.resolve(),lost=false,active=false;
   const snapshot=()=>{
     const files={};for(const file of privateFiles){const name=path.join(directory,file);if(fs.existsSync(name))files[file]=fs.readFileSync(name,"utf8");}
-    return {version:1,liveEpoch:epoch,liveOrigin:origin,arena:engine.exportState(),files};
+    const arena=engine.exportState();
+    // Skin pictures (up to 60 KB each) are left out of saves; after a restart the game sends its skin again.
+    arena.sessions=arena.sessions.map(session=>({...session,skin:"",skinVersion:0}));
+    return packSnapshot({version:1,liveEpoch:epoch,liveOrigin:origin,arena,files});
   };
   function checkpoint(){
+    active=false;
     const job=writes.then(async()=>{
-      const result=await pool.query("UPDATE splitflux_arena SET payload=$1::jsonb,updated_at=now() WHERE id=1 AND payload->>'liveEpoch'=$2",[JSON.stringify(snapshot()),epoch]);
+      const next=snapshot();
+      checkAccountsKept(savedFiles,next.files);
+      const result=await pool.query("UPDATE splitflux_arena SET payload=$1::jsonb,updated_at=now() WHERE id=1 AND payload->>'liveEpoch'=$2",[JSON.stringify(next),epoch]);
       if(result.rowCount!==1){lost=true;options.onLost?.();throw new Error("A newer live server owns the arena");}
+      if(filesChanged(savedFiles,next.files))await backupFiles(pool,next.files);
+      savedFiles=next.files;
     });
     writes=job.catch(()=>{});return job;
   }
   async function handle(request,response){
     if(lost){response.writeHead(503);response.end(JSON.stringify({error:"Server restarting"}));return;}
+    active=true;
     const captured=captureResponse();
     await engine.handleRequest(request,captured);
-    if(captured.statusCode<400&&["/api/accounts/register","/api/admin/ban"].includes(new URL(request.url,"http://game.invalid").pathname))await checkpoint();
+    if(captured.statusCode<400&&["/api/accounts/register","/api/accounts/password","/api/admin/reset-password","/api/admin/ban"].includes(new URL(request.url,"http://game.invalid").pathname))await checkpoint();
     for(const [name,value]of captured.headers)response.setHeader(name,value);
     response.writeHead(captured.statusCode);response.end(captured.body);
   }
@@ -40,9 +51,12 @@ async function createLiveRuntime(pool,options={}) {
     requests=job.catch(()=>{});return job;
   }
   const tick=options.timers===false?null:setInterval(()=>{if(!lost)engine.advanceArena();},40);
-  const save=options.timers===false?null:setInterval(()=>checkpoint().catch(error=>console.error("Game checkpoint failed",error.code||error.name)),5000);
+  // The arena is saved every 30 s while people are playing (each save is ~50-100 KB of outgoing data, which
+  // counts against Render's monthly allowance). New accounts and bans are saved straight away (see handle).
+  // With nobody playing there is nothing worth saving, so the idle server stays quiet.
+  const save=options.timers===false?null:setInterval(()=>{if(active)checkpoint().catch(error=>console.error("Game checkpoint failed",error.code||error.name));},options.saveEveryMs||30000);
   tick?.unref();save?.unref();
-  return {engine,dispatch,checkpoint,async close(){clearInterval(tick);clearInterval(save);await requests;if(!lost)await checkpoint();}};
+  return {engine,dispatch,checkpoint,get active(){return active;},async close(){clearInterval(tick);clearInterval(save);await requests;if(!lost)await checkpoint();}};
 }
 
 async function main(){

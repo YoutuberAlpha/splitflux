@@ -6,8 +6,11 @@ function attachRealtime(server,{getSession,dispatch}) {
   const sockets=new Set(),tickets=new Map();
   const allowed=new Set((process.env.SPLITFLUX_ALLOWED_ORIGINS||"https://splitflux-agario.vercel.app,https://splitflux.vercel.app").split(","));
   if(process.env.RENDER_EXTERNAL_URL)allowed.add(process.env.RENDER_EXTERNAL_URL);
+  // Updates to one player look a lot like the previous one, so the server keeps its compression memory
+  // between messages (no "context takeover" reset): repeated names, colours and ids then cost almost nothing.
+  // A 16 KB memory window holds the last few updates and uses about 0.2 MB per connected player.
   const wss=new WebSocketServer({noServer:true,maxPayload:2_000_000,perMessageDeflate:{
-    threshold:1024,serverNoContextTakeover:true,clientNoContextTakeover:true,
+    threshold:256,serverNoContextTakeover:false,clientNoContextTakeover:true,serverMaxWindowBits:14,
     concurrencyLimit:2,zlibDeflateOptions:{level:1},
   }});
   const digest=value=>crypto.createHash("sha256").update(value).digest("hex");

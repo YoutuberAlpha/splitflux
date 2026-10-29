@@ -83,6 +83,18 @@
           <button id="accountRegister" type="button">CREATE ACCOUNT</button>
           <button id="accountLogout" type="button" hidden>SIGN OUT</button>
         </div>
+        <details id="accountTools" class="account-tools" hidden>
+          <summary>CHANGE PASSWORD</summary>
+          <input id="currentPassword" type="password" maxlength="128" autocomplete="current-password" placeholder="Current password" />
+          <input id="newPassword" type="password" maxlength="128" autocomplete="new-password" placeholder="New password (8+ characters)" />
+          <button id="changePassword" type="button">SAVE NEW PASSWORD</button>
+        </details>
+        <details id="ownerReset" class="account-tools" hidden>
+          <summary>RESET A PLAYER'S PASSWORD</summary>
+          <input id="resetUsername" maxlength="20" autocomplete="off" placeholder="Player's username" />
+          <input id="resetPassword" type="text" maxlength="128" autocomplete="off" placeholder="Temporary password (8+ characters)" />
+          <button id="resetPlayerPassword" type="button">RESET PASSWORD</button>
+        </details>
         <p id="adminUnlockStatus" role="status" aria-live="polite"></p>
         <button id="playButton"><span>DEPLOY CELL</span><kbd>ENTER</kbd></button>
         <p class="physics-credit">Feeding: <a href="https://github.com/owenashurst/agar.io-clone" target="_blank" rel="noopener">agar.io-clone</a> (MIT). Splitting: <a href="https://github.com/Barbosik/MultiOgar" target="_blank" rel="noopener">MultiOgar / Ogar</a> (Apache-2.0).</p>

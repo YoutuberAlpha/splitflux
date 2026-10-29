@@ -4,6 +4,11 @@ const crypto = require("crypto");
 const { promisify } = require("util");
 const scrypt = promisify(crypto.scrypt);
 
+// A login stays valid for 30 days after the last visit (each visit renews it). Every account has a
+// "token version": changing or resetting the password raises it, which signs out every other browser.
+const LOGIN_DAYS = 30;
+const LOGIN_MS = LOGIN_DAYS * 24 * 60 * 60 * 1000;
+
 module.exports = function createAccounts(directory, signingKey, ownerPassword) {
   const filename = path.join(directory, "accounts.json");
   const accounts = Object.assign(Object.create(null), fs.existsSync(filename) ? JSON.parse(fs.readFileSync(filename, "utf8")) : {});
@@ -32,13 +37,16 @@ module.exports = function createAccounts(directory, signingKey, ownerPassword) {
     if (!crypto.timingSafeEqual(Buffer.from(parts[1], "hex"), Buffer.from(sign(parts[0]), "hex"))) return null;
     try {
       const payload = JSON.parse(Buffer.from(parts[0], "base64url").toString("utf8"));
-      return payload.expires > Date.now() ? profile(payload.username) : null;
+      const account = Object.hasOwn(accounts, payload.username) && accounts[payload.username];
+      if (!account || !(payload.expires > Date.now()) || (Number(payload.v) || 0) !== (account.tokenVersion || 0)) return null;
+      return profile(payload.username);
     } catch { return null; }
   }
   function remember(response, username) {
-    const value = Buffer.from(JSON.stringify({ username, expires: Date.now() + 315360000000 })).toString("base64url");
+    const version = Object.hasOwn(accounts, username) ? accounts[username].tokenVersion || 0 : 0;
+    const value = Buffer.from(JSON.stringify({ username, v: version, expires: Date.now() + LOGIN_MS })).toString("base64url");
     const existing = response.getHeader("Set-Cookie") || [];
-    response.setHeader("Set-Cookie", [...(Array.isArray(existing) ? existing : [existing]), `tricksplit_account=${value}.${sign(value)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=315360000`]);
+    response.setHeader("Set-Cookie", [...(Array.isArray(existing) ? existing : [existing]), `tricksplit_account=${value}.${sign(value)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${LOGIN_MS / 1000}`]);
   }
   function forget(response) {
     response.setHeader("Set-Cookie", [
@@ -65,5 +73,35 @@ module.exports = function createAccounts(directory, signingKey, ownerPassword) {
     }
     return profile(username);
   }
-  return { fromRequest, remember, forget, authenticate };
+  function checkNewPassword(password) {
+    if (typeof password !== "string" || password.length < 8 || password.length > 128) throw new Error("Use a new password with 8-128 characters.");
+  }
+  async function setPassword(account, password) {
+    const salt = crypto.randomBytes(16).toString("hex");
+    account.salt = salt;
+    account.hash = (await scrypt(password, salt, 64)).toString("hex");
+    account.tokenVersion = (account.tokenVersion || 0) + 1;
+    save();
+  }
+  // The signed-in player changes their own password (they must know the current one).
+  async function changePassword(username, currentPassword, newPassword) {
+    const account = Object.hasOwn(accounts, username) && accounts[username];
+    if (!account) throw new Error("Sign in first.");
+    const hash = await scrypt(String(currentPassword || ""), account.salt, 64);
+    if (!crypto.timingSafeEqual(hash, Buffer.from(account.hash, "hex"))) throw new Error("Incorrect username or password.");
+    checkNewPassword(newPassword);
+    await setPassword(account, newPassword);
+    return profile(username);
+  }
+  // The owner gives a player who forgot their password a temporary one.
+  async function resetPassword(username, newPassword) {
+    username = String(username || "").trim().toLowerCase();
+    const account = Object.hasOwn(accounts, username) && accounts[username];
+    if (!account) throw new Error("No account with that username.");
+    if (account.role === "owner") throw new Error("Change the owner password with CHANGE PASSWORD instead.");
+    checkNewPassword(newPassword);
+    await setPassword(account, newPassword);
+    return profile(username);
+  }
+  return { fromRequest, remember, forget, authenticate, changePassword, resetPassword };
 };

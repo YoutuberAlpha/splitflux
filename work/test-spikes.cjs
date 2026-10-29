@@ -12,7 +12,7 @@ const {createServer} = require("./server-harness.cjs");
     game.tick(40_000);
     const spikes = game.run("world.viruses");
     assert.equal(spikes.length, 22, "An empty map must grow back to 22 spikes");
-    assert(spikes.every(spike => typeof spike.id === "string" && spike.id.length > 8));
+    assert(spikes.every(spike => typeof spike.id === "string" && spike.id.length >= 8), "Every spike has an id");
     for (const a of spikes) for (const b of spikes) if (a !== b) assert(Math.hypot(a.x - b.x, a.y - b.y) >= 200, "Spikes must not grow on top of each other");
   }
 
@@ -78,9 +78,10 @@ const {createServer} = require("./server-harness.cjs");
     const context = vm.createContext({BlobPhysics: physics, worldSize: 5200, bots: [], viruses: [], lastWorld: null, updateMapSizeLabel() {},
       isAdmin: false, normalizeNetworkCell: cell => cell, mergeNetworkCell: (_, cell) => cell, ejected: [], ejectedCache: new Map(),
       networkDelay: 0, performance: {now: () => 1000}, Date, rebuildSharedFood() {},
-      poppedVirusIds: new Map([["popped", 3000]]), autoSpikesOn: true, labels: []});
+      poppedVirusIds: new Map([["popped", 3000]]), autoSpikesOn: true, labels: [],
+      botTeamInfo: new Map(), serverViruses: [], teamsSig: "", spikesSig: "", radiusForMass: mass => Math.sqrt(mass) * 4.2 + 8});
     context.setAutoSpikesLabel = on => { context.labels.push(on); context.autoSpikesOn = on; };
-    vm.runInContext(source.slice(source.indexOf("  function applyWorld("), source.indexOf("  // Brings the shared food up to date")), context);
+    vm.runInContext(source.slice(source.indexOf("  // A compact bot is"), source.indexOf("  // Brings the shared food up to date")), context);
     vm.runInContext("applyWorld({worldSize: 5200, autoSpikes: false, viruses: [{id: 'popped', x: 1, y: 1, r: 42}, {id: 'other', x: 9, y: 9, r: 42}]})", context);
     assert.deepEqual(Array.from(context.viruses, spike => spike.id), ["other"], "A just-popped spike must not flash back");
     assert.deepEqual(context.labels, [false], "The owner's AUTO SPIKES label follows the server");

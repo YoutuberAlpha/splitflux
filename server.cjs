@@ -3,6 +3,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const zlib = require("zlib");
 const BlobPhysics = require("./physics.js");
 
 const root = __dirname;
@@ -74,6 +75,12 @@ const SERVER_FAILURE_LIMIT = 100;
 const SERVER_FAILURE_WINDOW_MS = 10 * 60_000;
 const DEVICE_REGISTRATIONS_PER_HOUR = 3;
 const SERVER_REGISTRATIONS_PER_HOUR = 40;
+// Limits that keep one person (or a script) from using up the server for everyone:
+const MAX_SESSIONS = 150;               // players connected at once
+const SESSIONS_PER_DEVICE = 6;          // game tabs per browser at once
+const NEW_SESSIONS_PER_MINUTE = 60;     // new connections per minute, whole server
+const STATE_RATE = 25, STATE_BURST = 40; // updates per second per player (the game sends 10)
+const SKIN_BYTES_PER_HOUR = 20_000_000; // skin pictures sent out per hour, whole server
 let signInGuard = createSignInGuard();
 
 const SERVER_BOT_NAMES = [
@@ -186,7 +193,7 @@ function cleanWorld(raw) {
 }
 
 function makeSpike(x, y) {
-  return { id: crypto.randomUUID(), x, y, r: 42, angle: Math.random() * Math.PI * 2 };
+  return { id: crypto.randomBytes(6).toString("base64url"), x, y, r: 42, angle: Math.random() * Math.PI * 2 };
 }
 
 // 22 spikes on the normal 5,200 map; bigger maps get proportionally more (max 200).
@@ -234,7 +241,7 @@ function distance(a, b) {
 }
 
 function createSignInGuard() {
-  return { accounts: Object.create(null), devices: Object.create(null), failures: [], registrations: [] };
+  return { accounts: Object.create(null), devices: Object.create(null), failures: [], registrations: [], sessionStarts: [], skinHour: 0, skinBytes: 0 };
 }
 
 function importSignInGuard(saved) {
@@ -243,6 +250,8 @@ function importSignInGuard(saved) {
   for (const key of ["accounts", "devices"]) Object.assign(guard[key], saved[key] && typeof saved[key] === "object" ? saved[key] : {});
   if (Array.isArray(saved.failures)) guard.failures = saved.failures.filter(Number.isFinite);
   if (Array.isArray(saved.registrations)) guard.registrations = saved.registrations.filter(entry => entry && Number.isFinite(entry.time));
+  if (Array.isArray(saved.sessionStarts)) guard.sessionStarts = saved.sessionStarts.filter(Number.isFinite).slice(-NEW_SESSIONS_PER_MINUTE);
+  guard.skinHour = Number(saved.skinHour) || 0; guard.skinBytes = Number(saved.skinBytes) || 0;
   return guard;
 }
 
@@ -294,6 +303,34 @@ function registrationWait(deviceId, now) {
   return 0;
 }
 
+// Milliseconds until a new connection may start (0 = now). Closed tabs free their place 15 s after their
+// last update, so a browser that hit its tab limit (or a full server) only waits briefly.
+function sessionStartWait(deviceId, now) {
+  signInGuard.sessionStarts = signInGuard.sessionStarts.filter(time => now - time < 60_000);
+  if (signInGuard.sessionStarts.length >= NEW_SESSIONS_PER_MINUTE) return signInGuard.sessionStarts[0] + 60_000 - now;
+  const mine = [...sessions.values()].filter(session => session.deviceId === deviceId);
+  if (mine.length >= SESSIONS_PER_DEVICE) return Math.max(1000, Math.min(...mine.map(session => session.lastSeen)) + 15_000 - now);
+  if (sessions.size >= MAX_SESSIONS) return 10_000;
+  return 0;
+}
+
+// A small allowance per player that refills 25 times a second; requests beyond it are turned away cheaply.
+function takeStateAllowance(session, now) {
+  const refill = Math.max(0, now - (session.stateRefillAt || now)) / 1000 * STATE_RATE;
+  const allowance = Math.min(STATE_BURST, (session.stateAllowance ?? STATE_BURST) + refill);
+  session.stateRefillAt = now;
+  session.stateAllowance = Math.max(0, allowance - 1);
+  return allowance >= 1;
+}
+
+function takeSkinBudget(bytes, now) {
+  const hour = Math.floor(now / 3_600_000);
+  if (signInGuard.skinHour !== hour) { signInGuard.skinHour = hour; signInGuard.skinBytes = 0; }
+  if (signInGuard.skinBytes + bytes > SKIN_BYTES_PER_HOUR) return false;
+  signInGuard.skinBytes += bytes;
+  return true;
+}
+
 function tryAgainMessage(wait) {
   const minutes = Math.ceil(wait / 60_000);
   return `Too many attempts. Try again in ${minutes} minute${minutes === 1 ? "" : "s"}.`;
@@ -303,14 +340,18 @@ function createFoodState() {
   return { seed: crypto.randomInt(1, 2 ** 31), versions: new Uint8Array(FOOD_COUNT), revision: 0, log: [] };
 }
 
+// Saved compressed: the 49,600 food versions are mostly small repeating numbers (66 KB as plain text).
 function exportFoodState() {
-  return { seed: foodState.seed, versions: Buffer.from(foodState.versions).toString("base64"), revision: foodState.revision, log: foodState.log };
+  return { seed: foodState.seed, packed: zlib.deflateRawSync(Buffer.from(foodState.versions)).toString("base64"), revision: foodState.revision, log: foodState.log };
 }
 
 function importFoodState(saved) {
-  if (!saved || !Number.isInteger(saved.seed) || typeof saved.versions !== "string") return createFoodState();
+  if (!saved || !Number.isInteger(saved.seed) || (typeof saved.versions !== "string" && typeof saved.packed !== "string")) return createFoodState();
   const versions = new Uint8Array(FOOD_COUNT);
-  versions.set(Buffer.from(saved.versions, "base64").subarray(0, FOOD_COUNT));
+  let bytes;
+  try { bytes = typeof saved.packed === "string" ? zlib.inflateRawSync(Buffer.from(saved.packed, "base64"), {maxOutputLength: FOOD_COUNT}) : Buffer.from(saved.versions, "base64"); }
+  catch { return createFoodState(); }
+  versions.set(bytes.subarray(0, FOOD_COUNT));
   return { seed: saved.seed, versions, revision: Number(saved.revision) || 0, log: Array.isArray(saved.log) ? saved.log.slice(-FOOD_LOG_LIMIT) : [] };
 }
 
@@ -1218,6 +1259,13 @@ function resolveCollisions() {
   world.bots = world.bots.filter(bot => bot.alive);
 }
 
+// Fields starting with "_" are the server's own notes (anti-cheat credits, collision smoothing). Never send them.
+function publicCell(cell) {
+  const view = {};
+  for (const key in cell) if (key[0] !== "_") view[key] = cell[key];
+  return view;
+}
+
 function sessionView(session) {
   const aliveCells = session.cells.filter(cell => cell.alive);
   return {
@@ -1226,11 +1274,92 @@ function sessionView(session) {
     skinVersion: session.skinVersion || 0,
     color: session.color,
     running: session.running,
-    cells: aliveCells,
+    cells: aliveCells.map(publicCell),
     dead: session.running && aliveCells.length === 0,
     revision: session.revision,
     forceMenuVersion: session.forceMenuVersion,
   };
+}
+
+// ---- Compact updates (bandwidth) ----
+// Every update used to carry everything the server knows: each bot's brain, timers and targets, the full spike
+// list, every flying pellet. That was about 57 KB, 10-20 times a second per player. The views below send only
+// what a player's screen draws, with rounded numbers, and skip parts the player already has:
+// - bots are short lists [id, team, x, y, mass, vx, vy]; the team's name and colours go in a separate table,
+// - the team table and the spike list are only sent when they changed (the game sends back a fingerprint),
+// - a pellet is sent once; afterwards only its number appears in the list of pellets still in the air.
+const roundTo = (value, places = 0) => { const scale = 10 ** places; return Math.round((Number(value) || 0) * scale) / scale; };
+const massValue = mass => roundTo(mass, mass < 1 ? 6 : 1);
+let ejectedSeq = 0;
+
+// A short fingerprint of some text (FNV-1a). Same text, same fingerprint.
+function fingerprint(text) {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < text.length; index++) { hash ^= text.charCodeAt(index); hash = Math.imul(hash, 0x01000193); }
+  return (hash >>> 0).toString(36);
+}
+
+function botTeamTable() {
+  const teams = {};
+  for (const bot of world.bots) {
+    const team = bot.botTeam || bot.name;
+    if (bot.alive && !teams[team]) teams[team] = [bot.name, bot.color, bot.accent];
+  }
+  return teams;
+}
+
+function spikeList() {
+  return world.viruses.map(spike => ({ id: spike.id, x: roundTo(spike.x), y: roundTo(spike.y), r: roundTo(spike.r, 1), angle: roundTo(spike.angle, 2) }));
+}
+
+function pelletView(pellet, session) {
+  return {
+    seq: pellet.seq,
+    // The player who fed it needs the real id to swap their own preview for it; everyone else gets a short one.
+    netId: session && pellet.ownerSessionId === session.id ? pellet.netId : fingerprint(String(pellet.netId)),
+    x: roundTo(pellet.x, 1), y: roundTo(pellet.y, 1), vx: roundTo(pellet.vx), vy: roundTo(pellet.vy),
+    value: roundTo(pellet.value, 2), r: roundTo(pellet.r, 1), color: pellet.color,
+    createdAt: pellet.createdAt, ownerUntil: pellet.ownerUntil,
+    flightX: roundTo(pellet.flightX, 1), flightY: roundTo(pellet.flightY, 1),
+    flightEndX: roundTo(pellet.flightEndX, 1), flightEndY: roundTo(pellet.flightEndY, 1),
+    flightAge: roundTo(pellet.flightAge, 3), flightDuration: pellet.flightDuration,
+  };
+}
+
+function worldView(body = {}, session = null) {
+  for (const pellet of world.ejected) if (!pellet.seq) pellet.seq = ++ejectedSeq;
+  const teams = botTeamTable(), teamsSig = fingerprint(JSON.stringify(teams));
+  const spikes = spikeList(), spikesSig = fingerprint(JSON.stringify(spikes));
+  const seen = number(body.ackEjected, 0, 0);
+  const view = {
+    worldSize: world.worldSize,
+    autoSpikes: world.autoSpikes,
+    bots: world.bots.filter(bot => bot.alive).map(bot => [fingerprint(String(bot.netId)), bot.botTeam || bot.name,
+      roundTo(bot.x), roundTo(bot.y), massValue(bot.mass), roundTo(bot.vx), roundTo(bot.vy)]),
+    teamsSig,
+    spikesSig,
+    ejected: world.ejected.filter(pellet => pellet.seq > seen).map(pellet => pelletView(pellet, session)),
+    ejectedLive: world.ejected.map(pellet => pellet.seq),
+  };
+  if (body.ackTeams !== teamsSig) view.teams = teams;
+  if (body.ackSpikes !== spikesSig) view.viruses = spikes;
+  return view;
+}
+
+// Another player as others see them: name, colour, skin version and [id, x, y, mass, vx, vy] per piece.
+function remoteView(session) {
+  return {
+    id: session.id, name: session.name, color: session.color, skinVersion: session.skinVersion || 0,
+    cells: session.cells.filter(cell => cell.alive).map(cell => [fingerprint(String(cell.netId)),
+      roundTo(cell.x), roundTo(cell.y), massValue(cell.mass), roundTo(cell.vx), roundTo(cell.vy)]),
+  };
+}
+
+// The player's own pieces only travel when the server changed them (a correction the game hasn't seen yet).
+function selfView(session, ackRevision) {
+  const view = sessionView(session);
+  if (session.revision <= ackRevision) delete view.cells;
+  return view;
 }
 
 function readBody(request) {
@@ -1285,6 +1414,10 @@ const handleRequest = async (request, response) => {
     const deviceId = moderation.device(request, response);
     const bannedUntil = account?.isAdmin ? 0 : moderation.until([`device:${deviceId}`, ...(account ? [`account:${account.username}`] : [])]);
     if (bannedUntil) { sendJson(response, 403, { error: "You are banned from this arena.", bannedUntil }); return; }
+    // The owner can always get in; everyone else waits if the server is full or flooded with new connections.
+    const startWait = account?.isAdmin ? 0 : sessionStartWait(deviceId, Date.now());
+    if (startWait > 0) { sendJson(response, 503, { error: "The arena is full right now.", full: true, retryAfter: Math.ceil(startWait / 1000) }); return; }
+    signInGuard.sessionStarts.push(Date.now());
     const id = crypto.randomUUID();
     const sessionKey = crypto.randomBytes(20).toString("hex");
     const isAdmin = Boolean(account && account.isAdmin);
@@ -1325,6 +1458,8 @@ const handleRequest = async (request, response) => {
     const target=sessions.get(url.pathname.slice("/api/skins/".length));
     const match=target?.skin?.match(/^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=]+)$/);
     if (!match) {sendJson(response,404,{error:"Skin not found"});return;}
+    // Skin pictures are the biggest downloads; a cap per hour stops anyone from draining the monthly allowance.
+    if (!takeSkinBudget(match[2].length*3/4,Date.now())) {sendJson(response,429,{error:"Too many skin downloads right now"});return;}
     response.writeHead(200,{"Content-Type":match[1],"Cache-Control":"private, max-age=60","X-Content-Type-Options":"nosniff"});
     response.end(Buffer.from(match[2],"base64"));
     return;
@@ -1376,6 +1511,51 @@ const handleRequest = async (request, response) => {
       if (account) accounts.remember(response, account.username);
       else accounts.forget(response);
       sendJson(response, 200, { isAdmin: session.isAdmin, account });
+    } catch (error) {
+      sendJson(response, 400, { error: error.message });
+    }
+    return;
+  }
+
+  // A signed-in player changes their password. Every other browser signed in to the account is signed out.
+  if (request.method === "POST" && url.pathname === "/api/accounts/password") {
+    try {
+      const body = await readBody(request);
+      const session = sessions.get(String(body.id || ""));
+      if (!session || session.sessionKey !== body.sessionKey) { sendJson(response, 401, { error: "Refresh the game first." }); return; }
+      const signedIn = accounts.fromRequest(request);
+      if (!signedIn) { sendJson(response, 403, { error: "Sign in first." }); return; }
+      const wait = signInWait(signedIn.username, session.deviceId, Date.now());
+      if (wait > 0) { sendJson(response, 429, { error: tryAgainMessage(wait), retryAfter: Math.ceil(wait / 1000) }); return; }
+      let account;
+      try {
+        account = await accounts.changePassword(signedIn.username, body.currentPassword, body.newPassword);
+      } catch (error) {
+        if (error.message !== "Incorrect username or password.") throw error;
+        recordSignInFailure(signedIn.username, session.deviceId, Date.now());
+        throw new Error("Your current password is not right.");
+      }
+      recordSignInSuccess(signedIn.username, session.deviceId);
+      for (const other of sessions.values()) if (other.id !== session.id && other.account?.username === account.username) { other.account = null; other.isAdmin = false; other.immune = false; }
+      realtime?.invalidateDevice(session.deviceId);
+      accounts.remember(response, account.username); // this browser stays signed in
+      sendJson(response, 200, { account, isAdmin: account.isAdmin });
+    } catch (error) {
+      sendJson(response, 400, { error: error.message });
+    }
+    return;
+  }
+
+  // The owner gives a player who forgot their password a temporary one (and signs them out everywhere).
+  if (request.method === "POST" && url.pathname === "/api/admin/reset-password") {
+    try {
+      const body = await readBody(request);
+      const admin = sessions.get(String(body.id || ""));
+      const owner = accounts.fromRequest(request);
+      if (!admin || admin.sessionKey !== body.sessionKey || !owner?.isAdmin) { sendJson(response, 403, { error: "Admin access required" }); return; }
+      const account = await accounts.resetPassword(body.username, body.newPassword);
+      for (const other of sessions.values()) if (other.account?.username === account.username) { other.account = null; other.isAdmin = false; }
+      sendJson(response, 200, { reset: account.username });
     } catch (error) {
       sendJson(response, 400, { error: error.message });
     }
@@ -1449,7 +1629,7 @@ const handleRequest = async (request, response) => {
         if (body.clearSpikes) { world.viruses = []; world.autoSpikes = false; }
         if (typeof body.autoSpikes === "boolean") { world.autoSpikes = body.autoSpikes; world.nextSpikeAt = 0; }
         worldRevision++; botRevision++;
-        sendJson(response,200,{world, self:sessionView(admin), botRevision});
+        sendJson(response,200,{world: body.view === 2 ? worldView({}, admin) : world, self:sessionView(admin), botRevision});
       } else if (url.pathname.endsWith("/ban")) {
         const target = sessions.get(String(body.targetId || ""));
         const team = typeof body.botTeam === "string" ? body.botTeam : null;
@@ -1522,6 +1702,7 @@ const handleRequest = async (request, response) => {
         sendJson(response, 401, { error: "Session expired" });
         return;
       }
+      if (!takeStateAllowance(session, Date.now())) { sendJson(response, 429, { error: "Too many updates" }); return; }
       const previousSeen = session.lastSeen;
       const rejectedFood = new Set();
       session.lastSeen = Date.now();
@@ -1579,12 +1760,15 @@ const handleRequest = async (request, response) => {
       if (!wasRunning && session.running) ensureSafeOnlineSpawn(session);
       resolveCollisions();
 
-      const players = [...sessions.values()].filter(other => other.id !== session.id).map(sessionView);
+      // Games from before the compact updates (an old open tab) still get the long format.
+      const compact = body.view === 2;
+      const others = [...sessions.values()].filter(other => other.id !== session.id);
+      const players = compact ? others.filter(other => other.running).map(remoteView) : others.map(sessionView);
       const activeCount = [...sessions.values()].filter(other => other.running).length;
       session.lastReplyCells=session.cells.filter(cell=>cell.alive).map(cell=>({netId:cell.netId,mass:cell.mass}));
       session.lastReplyRevision=session.revision;
       sendJson(response, 200, {
-        self: sessionView(session),
+        self: compact ? selfView(session, number(body.ackRevision, 0, 0)) : sessionView(session),
         account: session.account,
         isAdmin: session.isAdmin,
         acceptedFeedIds: (Array.isArray(body.ejectedAdditions) ? body.ejectedAdditions : []).filter(pellet => session.feedIds.has(pellet.netId)).map(pellet => pellet.netId),
@@ -1598,7 +1782,7 @@ const handleRequest = async (request, response) => {
         food: foodSyncFor(body, rejectedFood),
         players,
         playerCount: Math.max(1, activeCount),
-        world,
+        world: compact && world ? worldView(body, session) : world,
         worldRevision,
         botRevision,
         botMassRevision,
@@ -1687,7 +1871,7 @@ if (!cloudMode) server.listen(port, "0.0.0.0", () => {
 });
 
 function exportState() {
-  return {world,food:exportFoodState(),signInGuard,worldRevision,botRevision,botMassRevision,serverBotCounter,serverFallbackActive,
+  return {world,food:exportFoodState(),signInGuard,worldRevision,botRevision,botMassRevision,serverBotCounter,ejectedSeq,serverFallbackActive,
     botRespawnBlockedUntil,targetBotTeams,botPieceCap,lastFallbackTick,ownerId,
     sessions:[...sessions.values()].map(session=>({...session,feedIds:[...session.feedIds],
       botActionIds:[...session.botActionIds],teamedBots:[...session.teamedBots]}))};
@@ -1697,6 +1881,7 @@ function importState(state) {
   world=state.world; for (const virus of world.viruses || []) if (!virus.id) virus.id=crypto.randomUUID();
   foodState=importFoodState(state.food); signInGuard=importSignInGuard(state.signInGuard); worldRevision=state.worldRevision||0; botRevision=state.botRevision||0;
   botMassRevision=state.botMassRevision||0; serverBotCounter=state.serverBotCounter||0;
+  ejectedSeq=Math.max(Number(state.ejectedSeq)||0,...(world.ejected||[]).map(pellet=>Number(pellet.seq)||0));
   serverFallbackActive=Boolean(state.serverFallbackActive);botRespawnBlockedUntil=state.botRespawnBlockedUntil||0;
   targetBotTeams=state.targetBotTeams||24;botPieceCap=state.botPieceCap||96;
   lastFallbackTick=state.lastFallbackTick||Date.now();ownerId=state.ownerId||null;sessions.clear();
