@@ -11,7 +11,10 @@ module.exports=async(request,response)=>{
     url.searchParams.delete("route");
     request.url=(pathname==="health"?"/health":"/api/"+pathname)+url.search;
   }
-  if(process.env.SPLITFLUX_BACKEND_ORIGIN){
+  const connectionString=process.env.DATABASE_URL||process.env.POSTGRES_URL;
+  // With a database, the live server's own note in it decides where games run (and allows a fallback when the
+  // live server is down). The fixed backend setting is only used when there is no database.
+  if(process.env.SPLITFLUX_BACKEND_ORIGIN&&!connectionString){
     try{await require("../backend-proxy.cjs").proxyBackend(request,response,process.env.SPLITFLUX_BACKEND_ORIGIN);}catch{
       response.writeHead(503,{"Content-Type":"application/json","Cache-Control":"no-store","Retry-After":"3"});
       response.end(JSON.stringify({error:"The game server is waking up. Please retry shortly."}));
@@ -19,7 +22,6 @@ module.exports=async(request,response)=>{
     return;
   }
   if (!handler) {
-    const connectionString=process.env.DATABASE_URL||process.env.POSTGRES_URL;
     if (!connectionString) {
       response.writeHead(503,{"Content-Type":"application/json","Cache-Control":"no-store"});
       response.end(JSON.stringify({error:"Connect the shared database before playing."}));return;
