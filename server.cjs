@@ -17,12 +17,22 @@ if (!fs.existsSync(adminKeyPath)) {
   fs.writeFileSync(adminKeyPath, JSON.stringify({ key: crypto.randomBytes(32).toString("hex") }), { mode: 0o600, flag: "wx" });
 }
 const rememberedAdminKey = JSON.parse(fs.readFileSync(adminKeyPath, "utf8")).key;
-const accounts = require("./accounts.cjs")(dataDirectory, rememberedAdminKey, adminPassword);
-const moderation = require("./moderation.cjs")(dataDirectory, rememberedAdminKey);
+// Accounts and bans are shared by every server (see useShared); "let" so a server copy can use the main ones.
+let accounts = require("./accounts.cjs")(dataDirectory, rememberedAdminKey, adminPassword);
+let moderation = require("./moderation.cjs")(dataDirectory, rememberedAdminKey);
 
 const sessions = new Map();
 let realtime=null;
 let ownerId = null;
+// ---- Servers ----
+// The main server has no room settings. A server made from the SERVERS tab runs in its own copy of this engine
+// with roomConfig set; its host gets the admin panel there. Any admin can make other players admins too.
+// Who is what:  owner = the alpha account (everything, on every server, bans everywhere)
+//               host  = whoever made this server        admin = promoted by an admin on this server
+// Bans by hosts and admins only remove the player from this server.
+let roomConfig = null;     // {id, name, host: {username, deviceId}}
+let promotedAdmins = [];   // "account:name" / "device:id" of players made admin on this server
+let serverBans = {};       // identity -> banned until (this server only)
 let world = null;
 // Shared food: one seed for the arena plus how many times each slot was eaten (0-255).
 // Positions come from BlobPhysics.food.at(), so only these small numbers are stored and sent.
@@ -188,6 +198,7 @@ function cleanWorld(raw) {
     ejected: [],
     // Spikes grow back on their own unless the owner turns that off (or removes all spikes).
     autoSpikes: raw.autoSpikes !== false,
+    botsOff: raw.botsOff === true,
     nextSpikeAt: 0,
   };
 }
@@ -219,16 +230,26 @@ function respawnSpikes(now) {
 
 // A player's game reports which spikes it popped; the server removes a spike only if one of that
 // player's pieces big enough to pop it (over 90 mass) really passed over it.
-function popSpikes(paths, rawPops) {
+// A player's pop counts if the piece that popped was big enough before popping (path.popMass), covered the
+// spike somewhere along the way it moved (same rule as BlobPhysics.spikes.covered, plus a little room for lag),
+// and really split this update (`poppers`: pieces that sent out new pieces; each can pop one spike).
+// The owner's game is trusted to split, so `poppers` is null there.
+function popSpikes(paths, rawPops, poppers = null) {
   if (!world || !Array.isArray(rawPops) || !paths.length) return 0;
   let popped = 0;
+  const used = new Set();
   for (const raw of rawPops.slice(0, 16)) {
     const index = world.viruses.findIndex(virus => virus.id === String(raw ?? ""));
     if (index < 0) continue;
     const virus = world.viruses[index];
-    const hit = paths.some(path => path.mass > 90 &&
-      distanceToPath(virus.x, virus.y, path.fromX, path.fromY, path.toX, path.toY) < path.radius + virus.r * .65 + path.margin);
+    const hit = paths.find(path => {
+      if (poppers && (!poppers.has(path.id) || used.has(path.id))) return false;
+      const mass = Math.max(path.popMass || 0, path.mass || 0);
+      if (mass < BlobPhysics.spikes.popMass) return false;
+      return distanceToPath(virus.x, virus.y, path.fromX, path.fromY, path.toX, path.toY) < cellRadius(mass) - (virus.r || 42) * .28 + path.margin;
+    });
     if (!hit) continue;
+    used.add(hit.id);
     world.viruses.splice(index, 1);
     worldRevision++;
     popped++;
@@ -519,9 +540,53 @@ function botControllers() {
     .map(session => ({ team: session.followedBotTeam, x: session.cursor.x, y: session.cursor.y }));
 }
 
+function identitiesOf(deviceId, account) {
+  return [`device:${deviceId}`, ...(account ? [`account:${account.username}`] : [])];
+}
+
+function isHost(deviceId, account) {
+  if (!roomConfig) return false;
+  const host = roomConfig.host;
+  return host.username ? account?.username === host.username : deviceId === host.deviceId;
+}
+
+// "owner", "host", "admin" or null for a player (by browser and account).
+function adminRole(deviceId, account) {
+  if (account?.isAdmin) return "owner";
+  if (isHost(deviceId, account)) return "host";
+  if (identitiesOf(deviceId, account).some(identity => promotedAdmins.includes(identity))) return "admin";
+  return null;
+}
+
+function serverBanUntil(identities) {
+  const now = Date.now();
+  return Math.max(0, ...identities.map(identity => Number(serverBans[identity]) > now ? Number(serverBans[identity]) : 0));
+}
+
+function banUntil(identities) {
+  return Math.max(moderation.until(identities), serverBanUntil(identities));
+}
+
+function serverBan(identities, durationMs) {
+  if (durationMs !== null && (!Number.isFinite(durationMs) || durationMs < 1000 || durationMs > Number.MAX_SAFE_INTEGER - Date.now())) throw new Error("Choose a duration of at least one second, or forever.");
+  const until = durationMs === null ? Number.MAX_SAFE_INTEGER : Date.now() + durationMs;
+  for (const identity of identities) serverBans[identity] = until;
+  for (const [identity, time] of Object.entries(serverBans)) if (time <= Date.now()) delete serverBans[identity];
+  return until;
+}
+
+function botTeamBanned(team) {
+  return Boolean(banUntil([`bot:${team}`]));
+}
+
+function bannedBotTeams() {
+  const local = Object.keys(serverBans).filter(identity => identity.startsWith("bot:") && serverBanUntil([identity])).map(identity => identity.slice(4));
+  return [...new Set([...moderation.bannedBotTeams(), ...local])];
+}
+
 function playerBanUntil(session) {
   if (session.account?.isAdmin) return 0;
-  return moderation.until([`device:${session.deviceId}`, ...(session.account ? [`account:${session.account.username}`] : [])]);
+  return banUntil(identitiesOf(session.deviceId, session.account));
 }
 
 function stopBannedPlayer(session) {
@@ -660,6 +725,29 @@ function simulateSharedEjected(dt) {
   if (botChanged) botMassRevision++;
   if (botChanged && !ownerDriving) botRevision++;
   return changed;
+}
+
+// A bot popped by a spike: like a player, it keeps half its mass and the rest bursts out as an even ring of shards.
+function popServerBot(bot) {
+  const team = bot.botTeam || bot.name;
+  const teamPieces = world.bots.filter(other => other.alive && (other.botTeam || other.name) === team).length;
+  const masses = BlobPhysics.spikes.popMasses(bot.mass, Math.min(BOT_TEAM_PIECES - teamPieces, BOT_PIECE_HARD_CAP - world.bots.length));
+  if (!bot.alive || !masses.length) return false;
+  const turn = Math.random() * Math.PI * 2, now = Date.now();
+  bot.mass = masses[0];
+  bot.radius = radiusForMass(bot.mass);
+  bot.splitCooldown = 3;
+  bot.serverMergeAt = now + 15000;
+  for (let index = 1; index < masses.length; index++) {
+    const shard = BlobPhysics.spikes.shardLaunch(bot, index - 1, masses.length - 1, turn, bot.radius);
+    const radius = radiusForMass(masses[index]);
+    world.bots.push({ ...bot, netId: crypto.randomUUID(), mass: masses[index], radius,
+      x: Math.max(radius, Math.min(world.worldSize - radius, shard.x)), y: Math.max(radius, Math.min(world.worldSize - radius, shard.y)),
+      launchX: shard.launchX, launchY: shard.launchY, targetX: shard.x + shard.launchX, targetY: shard.y + shard.launchY,
+      splitLineX: 0, splitLineY: 0, splitLineUntil: 0, splitLineUntilEpoch: 0, think: 0, splitCooldown: 3,
+      serverMergeAt: bot.serverMergeAt, virusImmuneUntil: now + 600 });
+  }
+  return true;
 }
 
 function splitServerBot(bot, target, burstPieces = 1, commanded = false) {
@@ -955,19 +1043,19 @@ function simulateServerBots(dt) {
 
   for (let index = world.viruses.length - 1; index >= 0; index--) {
     const virus = world.viruses[index];
-    const bot = world.bots.find(candidate => (
-      candidate.alive && candidate.mass > 90 && distance(candidate, virus) < candidate.radius + virus.r * .65
-    ));
+    // Same rule as players: the biggest bot piece covering the spike pops it, if it has room to split.
+    const bot = world.bots.filter(candidate => candidate.alive && Date.now() >= (candidate.virusImmuneUntil || 0) && BlobPhysics.spikes.covered(candidate, virus))
+      .sort((a, b) => b.mass - a.mass)[0];
     if (!bot) continue;
-    // If the bot can't split (piece limit reached) it just passes through and the spike stays.
-    if (!splitServerBot(bot, null, 6)) continue;
+    // If the bot can't split (piece limit reached) it just passes over and the spike stays.
+    if (!popServerBot(bot)) continue;
     world.viruses.splice(index, 1);
   }
 
   resolveServerBotCollisions(dt);
   resolveCollisions();
   const livingTeams = new Set(world.bots.filter(bot => bot.alive).map(bot => bot.botTeam));
-  if (Date.now() >= botRespawnBlockedUntil && livingTeams.size < targetBotTeams && world.bots.length < BOT_PIECE_HARD_CAP) spawnServerBot();
+  if (!world.botsOff && Date.now() >= botRespawnBlockedUntil && livingTeams.size < targetBotTeams && world.bots.length < BOT_PIECE_HARD_CAP) spawnServerBot();
   worldRevision++;
   botRevision++;
   return true;
@@ -1168,6 +1256,8 @@ function validateClientCells(session, previousCells, cells, rawCells, spawning, 
     entry.paths = grace
       ? [{ id: cell.netId, fromX: cell.x, fromY: cell.y, toX: cell.x, toY: cell.y, radius, mass: pathMass, margin: 60 + speed * elapsed }]
       : [{ id: cell.netId, fromX: ref.x, fromY: ref.y, toX: cell.x, toY: cell.y, radius, mass: pathMass, margin: 14 + radius * (severalPieces ? .35 : .1) }];
+    // How big this piece was before this update: a spike pop is judged on that (a popped piece has just halved).
+    entry.paths[0].popMass = isNew ? pathMass : Math.max(pathMass, Number(ref.mass) || 0);
     // Pieces that merged into this one ate food on their own way in.
     for (const id of Object.keys(origins.get(cell.netId) || {})) {
       const merged = previous.get(id);
@@ -1180,7 +1270,7 @@ function validateClientCells(session, previousCells, cells, rawCells, spawning, 
   // (Being eaten, eating others and feeding are applied by the server itself.)
   const paths = entries.flatMap(entry => entry.paths);
   const earned = claimFood(paths, rawClaims, rejectedFood);
-  popSpikes(paths, rawPops);
+  popSpikes(paths, rawPops, splitParents);
   const kept = entries.map(entry => entry.cell);
   const previousTotal = [...previous.values()].reduce((sum, cell) => sum + cell.mass, 0);
   const total = kept.reduce((sum, cell) => sum + cell.mass, 0);
@@ -1202,7 +1292,8 @@ function ownerActions(previousCells, cells, rawClaims, rejectedFood, rawPops) {
   const previous = new Map((previousCells || []).map(cell => [cell.netId, cell]));
   const paths = cells.filter(cell => cell.alive).map(cell => {
     const from = previous.get(cell.netId) || cell;
-    return { id: cell.netId, fromX: from.x, fromY: from.y, toX: cell.x, toY: cell.y, radius: cell.radius, mass: cell.mass, margin: 120 };
+    return { id: cell.netId, fromX: from.x, fromY: from.y, toX: cell.x, toY: cell.y, radius: cell.radius, mass: cell.mass,
+      popMass: Math.max(cell.mass, Number(from.mass) || 0), margin: 120 };
   });
   claimFood(paths, rawClaims, rejectedFood);
   popSpikes(paths, rawPops);
@@ -1334,6 +1425,7 @@ function worldView(body = {}, session = null) {
   const view = {
     worldSize: world.worldSize,
     autoSpikes: world.autoSpikes,
+    botsOff: Boolean(world.botsOff),
     bots: world.bots.filter(bot => bot.alive).map(bot => [fingerprint(String(bot.netId)), bot.botTeam || bot.name,
       roundTo(bot.x), roundTo(bot.y), massValue(bot.mass), roundTo(bot.vx), roundTo(bot.vy)]),
     teamsSig,
@@ -1350,6 +1442,8 @@ function worldView(body = {}, session = null) {
 function remoteView(session) {
   return {
     id: session.id, name: session.name, color: session.color, skinVersion: session.skinVersion || 0,
+    // Admins see who else is an admin, to give or take admin from the player menu.
+    role: adminRole(session.deviceId, session.account) || undefined,
     cells: session.cells.filter(cell => cell.alive).map(cell => [fingerprint(String(cell.netId)),
       roundTo(cell.x), roundTo(cell.y), massValue(cell.mass), roundTo(cell.vx), roundTo(cell.vy)]),
   };
@@ -1412,7 +1506,7 @@ const handleRequest = async (request, response) => {
     cleanupSessions();
     const account = accounts.fromRequest(request);
     const deviceId = moderation.device(request, response);
-    const bannedUntil = account?.isAdmin ? 0 : moderation.until([`device:${deviceId}`, ...(account ? [`account:${account.username}`] : [])]);
+    const bannedUntil = account?.isAdmin ? 0 : banUntil(identitiesOf(deviceId, account));
     if (bannedUntil) { sendJson(response, 403, { error: "You are banned from this arena.", bannedUntil }); return; }
     // The owner can always get in; everyone else waits if the server is full or flooded with new connections.
     const startWait = account?.isAdmin ? 0 : sessionStartWait(deviceId, Date.now());
@@ -1420,8 +1514,9 @@ const handleRequest = async (request, response) => {
     signInGuard.sessionStarts.push(Date.now());
     const id = crypto.randomUUID();
     const sessionKey = crypto.randomBytes(20).toString("hex");
-    const isAdmin = Boolean(account && account.isAdmin);
-    if (isAdmin) {
+    const role = adminRole(deviceId, account);
+    const isAdmin = Boolean(role);
+    if (account?.isAdmin) {
       ownerId = id;
     }
     sessions.set(id, {
@@ -1450,7 +1545,15 @@ const handleRequest = async (request, response) => {
       lastSeen: Date.now(),
     });
     if (account) accounts.remember(response, account.username);
-    sendJson(response, 200, { id, sessionKey, isAdmin, account });
+    sendJson(response, 200, { id, sessionKey, isAdmin, adminRole: role, account, server: serverInfo() });
+    return;
+  }
+
+  // The live server answers this with every server (rooms.cjs); on its own this engine only knows itself.
+  if (request.method === "GET" && url.pathname === "/api/rooms") {
+    cleanupSessions();
+    sendJson(response, 200, { rooms: [{ ...serverInfo(), main: !roomConfig, private: false, ...summary() }], canCreate: false,
+      reason: "Making servers needs the live game server. Try again in a minute." });
     return;
   }
 
@@ -1502,15 +1605,15 @@ const handleRequest = async (request, response) => {
         if (registering) signInGuard.registrations.push({ time: Date.now(), device: session.deviceId });
         else recordSignInSuccess(body.username, session.deviceId);
       }
-      if (account && !account.isAdmin && moderation.until([`account:${account.username}`, `device:${session.deviceId}`])) throw new Error("This account or browser is currently banned.");
+      if (account && !account.isAdmin && banUntil(identitiesOf(session.deviceId, account))) throw new Error("This account or browser is currently banned.");
       session.account = account;
-      session.isAdmin = Boolean(account && account.isAdmin);
+      session.isAdmin = Boolean(adminRole(session.deviceId, account));
       realtime?.invalidateDevice(session.deviceId);
       if (!session.isAdmin) session.immune = false;
       session.lastSeen = Date.now();
       if (account) accounts.remember(response, account.username);
       else accounts.forget(response);
-      sendJson(response, 200, { isAdmin: session.isAdmin, account });
+      sendJson(response, 200, { isAdmin: session.isAdmin, adminRole: adminRole(session.deviceId, account), account });
     } catch (error) {
       sendJson(response, 400, { error: error.message });
     }
@@ -1536,10 +1639,10 @@ const handleRequest = async (request, response) => {
         throw new Error("Your current password is not right.");
       }
       recordSignInSuccess(signedIn.username, session.deviceId);
-      for (const other of sessions.values()) if (other.id !== session.id && other.account?.username === account.username) { other.account = null; other.isAdmin = false; other.immune = false; }
+      for (const other of sessions.values()) if (other.id !== session.id && other.account?.username === account.username) { other.account = null; other.isAdmin = Boolean(adminRole(other.deviceId, null)); other.immune = false; }
       realtime?.invalidateDevice(session.deviceId);
       accounts.remember(response, account.username); // this browser stays signed in
-      sendJson(response, 200, { account, isAdmin: account.isAdmin });
+      sendJson(response, 200, { account, isAdmin: Boolean(adminRole(session.deviceId, account)), adminRole: adminRole(session.deviceId, account) });
     } catch (error) {
       sendJson(response, 400, { error: error.message });
     }
@@ -1554,7 +1657,7 @@ const handleRequest = async (request, response) => {
       const owner = accounts.fromRequest(request);
       if (!admin || admin.sessionKey !== body.sessionKey || !owner?.isAdmin) { sendJson(response, 403, { error: "Admin access required" }); return; }
       const account = await accounts.resetPassword(body.username, body.newPassword);
-      for (const other of sessions.values()) if (other.account?.username === account.username) { other.account = null; other.isAdmin = false; }
+      for (const other of sessions.values()) if (other.account?.username === account.username) { other.account = null; other.isAdmin = Boolean(adminRole(other.deviceId, null)); }
       sendJson(response, 200, { reset: account.username });
     } catch (error) {
       sendJson(response, 400, { error: error.message });
@@ -1600,12 +1703,13 @@ const handleRequest = async (request, response) => {
     return;
   }
 
-  if (request.method === "POST" && ["/api/admin/ban", "/api/admin/paint-spikes", "/api/admin/arena"].includes(url.pathname)) {
+  if (request.method === "POST" && ["/api/admin/ban", "/api/admin/paint-spikes", "/api/admin/arena", "/api/admin/promote"].includes(url.pathname)) {
     try {
       const body = await readBody(request);
       const admin = sessions.get(String(body.id || ""));
       const account = accounts.fromRequest(request);
-      if (!admin || admin.sessionKey !== body.sessionKey || !account?.isAdmin) { sendJson(response, 403, { error: "Admin access required" }); return; }
+      const role = admin && admin.sessionKey === body.sessionKey ? adminRole(admin.deviceId, account) : null;
+      if (!role) { sendJson(response, 403, { error: "Admin access required" }); return; }
       if (url.pathname.endsWith("/arena")) {
         if (!world) { sendJson(response, 409, {error:"Start a round first."}); return; }
         if (body.mapScale === 2 || body.mapScale === .5) {
@@ -1627,20 +1731,38 @@ const handleRequest = async (request, response) => {
           world.bots = world.bots.filter(bot=>keep.has(bot.botTeam||bot.name)).slice(0,botPieceCap);
         }
         if (body.clearSpikes) { world.viruses = []; world.autoSpikes = false; }
+        // REMOVE ALL BOTS is a switch: on = every bot is gone and none come back, off = they spawn again.
+        if (typeof body.botsOff === "boolean") { world.botsOff = body.botsOff; if (body.botsOff) world.bots = []; }
         if (typeof body.autoSpikes === "boolean") { world.autoSpikes = body.autoSpikes; world.nextSpikeAt = 0; }
         worldRevision++; botRevision++;
         sendJson(response,200,{world: body.view === 2 ? worldView({}, admin) : world, self:sessionView(admin), botRevision});
+      } else if (url.pathname.endsWith("/promote")) {
+        // Make another player an admin on this server (or take it away). The owner and host always stay admins.
+        const target = sessions.get(String(body.targetId || ""));
+        if (!target) { sendJson(response, 404, { error: "Player is no longer in the arena." }); return; }
+        const targetRole = adminRole(target.deviceId, target.account);
+        if (targetRole === "owner" || targetRole === "host") { sendJson(response, 403, { error: `The ${targetRole} is always an admin.` }); return; }
+        const identities = identitiesOf(target.deviceId, target.account);
+        promotedAdmins = promotedAdmins.filter(identity => !identities.includes(identity));
+        if (body.admin === true) promotedAdmins.push(target.account ? `account:${target.account.username}` : `device:${target.deviceId}`);
+        promotedAdmins = promotedAdmins.slice(-100);
+        target.isAdmin = Boolean(adminRole(target.deviceId, target.account));
+        if (!target.isAdmin) target.immune = false;
+        sendJson(response, 200, { admin: target.isAdmin, name: target.name });
       } else if (url.pathname.endsWith("/ban")) {
         const target = sessions.get(String(body.targetId || ""));
         const team = typeof body.botTeam === "string" ? body.botTeam : null;
+        // Only the owner's bans count on every server; a host's or admin's ban removes the player from this server.
+        const ban = role === "owner" ? (identities, duration) => moderation.ban(identities, duration) : serverBan;
         if (target) {
-          if (target.id === admin.id || target.account?.isAdmin || target.deviceId===admin.deviceId) { sendJson(response, 403, { error:"The owner cannot be banned." }); return; }
-          const identities = [`device:${target.deviceId}`, ...(target.account ? [`account:${target.account.username}`] : [])];
-          const until = moderation.ban(identities, body.durationMs);
+          const targetRole = adminRole(target.deviceId, target.account);
+          if (target.id === admin.id || target.deviceId === admin.deviceId) { sendJson(response, 403, { error: "You can't ban yourself." }); return; }
+          if (targetRole === "owner" || (targetRole === "host" && role !== "owner")) { sendJson(response, 403, { error: `The ${targetRole} cannot be banned.` }); return; }
+          const until = ban(identitiesOf(target.deviceId, target.account), body.durationMs);
           for (const session of sessions.values()) if (playerBanUntil(session)) stopBannedPlayer(session);
           sendJson(response, 200, { bannedUntil: until });
         } else if (team && world?.bots.some(bot => (bot.botTeam || bot.name) === team)) {
-          const until = moderation.ban([`bot:${team}`], body.durationMs);
+          const until = ban([`bot:${team}`], body.durationMs);
           world.bots = world.bots.filter(bot => (bot.botTeam || bot.name) !== team);
           botRevision++;
           sendJson(response, 200, { bannedUntil: until });
@@ -1666,13 +1788,17 @@ const handleRequest = async (request, response) => {
       const body = await readBody(request);
       const owner = sessions.get(String(body.id || ""));
       const account = accounts.fromRequest(request);
-      if (!owner || owner.sessionKey !== body.sessionKey || !account || !account.isAdmin) {
-        sendJson(response, 403, { error: "Owner access required" });
+      const role = owner && owner.sessionKey === body.sessionKey ? adminRole(owner.deviceId, account) : null;
+      if (!role) {
+        sendJson(response, 403, { error: "Admin access required" });
         return;
       }
       let killed = 0;
       for (const session of sessions.values()) {
         if (session.id === owner.id) continue;
+        // The owner is never killed by someone else, and a host only by the owner.
+        const otherRole = adminRole(session.deviceId, session.account);
+        if (otherRole === "owner" || (otherRole === "host" && role !== "owner")) continue;
         if (session.running || session.cells.some(cell => cell.alive)) killed++;
         session.cells = [];
         session.running = false;
@@ -1707,7 +1833,7 @@ const handleRequest = async (request, response) => {
       const rejectedFood = new Set();
       session.lastSeen = Date.now();
       session.account = accounts.fromRequest(request);
-      session.isAdmin = Boolean(session.account && session.account.isAdmin);
+      session.isAdmin = Boolean(adminRole(session.deviceId, session.account));
       const bannedUntil = playerBanUntil(session);
       if (bannedUntil) { stopBannedPlayer(session); sendJson(response, 403, {error:"You are banned from this arena.",bannedUntil}); return; }
       const wasRunning = session.running;
@@ -1748,7 +1874,7 @@ const handleRequest = async (request, response) => {
       if (process.env.NODE_ENV === "test" && process.env.SPLITFLUX_TEST_WORLD === "1" && session.isAdmin && session.running && body.world && number(body.ackBotRevision, 0, 0) >= botRevision && number(body.ackBotMassRevision, 0, 0) >= botMassRevision) {
         const sharedEjected = world ? world.ejected : [];
         world = cleanWorld(body.world);
-        world.bots = world.bots.filter(bot => !moderation.until([`bot:${bot.botTeam || bot.name}`]));
+        world.bots = world.bots.filter(bot => !botTeamBanned(bot.botTeam || bot.name));
         world.ejected = sharedEjected;
       }
       // Map boundaries are independent of bot correction acknowledgements.
@@ -1771,6 +1897,7 @@ const handleRequest = async (request, response) => {
         self: compact ? selfView(session, number(body.ackRevision, 0, 0)) : sessionView(session),
         account: session.account,
         isAdmin: session.isAdmin,
+        adminRole: adminRole(session.deviceId, session.account),
         acceptedFeedIds: (Array.isArray(body.ejectedAdditions) ? body.ejectedAdditions : []).filter(pellet => session.feedIds.has(pellet.netId)).map(pellet => pellet.netId),
         teamedBots: [...session.teamedBots],
         teamRevision:session.teamRevision,
@@ -1778,7 +1905,7 @@ const handleRequest = async (request, response) => {
         botControllers: botControllers(),
         acceptedBotSplitCommands: (Array.isArray(body.botSplitCommands) ? body.botSplitCommands : []).filter(id => session.botActionIds.has(id)),
         botSplitError,
-        bannedBotTeams: moderation.bannedBotTeams(),
+        bannedBotTeams: bannedBotTeams(),
         food: foodSyncFor(body, rejectedFood),
         players,
         playerCount: Math.max(1, activeCount),
@@ -1814,7 +1941,9 @@ const handleRequest = async (request, response) => {
   response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
   response.end("Not found");
 };
-const server = http.createServer(handleRequest);
+// On a PC (node server.cjs) requests go through the server list (set up at the end of this file).
+let localHandler = handleRequest;
+const server = http.createServer((request, response) => localHandler(request, response));
 
 world = cleanWorld({ worldSize: 5200, bots: [], viruses: Array.from({ length: 22 }, () => makeSpike(100 + Math.random() * 5000, 100 + Math.random() * 5000)) });
 for (let index = 0; index < 24; index++) spawnServerBot();
@@ -1830,7 +1959,7 @@ function tickArena(dt) {
   resolveCollisions();
   if (world) {
     const before=world.bots.length;
-    world.bots=world.bots.filter(bot=>!moderation.until([`bot:${bot.botTeam||bot.name}`]));
+    world.bots=world.bots.filter(bot=>!botTeamBanned(bot.botTeam||bot.name));
     if (world.bots.length!==before) botRevision++;
   }
 }
@@ -1843,12 +1972,32 @@ function advanceArena() {
 const fallbackTimer = cloudMode ? null : setInterval(advanceArena,40);
 fallbackTimer?.unref();
 
-function enableRealtime(target=server,dispatch=handleRequest){
-  realtime=require("./realtime.cjs").attachRealtime(target,{getSession:id=>sessions.get(id),dispatch});
+function enableRealtime(target=server,dispatch=handleRequest,getSession=id=>sessions.get(id)){
+  realtime=require("./realtime.cjs").attachRealtime(target,{getSession,dispatch});
   return realtime;
 }
-if(!cloudMode&&typeof server.on==="function")enableRealtime();
 
+// ---- Used by the server list (rooms.cjs) ----
+function serverInfo() {
+  return roomConfig ? { id: roomConfig.id, name: roomConfig.name } : { id: "main", name: "MAIN SERVER" };
+}
+// A made server: its name and host, and whether it starts with bots.
+function configureRoom(config) {
+  roomConfig = { id: String(config.id), name: String(config.name), host: { username: config.host?.username || null, deviceId: config.host?.deviceId || null } };
+  if (config.bots === false) { world.botsOff = true; world.bots = []; botRevision++; }
+}
+function summary() {
+  const list = [...sessions.values()];
+  return { players: list.filter(session => session.running).length, connected: list.length, bots: !world.botsOff };
+}
+function shared() { return { accounts, moderation, signInGuard, realtime }; }
+// A made server uses the main server's accounts, bans, sign-in limits and live connection.
+function useShared(parts) {
+  if (parts.accounts) accounts = parts.accounts;
+  if (parts.moderation) moderation = parts.moderation;
+  if (parts.signInGuard) signInGuard = parts.signInGuard;
+  if (parts.realtime !== undefined) realtime = parts.realtime;
+}
 if (!cloudMode) server.listen(port, "0.0.0.0", () => {
   const addresses = [];
   for (const entries of Object.values(os.networkInterfaces())) {
@@ -1872,7 +2021,7 @@ if (!cloudMode) server.listen(port, "0.0.0.0", () => {
 
 function exportState() {
   return {world,food:exportFoodState(),signInGuard,worldRevision,botRevision,botMassRevision,serverBotCounter,ejectedSeq,serverFallbackActive,
-    botRespawnBlockedUntil,targetBotTeams,botPieceCap,lastFallbackTick,ownerId,
+    botRespawnBlockedUntil,targetBotTeams,botPieceCap,lastFallbackTick,ownerId,promotedAdmins,serverBans,
     sessions:[...sessions.values()].map(session=>({...session,feedIds:[...session.feedIds],
       botActionIds:[...session.botActionIds],teamedBots:[...session.teamedBots]}))};
 }
@@ -1885,7 +2034,20 @@ function importState(state) {
   serverFallbackActive=Boolean(state.serverFallbackActive);botRespawnBlockedUntil=state.botRespawnBlockedUntil||0;
   targetBotTeams=state.targetBotTeams||24;botPieceCap=state.botPieceCap||96;
   lastFallbackTick=state.lastFallbackTick||Date.now();ownerId=state.ownerId||null;sessions.clear();
+  promotedAdmins=Array.isArray(state.promotedAdmins)?state.promotedAdmins.filter(identity=>typeof identity==="string").slice(-100):[];
+  serverBans=state.serverBans&&typeof state.serverBans==="object"?{...state.serverBans}:{};
   for (const session of state.sessions) sessions.set(session.id,{...session,feedIds:new Set(session.feedIds),
     botActionIds:new Set(session.botActionIds),teamedBots:new Set(session.teamedBots)});
 }
-module.exports = { server, handleRequest, advanceArena, exportState, importState, enableRealtime };
+module.exports = { server, handleRequest, advanceArena, exportState, importState, enableRealtime,
+  getSession: id => sessions.get(id), serverInfo, configureRoom, summary, shared, useShared, cleanupSessions };
+
+// Running on a PC (node server.cjs, localhost:1000): the main server plus servers players make, just like the
+// live server. Made servers run in their own copy of this engine; this copy keeps its own 40 ms timer.
+if (!cloudMode && typeof server.on === "function") {
+  const rooms = require("./rooms.cjs").createRoomManager({ main: module.exports, tickMain: false,
+    loadEngine: () => require("./cloud-runtime.cjs").loadEngine(dataDirectory) });
+  localHandler = rooms.handle;
+  enableRealtime(server, rooms.handle, rooms.getSession);
+  setInterval(rooms.tick, 40).unref();
+}

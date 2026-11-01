@@ -17,6 +17,7 @@
       </div>
       <div class="status-strip">
         <span id="serverStatus"><i class="status-dot"></i> LOCAL MODE</span>
+        <span id="serverLabel" hidden>MAIN SERVER</span>
         <span>NO AUDIO</span>
         <span id="botCount">24 BOTS</span>
       </div>
@@ -40,6 +41,25 @@
 
     <div id="startScreen" class="overlay">
       <div class="hero-card">
+        <div id="menuTabs" class="menu-tabs" role="tablist" hidden>
+          <button id="tabPlay" type="button" role="tab" aria-selected="true" class="active">PLAY</button>
+          <button id="tabServers" type="button" role="tab" aria-selected="false">SERVERS</button>
+        </div>
+        <p id="currentServer" class="current-server" hidden>SERVER: <b id="currentServerName">MAIN SERVER</b></p>
+        <div id="serversTab" class="servers-tab" hidden>
+          <div class="servers-head"><b>SERVERS</b><button id="refreshServers" type="button">REFRESH</button></div>
+          <ul id="serverList" class="server-list"></ul>
+          <p id="serverMessage" class="server-message" role="status" aria-live="polite"></p>
+          <details id="makeServer" class="account-tools make-server">
+            <summary>MAKE A SERVER</summary>
+            <input id="newServerName" maxlength="24" autocomplete="off" placeholder="Server name" />
+            <input id="newServerPassword" type="password" maxlength="64" autocomplete="new-password" placeholder="Password (optional, makes it private)" />
+            <label class="check-field"><input id="newServerBots" type="checkbox" checked /> Add bots</label>
+            <button id="createServer" type="button">CREATE SERVER</button>
+            <p class="server-note">You get the admin panel in your server. It closes 5 minutes after everyone leaves.</p>
+          </details>
+        </div>
+        <div id="playTab">
         <div class="eyebrow">ENTER THE VOID</div>
         <h1>Consume.<br /><em>Outgrow.</em> Survive.</h1>
         <p>Absorb energy and smaller cells. Avoid anything bigger than you. The arena is filled with bots that hunt, flee, and fight each other.</p>
@@ -103,6 +123,7 @@
           <div><b>TRIPLE SPLIT</b><span>Press E</span></div>
           <div><b>SPLIT</b><span>Space - 3s merge</span></div>
         </div>
+        </div>
       </div>
     </div>
 
@@ -132,6 +153,7 @@
       <label>Ban duration <input id="banDuration" type="number" min="1" step="any" value="5" /></label>
       <select id="banUnit"><option value="1000">Seconds</option><option value="60000" selected>Minutes</option><option value="3600000">Hours</option><option value="86400000">Days</option><option value="forever">Forever</option></select>
       <button id="confirmBan" type="button">BAN PLAYER</button>
+      <button id="toggleAdminRole" type="button" hidden>MAKE ADMIN</button>
       <p id="moderationMessage"></p>
     </section>
     <section id="adminPanel" class="admin-panel hidden">
@@ -168,6 +190,7 @@
         <button id="instantMerge" class="admin-merge">INSTANTLY REMERGE</button>
         <button id="autoSpikes" class="admin-merge active">AUTO SPIKES <span id="autoSpikesState">ON</span></button>
         <button id="removeSpikes" class="admin-danger">REMOVE ALL SPIKES</button>
+        <button id="removeBots" class="admin-danger">REMOVE ALL BOTS <span id="removeBotsState">OFF</span></button>
         <button id="spikePainter" type="button">SPIKE PAINTER: OFF</button>
         <p>Turn on the painter, then click or drag on the map. Team bot: hold T to feed, press 1 to split.</p>
         <button id="killEveryone" class="admin-danger">KILL EVERYONE</button>

@@ -91,9 +91,13 @@ const piece = (team, i, x, y, mass, color = "#ff8844") =>
   const client = vm.createContext({BlobPhysics: physics, worldSize: 5200, bots: [], viruses: [], lastWorld: null, updateMapSizeLabel() {},
     isAdmin: false, normalizeNetworkCell: cell => cell, mergeNetworkCell: (_, cell) => ({...cell}), ejected: [], ejectedCache: new Map(),
     networkDelay: 0, performance: {now: () => 1000}, Date, rebuildSharedFood() {}, poppedVirusIds: new Map(), autoSpikesOn: false,
-    setAutoSpikesLabel() {}, botTeamInfo: new Map(), serverViruses: [], teamsSig: "", spikesSig: "", radiusForMass: m => Math.sqrt(m) * 4.2 + 8});
+    setAutoSpikesLabel() {}, botsRemoved: false, botTeamInfo: new Map(), serverViruses: [], teamsSig: "", spikesSig: "", radiusForMass: m => Math.sqrt(m) * 4.2 + 8});
   vm.runInContext(source.slice(source.indexOf("  // A compact bot is"), source.indexOf("  // Brings the shared food up to date")), client);
   client.first = first.world; client.steady = steady.world; client.pellets = withPellets.world; client.later = later.world;
+  client.setRemoveBotsLabel = on => { client.botsRemoved = on; };
+  vm.runInContext("applyWorld(first)", client);
+  vm.runInContext("applyWorld({...first, botsOff: true})", client);
+  assert.equal(client.botsRemoved, true, "The REMOVE ALL BOTS switch shows the server's setting");
   vm.runInContext("applyWorld(first)", client);
   const bot = vm.runInContext("bots.find(bot => bot.botTeam === 'Team3')", client);
   assert.equal(bot.name, "Team3"); assert.equal(bot.color, "#ff8844"); assert.equal(bot.alive, true);

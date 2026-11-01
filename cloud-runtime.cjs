@@ -51,12 +51,17 @@ function createEngine(snapshot, directory) {
     if (snapshot?.files?.[name]) fs.writeFileSync(filename,snapshot.files[name],{mode:0o600});
     else fs.rmSync(filename,{force:true});
   }
+  const engine=loadEngine(directory);
+  if (snapshot) engine.importState(arenaOf(snapshot));
+  return engine;
+}
+
+// A fresh copy of the game engine (its own arena and players) using the files already in the directory.
+function loadEngine(directory) {
   process.env.SPLITFLUX_CLOUD_MODE="1";
   process.env.SPLITFLUX_DATA_DIR=directory;
   delete require.cache[require.resolve("./server.cjs")];
-  const engine=require("./server.cjs");
-  if (snapshot) engine.importState(arenaOf(snapshot));
-  return engine;
+  return require("./server.cjs");
 }
 
 function captureResponse() {
@@ -155,4 +160,4 @@ function createCloudHandler(pool, options={}) {
   };
 }
 
-module.exports={createCloudHandler,createEngine,captureResponse,packSnapshot,arenaOf,LIVE_TAKEOVER_MS,BACKUP_TABLE,backupFiles,filesChanged,checkAccountsKept};
+module.exports={createCloudHandler,createEngine,loadEngine,captureResponse,packSnapshot,arenaOf,LIVE_TAKEOVER_MS,BACKUP_TABLE,backupFiles,filesChanged,checkAccountsKept};

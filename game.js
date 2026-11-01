@@ -63,6 +63,9 @@ let playerBlobImage = null;
 let playerBlobImageData = "";
 const onlineMode = location.protocol === "http:" || location.protocol === "https:";
 let isAdmin = !onlineMode;
+// "owner" (the alpha account), "host" (made this server), "admin" (made admin by an admin) or null.
+let adminRole = onlineMode ? null : "owner";
+let botsRemoved = false;
 let remotePlayerCells = [];
 let teamedBots = new Set();
 let selectedTeamBot = null;
@@ -413,6 +416,7 @@ function spawnBot(name) {
 
 function maintainBotPopulation(dt) {
   if (onlineMode) return;
+  if (botsRemoved) { bots = []; return; }
   bots = bots.filter(bot => bot.alive);
   if (performance.now() < botRespawnPausedUntil) return;
   botSpawnTimer -= dt;
@@ -738,75 +742,82 @@ function separatePlayerCells(dt = 1 / 60) {
   playerCells = playerCells.filter(c => c.alive);
 }
 
-function burstPlayerCell(cell) {
-  if (!cell.alive || cell.mass < 90 || playerCells.length >= MAX_PLAYER_CELLS) return;
-  const pieces = Math.min(6, MAX_PLAYER_CELLS - playerCells.length);
-  partitionMassCorrection(cell, pieces + 1);
-  const pieceMass = cell.mass / (pieces + 1);
-  cell.mass = pieceMass;
-  cell.radius = radiusForMass(pieceMass);
-  cell.mergeAt = performance.now() + 3000;
-  for (let i = 0; i < pieces; i++) {
-    const angle = Math.PI * 2 * i / pieces + rand(-.25, .25);
-    const child = { ...cell, netId: `cell-${Math.random().toString(36).slice(2)}` };
-    child.x = clamp(cell.x + Math.cos(angle) * cell.radius, cell.radius, worldSize - cell.radius);
-    child.y = clamp(cell.y + Math.sin(angle) * cell.radius, cell.radius, worldSize - cell.radius);
-    child.launchX = Math.cos(angle) * rand(380, 620);
-    child.launchY = Math.sin(angle) * rand(380, 620);
-    playerCells.push(child);
+// Splits the mass bookkeeping for the server in the same shares as the mass itself (see syncRoom).
+function shareMassCorrection(cell, shares) {
+  return shares.map(share => {
+    const part = {};
+    for (const key of ["_syncMassWeights", "_pendingFeedCosts"]) {
+      if (cell[key]) part[key] = Object.fromEntries(Object.entries(cell[key]).map(([id, weight]) => [id, weight * share]));
+    }
+    return part;
+  });
+}
+
+// Spike pop (rules in BlobPhysics.spikes): the piece keeps half its mass, the rest bursts out as an even ring
+// of shards. Returns false when there is no room for a shard: then the spike stays and nothing happens.
+function popPlayerCell(cell) {
+  if (!cell.alive) return false;
+  const masses = BlobPhysics.spikes.popMasses(cell.mass, MAX_PLAYER_CELLS - playerCells.filter(c => c.alive).length);
+  if (!masses.length) return false;
+  const now = performance.now(), turn = Math.random() * Math.PI * 2, total = cell.mass;
+  const parts = shareMassCorrection(cell, masses.map(mass => mass / total));
+  Object.assign(cell, parts[0]);
+  cell.mass = masses[0];
+  cell.radius = radiusForMass(cell.mass);
+  cell.mergeAt = now + 3000;
+  for (let i = 1; i < masses.length; i++) {
+    const shard = BlobPhysics.spikes.shardLaunch(cell, i - 1, masses.length - 1, turn, cell.radius);
+    const shardRadius = radiusForMass(masses[i]);
+    playerCells.push({ ...cell, ...parts[i], netId: `cell-${Math.random().toString(36).slice(2)}`, mass: masses[i], radius: shardRadius,
+      x: clamp(shard.x, shardRadius, worldSize - shardRadius), y: clamp(shard.y, shardRadius, worldSize - shardRadius),
+      launchX: shard.launchX, launchY: shard.launchY, virusImmuneUntil: now + 600 });
   }
   emit(cell.x, cell.y, "#56ff71", 24);
+  return true;
 }
 
-function burstBotCell(bot) {
+// Same pop for bots when playing offline (online, the server pops bots).
+function popBotCell(bot) {
   const maxPieces = megaCrazyMode ? 360 : xtraCrazyMode ? 180 : crazyMode ? 96 : 64;
-  if (!bot.alive || bot.mass < 90 || bots.length >= maxPieces) return;
-  const pieces = Math.min(6, maxPieces - bots.length);
-  if (pieces < 1) return;
-  const pieceMass = bot.mass / (pieces + 1);
-  bot.mass = pieceMass;
-  bot.radius = radiusForMass(pieceMass);
+  const team = bot.botTeam || bot.name;
+  const room = Math.min(MAX_PLAYER_CELLS - bots.filter(other => other.alive && (other.botTeam || other.name) === team).length, maxPieces - bots.length);
+  const masses = BlobPhysics.spikes.popMasses(bot.mass, room);
+  if (!bot.alive || !masses.length) return false;
+  const turn = Math.random() * Math.PI * 2;
+  bot.mass = masses[0];
+  bot.radius = radiusForMass(bot.mass);
   bot.splitCooldown = 7;
   bot.mergeAt = performance.now() + 15000;
-  for (let i = 0; i < pieces; i++) {
-    const angle = Math.PI * 2 * i / pieces + rand(-.25, .25);
-    const child = { ...bot };
-    child.x = boundCell(bot.x + Math.cos(angle) * bot.radius, bot.radius);
-    child.y = boundCell(bot.y + Math.sin(angle) * bot.radius, bot.radius);
-    child.launchX = Math.cos(angle) * rand(380, 620);
-    child.launchY = Math.sin(angle) * rand(380, 620);
-    child.splitCooldown = 7;
-    child.mergeAt = bot.mergeAt;
-    bots.push(child);
+  for (let i = 1; i < masses.length; i++) {
+    const shard = BlobPhysics.spikes.shardLaunch(bot, i - 1, masses.length - 1, turn, bot.radius);
+    const shardRadius = radiusForMass(masses[i]);
+    bots.push({ ...bot, mass: masses[i], radius: shardRadius, x: boundCell(shard.x, shardRadius), y: boundCell(shard.y, shardRadius),
+      launchX: shard.launchX, launchY: shard.launchY, splitCooldown: 7, mergeAt: bot.mergeAt, virusImmuneUntil: performance.now() + 600 });
   }
   emit(bot.x, bot.y, "#56ff71", 24);
+  return true;
 }
 
+// A spike pops the biggest piece covering it. If that piece can't pop (no room to split), the spike stays.
 function handleViruses() {
+  const now = performance.now();
   for (let virusIndex = viruses.length - 1; virusIndex >= 0; virusIndex--) {
     const virus = viruses[virusIndex];
-    let consumed = false;
-    for (const cell of playerCells.filter(c => c.alive)) {
-      if (!botImmunity && performance.now() >= cell.virusImmuneUntil && distance(cell, virus) < cell.radius + virus.r * .65 && cell.mass > 90) {
-        burstPlayerCell(cell);
-        if (onlineMode && virus.id) {
-          virusPops.push(virus.id);
-          poppedVirusIds.set(virus.id, performance.now() + 2500);
-        }
-        consumed = true;
-        break;
+    let popped = false;
+    const player = botImmunity ? null : playerCells.filter(cell => cell.alive && now >= (cell.virusImmuneUntil || 0) && BlobPhysics.spikes.covered(cell, virus))
+      .sort((a, b) => b.mass - a.mass)[0];
+    if (player && popPlayerCell(player)) {
+      popped = true;
+      if (onlineMode && virus.id) {
+        virusPops.push(virus.id);
+        poppedVirusIds.set(virus.id, now + 2500);
       }
     }
-    if (!consumed && !onlineMode) {
-      for (const bot of bots.filter(c => c.alive)) {
-        if (distance(bot, virus) < bot.radius + virus.r * .65 && bot.mass > 90) {
-          burstBotCell(bot);
-          consumed = true;
-          break;
-        }
-      }
+    if (!popped && !player && !onlineMode) {
+      const bot = bots.filter(cell => cell.alive && now >= (cell.virusImmuneUntil || 0) && BlobPhysics.spikes.covered(cell, virus)).sort((a, b) => b.mass - a.mass)[0];
+      if (bot && popBotCell(bot)) popped = true;
     }
-    if (consumed) viruses.splice(virusIndex, 1);
+    if (popped) viruses.splice(virusIndex, 1);
   }
 }
 
@@ -1422,9 +1433,11 @@ function render(time) {
     drawFood(dot, time);
   }
   ejected.forEach(drawEjected);
-  viruses.forEach(drawVirus);
   drawParticles();
-  [...bots, ...playerCells].filter(Boolean).sort((a, b) => a.mass - b.mass).forEach(drawCell);
+  // Spikes are drawn in between cells by size: pieces too small to pop them (under 90 mass) slide underneath.
+  const layers = [...bots, ...playerCells].filter(Boolean).map(cell => ({ cell, mass: cell.mass }));
+  for (const virus of viruses) layers.push({ virus, mass: BlobPhysics.spikes.popMass - .001 });
+  layers.sort((a, b) => a.mass - b.mass).forEach(layer => layer.virus ? drawVirus(layer.virus) : drawCell(layer.cell));
   drawVignette();
   drawMinimap();
 }
@@ -1445,11 +1458,34 @@ function loop(time) {
 
 function showModeration(cell) {
   if (!isAdmin || !cell || cell.isPlayer) return;
-  selectedModerationTarget = {targetId:cell.remoteSessionId || null,botTeam:cell.isRemote?null:cell.botTeam||cell.name,name:cell.name};
+  selectedModerationTarget = {targetId:cell.remoteSessionId || null,botTeam:cell.isRemote?null:cell.botTeam||cell.name,name:cell.name,role:cell.role||null};
   document.querySelector("#moderationName").textContent=cell.name;
-  document.querySelector("#moderationMessage").textContent="Choose how long this player should be banned.";
+  // Only the owner's bans count on every server; a host's or admin's ban removes the player from this server.
+  document.querySelector("#moderationMessage").textContent=adminRole==="owner"||!onlineMode
+    ?"Choose how long this player should be banned.":"Choose how long to ban this player from this server.";
+  updateAdminRoleButton();
   document.querySelector("#moderationMenu").classList.remove("hidden");
 }
+// Players (not bots) can be made admin on this server, or have it taken away. The owner and host always stay admin.
+function updateAdminRoleButton() {
+  const button=document.querySelector("#toggleAdminRole"), target=selectedModerationTarget;
+  button.hidden=!onlineMode||!target||!target.targetId;
+  if (button.hidden) return;
+  button.disabled=target.role==="owner"||target.role==="host";
+  button.textContent=target.role==="owner"?"OWNER (ALWAYS ADMIN)":target.role==="host"?"HOST (ALWAYS ADMIN)":target.role==="admin"?"REMOVE ADMIN":"MAKE ADMIN";
+}
+document.querySelector("#toggleAdminRole").addEventListener("click",async()=>{
+  const target=selectedModerationTarget, message=document.querySelector("#moderationMessage"), button=document.querySelector("#toggleAdminRole");
+  if (!isAdmin||!target?.targetId||button.disabled) return;
+  const makeAdmin=target.role!=="admin";
+  button.disabled=true;
+  try {
+    const result=await window.promotePlayerOnline(target.targetId,makeAdmin);
+    target.role=result.admin?"admin":null;
+    for (const cell of remotePlayerCells) if (cell.remoteSessionId===target.targetId) cell.role=target.role;
+    message.textContent=result.admin?`${target.name} is now an admin on this server.`:`${target.name} is no longer an admin.`;
+  } catch(error) {message.textContent=error.message;} finally {button.disabled=false;updateAdminRoleButton();}
+});
 document.querySelector("#closeModeration").addEventListener("click",()=>document.querySelector("#moderationMenu").classList.add("hidden"));
 document.querySelector("#botBanOptions").addEventListener("click",()=>showModeration(bots.find(bot=>(bot.botTeam||bot.name)===selectedTeamBot)));
 document.querySelector("#confirmBan").addEventListener("click",async()=>{
@@ -1589,6 +1625,7 @@ document.querySelector("#clearBlobImage").addEventListener("click", () => {
 document.querySelector("#instantMerge").addEventListener("pointerdown", instantlyRemerge);
 document.querySelector("#removeSpikes").addEventListener("pointerdown", removeAllSpikes);
 document.querySelector("#autoSpikes").addEventListener("pointerdown", toggleAutoSpikes);
+document.querySelector("#removeBots").addEventListener("pointerdown", toggleRemoveBots);
 document.querySelector("#killEveryone").addEventListener("pointerdown", killEveryone);
 document.querySelectorAll("[data-multiplier]").forEach(button => button.addEventListener("pointerdown", () => multiplyPlayer(Number(button.dataset.multiplier))));
 document.querySelectorAll("[data-divisor]").forEach(button => button.addEventListener("pointerdown", () => dividePlayer(Number(button.dataset.divisor))));
@@ -1745,6 +1782,22 @@ function toggleAutoSpikes() {
   if (onlineMode) { window.configureArenaOnline({autoSpikes:!autoSpikesOn}).catch(showArenaError); return; }
   setAutoSpikesLabel(!autoSpikesOn);
   while (autoSpikesOn && viruses.length < VIRUS_COUNT) viruses.push(makeVirus());
+}
+
+// REMOVE ALL BOTS is a switch: ON = every bot is gone and none come back, OFF = bots spawn again.
+function toggleRemoveBots() {
+  if (!isAdmin) return;
+  if (onlineMode) { window.configureArenaOnline({botsOff:!botsRemoved}).catch(showArenaError); return; }
+  setRemoveBotsLabel(!botsRemoved);
+  if (botsRemoved) bots = [];
+  else { botSpawnTimer = 0; maintainBotPopulation(1); }
+}
+
+function setRemoveBotsLabel(on) {
+  botsRemoved = on;
+  const state = document.querySelector("#removeBotsState");
+  if (state) state.textContent = on ? "ON" : "OFF";
+  document.querySelector("#removeBots")?.classList.toggle("active", on);
 }
 
 function setAutoSpikesLabel(on) {
