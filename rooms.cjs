@@ -11,7 +11,7 @@ const CREATES_PER_HOUR = 5;             // per browser or account
 const JOIN_FAILURES_PER_10_MIN = 10;    // wrong passwords per browser
 const NAME_PATTERN = /^[\p{L}\p{N} _'!?.&#-]{3,24}$/u;
 
-function createRoomManager({main, loadEngine, now = () => Date.now()}) {
+function createRoomManager({main, loadEngine, now = () => Date.now(), tickMain = true}) {
   const rooms = new Map();         // id -> {id, name, host, salt, passwordHash, createdAt, emptySince, engine}
   const sessionRooms = new Map();  // player session id -> made server id
   const creations = new Map();     // host identity -> times a server was made (last hour)
@@ -151,8 +151,9 @@ function createRoomManager({main, loadEngine, now = () => Date.now()}) {
   }
 
   // Every 40 ms: the main server always runs; a made server only runs while someone is in it.
+  // (On a PC the main server has its own timer, so tickMain is false there.)
   function tick() {
-    main.advanceArena();
+    if (tickMain) main.advanceArena();
     for (const room of rooms.values()) {
       room.engine.cleanupSessions();
       if (room.engine.summary().connected) { room.emptySince = 0; room.engine.advanceArena(); continue; }

@@ -1941,7 +1941,9 @@ const handleRequest = async (request, response) => {
   response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
   response.end("Not found");
 };
-const server = http.createServer(handleRequest);
+// On a PC (node server.cjs) requests go through the server list (set up at the end of this file).
+let localHandler = handleRequest;
+const server = http.createServer((request, response) => localHandler(request, response));
 
 world = cleanWorld({ worldSize: 5200, bots: [], viruses: Array.from({ length: 22 }, () => makeSpike(100 + Math.random() * 5000, 100 + Math.random() * 5000)) });
 for (let index = 0; index < 24; index++) spawnServerBot();
@@ -1996,8 +1998,6 @@ function useShared(parts) {
   if (parts.signInGuard) signInGuard = parts.signInGuard;
   if (parts.realtime !== undefined) realtime = parts.realtime;
 }
-if(!cloudMode&&typeof server.on==="function")enableRealtime();
-
 if (!cloudMode) server.listen(port, "0.0.0.0", () => {
   const addresses = [];
   for (const entries of Object.values(os.networkInterfaces())) {
@@ -2041,3 +2041,13 @@ function importState(state) {
 }
 module.exports = { server, handleRequest, advanceArena, exportState, importState, enableRealtime,
   getSession: id => sessions.get(id), serverInfo, configureRoom, summary, shared, useShared, cleanupSessions };
+
+// Running on a PC (node server.cjs, localhost:1000): the main server plus servers players make, just like the
+// live server. Made servers run in their own copy of this engine; this copy keeps its own 40 ms timer.
+if (!cloudMode && typeof server.on === "function") {
+  const rooms = require("./rooms.cjs").createRoomManager({ main: module.exports, tickMain: false,
+    loadEngine: () => require("./cloud-runtime.cjs").loadEngine(dataDirectory) });
+  localHandler = rooms.handle;
+  enableRealtime(server, rooms.handle, rooms.getSession);
+  setInterval(rooms.tick, 40).unref();
+}
