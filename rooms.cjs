@@ -178,8 +178,6 @@ function createRoomManager({main, loadEngine, now = () => Date.now(), tickMain =
       if (request.method === "POST" && url.pathname.startsWith("/api/")) {
         request.body = await readJson(request);
         engine = engineFor(request.body.id);
-      } else if (request.method === "GET" && url.pathname.startsWith("/api/skins/")) {
-        engine = engineFor(decodeURIComponent(url.pathname.slice("/api/skins/".length)));
       }
       await engine.handleRequest(request, response);
     } catch {

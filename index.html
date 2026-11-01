@@ -32,6 +32,7 @@
       <div><span>SCORE</span><strong id="score">0</strong></div>
       <div><span>MASS</span><strong id="mass">0</strong></div>
       <div><span>RANK</span><strong id="rank">-</strong></div>
+      <div id="coinStat" hidden><span>COINS</span><strong id="coins">0</strong></div>
     </aside>
 
     <div class="minimap-shell panel">
@@ -44,6 +45,7 @@
         <div id="menuTabs" class="menu-tabs" role="tablist" hidden>
           <button id="tabPlay" type="button" role="tab" aria-selected="true" class="active">PLAY</button>
           <button id="tabServers" type="button" role="tab" aria-selected="false">SERVERS</button>
+          <button id="tabShop" type="button" role="tab" aria-selected="false">SHOP</button>
         </div>
         <p id="currentServer" class="current-server" hidden>SERVER: <b id="currentServerName">MAIN SERVER</b></p>
         <div id="serversTab" class="servers-tab" hidden>
@@ -59,6 +61,12 @@
             <button id="createServer" type="button">CREATE SERVER</button>
             <p class="server-note">You get the admin panel in your server. It closes after 10 minutes with no players in it (bots don't count).</p>
           </details>
+        </div>
+        <div id="shopTab" class="shop-tab" hidden>
+          <div class="servers-head"><b>SKIN SHOP</b><span class="coin-balance"><i class="coin" aria-hidden="true"></i><strong id="shopCoins">0</strong> COINS</span></div>
+          <p id="shopNote" class="server-note">Grow to earn coins: 1 coin for every 10 mass you grow past your biggest size in each life.</p>
+          <div id="shopGrid" class="shop-grid"></div>
+          <p id="shopMessage" class="server-message" role="status" aria-live="polite"></p>
         </div>
         <div id="playTab">
         <div class="eyebrow">ENTER THE VOID</div>
@@ -84,12 +92,6 @@
             <option value="165">165 FPS</option>
             <option value="240">240 FPS</option>
           </select>
-        </label>
-        <label id="imageField" class="image-field">
-          <span>BLOB IMAGE</span>
-          <input id="blobImageInput" type="file" accept="image/png,image/jpeg,image/webp,image/gif" />
-          <button id="clearBlobImage" type="button">CLEAR IMAGE</button>
-          <img id="blobImagePreview" alt="Blob image preview" class="hidden" />
         </label>
         <label class="name-field">
           <span>ACCOUNT USERNAME</span>
@@ -248,6 +250,7 @@
     <div class="hint" id="hint">Pointer - X square split - Z six split - O double speed - N reset speed - L immunity - 2 double size - A five split - Q quad split - E triple split - Space split - W feed - T bot feed - R remerge - 1 bot split - Shift+trick: double trick - Shift+S clear spikes - P admin - M twice: menu</div>
     <script src="feeding.js"></script>
     <script src="physics.js"></script>
+    <script src="skins.js"></script>
     <script src="game.js"></script>
     <script src="transport.js"></script>
     <script src="multiplayer.js"></script>

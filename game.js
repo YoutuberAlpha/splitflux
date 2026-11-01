@@ -59,8 +59,17 @@ let botSpawnTimer = 0;
 let botRespawnPausedUntil = 0;
 let botNameCounter = 0;
 let playerColor = "#b6ff4a";
-let playerBlobImage = null;
-let playerBlobImageData = "";
+// SKIN SHOP: the skin this player wears (chosen in the shop, checked by the server) and the skin pictures,
+// each loaded once and shared by every blob wearing it.
+let playerSkin = "";
+const skinImages = new Map();
+function skinPicture(id) {
+  const skin = id && window.SkinShop?.find(id);
+  if (!skin) return null;
+  let image = skinImages.get(id);
+  if (!image) { image = new Image(); image.src = skin.image; skinImages.set(id, image); }
+  return image;
+}
 const onlineMode = location.protocol === "http:" || location.protocol === "https:";
 let isAdmin = !onlineMode;
 // "owner" (the alpha account), "host" (made this server), "admin" (made admin by an admin) or null.
@@ -72,7 +81,6 @@ let selectedTeamBot = null;
 let followedBotTeam = null;
 let botFollowTargets = new Map();
 const pendingBotSplitCommands = new Set();
-const remoteSkinImages = new Map();
 let bannedBotTeams = new Set();
 let selectedModerationTarget = null;
 let spikePainter = false;
@@ -92,9 +100,6 @@ const ui = {
   name: document.querySelector("#nameInput"),
   colorInput: document.querySelector("#colorInput"),
   fpsSelect: document.querySelector("#fpsSelect"),
-  imageField: document.querySelector("#imageField"),
-  blobImageInput: document.querySelector("#blobImageInput"),
-  blobImagePreview: document.querySelector("#blobImagePreview"),
   score: document.querySelector("#score"),
   mass: document.querySelector("#mass"),
   rank: document.querySelector("#rank"),
@@ -183,37 +188,6 @@ function updateMapSizeLabel() {
   document.querySelector("#mapSizeLabel").textContent = worldSize.toLocaleString();
 }
 
-function saveBlobImagePreference(dataUrl) {
-  try {
-    if (dataUrl) localStorage.setItem("voidcellBlobImage", dataUrl);
-    else localStorage.removeItem("voidcellBlobImage");
-  } catch {}
-}
-
-function loadBlobImagePreference() {
-  try { return localStorage.getItem("voidcellBlobImage") || ""; } catch {}
-  return "";
-}
-
-function setPlayerBlobImage(dataUrl) {
-  playerBlobImageData = dataUrl || "";
-  if (!playerBlobImageData) {
-    playerBlobImage = null;
-    ui.blobImagePreview.classList.add("hidden");
-    ui.blobImagePreview.removeAttribute("src");
-    saveBlobImagePreference("");
-    return;
-  }
-  const img = new Image();
-  img.onload = () => {
-    playerBlobImage = img;
-    ui.blobImagePreview.src = playerBlobImageData;
-    ui.blobImagePreview.classList.remove("hidden");
-  };
-  img.src = playerBlobImageData;
-  saveBlobImagePreference(playerBlobImageData);
-}
-
 function saveFpsPreference(value) {
   try { localStorage.setItem("voidcellFpsLimit", String(value)); } catch {}
 }
@@ -228,21 +202,6 @@ function setFpsLimit(value) {
   fpsLimit = allowed.includes(Number(value)) ? Number(value) : 60;
   if (ui.fpsSelect) ui.fpsSelect.value = String(fpsLimit);
   saveFpsPreference(fpsLimit);
-}
-
-function clearActiveBlobImage() {
-  playerBlobImageData = "";
-  playerBlobImage = null;
-  ui.blobImagePreview.classList.add("hidden");
-  ui.blobImagePreview.removeAttribute("src");
-  ui.blobImageInput.value = "";
-}
-
-function updateBlobImageAccess() {
-  ui.imageField.classList.remove("hidden");
-  ui.blobImageInput.disabled = false;
-  document.querySelector("#clearBlobImage").disabled = false;
-  if (!playerBlobImageData) setPlayerBlobImage(loadBlobImagePreference());
 }
 
 function lightenColor(hex, amount) {
@@ -1327,7 +1286,7 @@ function drawCell(cell) {
   ctx.beginPath();
   ctx.arc(s.x, s.y, r, 0, Math.PI * 2);
   ctx.fill();
-  const skin = cell.isPlayer ? playerBlobImage : cell.isRemote ? remoteSkinImages.get(cell.remoteSessionId)?.image : null;
+  const skin = skinPicture(cell.isPlayer ? playerSkin : cell.isRemote ? cell.skin : "");
   if (skin && skin.complete && skin.naturalWidth) {
     ctx.save();
     ctx.beginPath();
@@ -1480,10 +1439,11 @@ function updateAdminRoleButton() {
   const button=document.querySelector("#toggleAdminRole"), target=selectedModerationTarget;
   button.hidden=!onlineMode||!target||!target.targetId;
   if (button.hidden) return;
-  const onMadeServer=window.onMadeServer?.()===true;
-  button.disabled=target.role==="owner"||target.role==="host"||(target.role==="admin"&&onMadeServer);
+  // Only the owner and real admins can change a real admin while on a made server.
+  const lockedAdmin=target.role==="admin"&&window.onMadeServer?.()===true&&adminRole!=="owner"&&adminRole!=="admin";
+  button.disabled=target.role==="owner"||target.role==="host"||lockedAdmin;
   button.textContent=target.role==="owner"?"OWNER (ALWAYS ADMIN)":target.role==="host"?"SERVER OWNER (ALWAYS ADMIN)"
-    :target.role==="admin"?(onMadeServer?"ADMIN ON EVERY SERVER":"REMOVE ADMIN"):target.role==="serveradmin"?"REMOVE ADMIN":"MAKE ADMIN";
+    :lockedAdmin?"ADMIN ON EVERY SERVER":target.role==="admin"||target.role==="serveradmin"?"REMOVE ADMIN":"MAKE ADMIN";
 }
 document.querySelector("#toggleAdminRole").addEventListener("click",async()=>{
   const target=selectedModerationTarget, message=document.querySelector("#moderationMessage"), button=document.querySelector("#toggleAdminRole");
@@ -1623,17 +1583,6 @@ ui.colorInput.addEventListener("input", () => {
 });
 ui.name.addEventListener("input", () => saveNamePreference(ui.name.value));
 ui.fpsSelect.addEventListener("change", () => setFpsLimit(ui.fpsSelect.value));
-ui.blobImageInput.addEventListener("change", () => {
-  const file = ui.blobImageInput.files && ui.blobImageInput.files[0];
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = () => setPlayerBlobImage(String(reader.result || ""));
-  reader.readAsDataURL(file);
-});
-document.querySelector("#clearBlobImage").addEventListener("click", () => {
-  ui.blobImageInput.value = "";
-  setPlayerBlobImage("");
-});
 document.querySelector("#instantMerge").addEventListener("pointerdown", instantlyRemerge);
 document.querySelector("#removeSpikes").addEventListener("pointerdown", removeAllSpikes);
 document.querySelector("#autoSpikes").addEventListener("pointerdown", toggleAutoSpikes);
@@ -1751,8 +1700,8 @@ if (/^#[0-9a-f]{6}$/i.test(savedColor || "")) {
 const savedName = loadNamePreference();
 if (savedName) ui.name.value = savedName.slice(0, 14);
 setFpsLimit(loadFpsPreference());
-setPlayerBlobImage(loadBlobImagePreference());
-updateBlobImageAccess();
+// Uploaded blob pictures are gone (skins come from the shop now); free the space an old one took.
+try { localStorage.removeItem("voidcellBlobImage"); } catch {}
 updateUI();
 requestAnimationFrame(loop);
 

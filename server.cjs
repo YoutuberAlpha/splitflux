@@ -20,6 +20,9 @@ const rememberedAdminKey = JSON.parse(fs.readFileSync(adminKeyPath, "utf8")).key
 // Accounts and bans are shared by every server (see useShared); "let" so a server copy can use the main ones.
 let accounts = require("./accounts.cjs")(dataDirectory, rememberedAdminKey, adminPassword);
 let moderation = require("./moderation.cjs")(dataDirectory, rememberedAdminKey);
+// The SKIN SHOP: coins and skins per account (shop.cjs) and the list of skins with their prices (skins.js).
+const SkinShop = require("./skins.js");
+let shop = require("./shop.cjs")(dataDirectory);
 
 const sessions = new Map();
 let realtime=null;
@@ -37,6 +40,7 @@ let serverBans = {};       // identity -> banned until (this server only)
 // "Real" admins are the ones made on the MAIN server: they are admins on every server and can send announcements.
 // A made server reads them from the main server (see useShared); on the main server they are its own admins.
 let globalAdmins = () => promotedAdmins;
+let setGlobalAdmins = list => { promotedAdmins = list; };  // a made server writes the main server's list through this
 // One announcement board for every server: the newest announcement, shown to every player once.
 let announcer = { latest: null };
 let world = null;
@@ -98,7 +102,6 @@ const MAX_SESSIONS = 150;               // players connected at once
 const SESSIONS_PER_DEVICE = 6;          // game tabs per browser at once
 const NEW_SESSIONS_PER_MINUTE = 60;     // new connections per minute, whole server
 const STATE_RATE = 25, STATE_BURST = 40; // updates per second per player (the game sends 10)
-const SKIN_BYTES_PER_HOUR = 20_000_000; // skin pictures sent out per hour, whole server
 let signInGuard = createSignInGuard();
 
 const SERVER_BOT_NAMES = [
@@ -125,6 +128,9 @@ const files = {
   "/licenses/agar-io-clone-LICENSE.txt": ["licenses/agar-io-clone-LICENSE.txt", "text/plain; charset=utf-8"],
   "/multiplayer.js": ["multiplayer.js", "text/javascript; charset=utf-8"],
   "/transport.js": ["transport.js", "text/javascript; charset=utf-8"],
+  "/skins.js": ["skins.js", "text/javascript; charset=utf-8"],
+  // The shop's skin pictures.
+  ...Object.fromEntries(SkinShop.list.map(skin => [skin.image, [skin.image.slice(1), "image/webp"]])),
 };
 
 function sendJson(response, status, value) {
@@ -270,7 +276,7 @@ function distance(a, b) {
 }
 
 function createSignInGuard() {
-  return { accounts: Object.create(null), devices: Object.create(null), failures: [], registrations: [], sessionStarts: [], skinHour: 0, skinBytes: 0 };
+  return { accounts: Object.create(null), devices: Object.create(null), failures: [], registrations: [], sessionStarts: [] };
 }
 
 function importSignInGuard(saved) {
@@ -280,7 +286,6 @@ function importSignInGuard(saved) {
   if (Array.isArray(saved.failures)) guard.failures = saved.failures.filter(Number.isFinite);
   if (Array.isArray(saved.registrations)) guard.registrations = saved.registrations.filter(entry => entry && Number.isFinite(entry.time));
   if (Array.isArray(saved.sessionStarts)) guard.sessionStarts = saved.sessionStarts.filter(Number.isFinite).slice(-NEW_SESSIONS_PER_MINUTE);
-  guard.skinHour = Number(saved.skinHour) || 0; guard.skinBytes = Number(saved.skinBytes) || 0;
   return guard;
 }
 
@@ -352,12 +357,27 @@ function takeStateAllowance(session, now) {
   return allowance >= 1;
 }
 
-function takeSkinBudget(bytes, now) {
-  const hour = Math.floor(now / 3_600_000);
-  if (signInGuard.skinHour !== hour) { signInGuard.skinHour = hour; signInGuard.skinBytes = 0; }
-  if (signInGuard.skinBytes + bytes > SKIN_BYTES_PER_HOUR) return false;
-  signInGuard.skinBytes += bytes;
-  return true;
+// COINS: 1 for every 10 mass a player grows past their biggest size in this life (eating food, bots, players).
+// Growing back after shrinking, or eating your own pellets again, doesn't count twice. Only growth the server
+// checked counts: an admin's size isn't checked (admin powers change it), so admins don't earn coins.
+// A guest's coins wait on their session and move onto their account when they sign in.
+function creditGrowth(session, wasRunning) {
+  const total = session.running ? session.cells.reduce((sum, cell) => sum + (cell.alive ? Number(cell.mass) || 0 : 0), 0) : 0;
+  if (!session.running || !wasRunning || session.isAdmin || trustClientForTests) session.lifePeak = total;
+  else if (total > (session.lifePeak || 0)) {
+    session.coinCredit = (session.coinCredit || 0) + (total - (session.lifePeak || 0)) / SkinShop.massPerCoin;
+    session.lifePeak = total;
+    const whole = Math.floor(session.coinCredit);
+    if (whole > 0) { session.coinCredit -= whole; session.guestCoins = (session.guestCoins || 0) + whole; }
+  }
+  if (session.account && session.guestCoins > 0) { shop.earn(session.account, session.guestCoins); session.guestCoins = 0; }
+}
+
+// The player's coins and skin, sent only when something changed (the game sends back the "sig" it last got).
+function walletFor(session, body) {
+  const wallet = {coins: shop.coins(session.account), unsaved: Math.floor(session.guestCoins || 0), skin: session.skin || "", signedIn: Boolean(session.account)};
+  const sig = `${wallet.coins}.${wallet.unsaved}.${wallet.skin}.${wallet.signedIn ? 1 : 0}`;
+  return body.ackWallet === sig ? undefined : {...wallet, sig};
 }
 
 function tryAgainMessage(wait) {
@@ -1379,7 +1399,7 @@ function sessionView(session) {
   return {
     id: session.id,
     name: session.name,
-    skinVersion: session.skinVersion || 0,
+    skin: session.skin || "",
     color: session.color,
     running: session.running,
     cells: aliveCells.map(publicCell),
@@ -1455,10 +1475,10 @@ function worldView(body = {}, session = null) {
   return view;
 }
 
-// Another player as others see them: name, colour, skin version and [id, x, y, mass, vx, vy] per piece.
+// Another player as others see them: name, colour, shop skin and [id, x, y, mass, vx, vy] per piece.
 function remoteView(session) {
   return {
-    id: session.id, name: session.name, color: session.color, skinVersion: session.skinVersion || 0,
+    id: session.id, name: session.name, color: session.color, skin: session.skin || undefined,
     // Admins see who else is an admin, to give or take admin from the player menu.
     role: adminRole(session.deviceId, session.account) || undefined,
     cells: session.cells.filter(cell => cell.alive).map(cell => [fingerprint(String(cell.netId)),
@@ -1555,7 +1575,6 @@ const handleRequest = async (request, response) => {
       immune: false,
       cells: [],
       skin: "",
-      skinVersion: 0,
       revision: 0,
       forceMenuVersion: 0,
       spawnProtectedUntil: 0,
@@ -1574,14 +1593,25 @@ const handleRequest = async (request, response) => {
     return;
   }
 
-  if (request.method === "GET" && url.pathname.startsWith("/api/skins/")) {
-    const target=sessions.get(url.pathname.slice("/api/skins/".length));
-    const match=target?.skin?.match(/^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=]+)$/);
-    if (!match) {sendJson(response,404,{error:"Skin not found"});return;}
-    // Skin pictures are the biggest downloads; a cap per hour stops anyone from draining the monthly allowance.
-    if (!takeSkinBudget(match[2].length*3/4,Date.now())) {sendJson(response,429,{error:"Too many skin downloads right now"});return;}
-    response.writeHead(200,{"Content-Type":match[1],"Cache-Control":"private, max-age=60","X-Content-Type-Options":"nosniff"});
-    response.end(Buffer.from(match[2],"base64"));
+  // SKIN SHOP: see your coins and skins (/api/shop), buy one (/api/shop/buy) or choose which to wear (/api/shop/equip).
+  if (request.method === "POST" && ["/api/shop", "/api/shop/buy", "/api/shop/equip"].includes(url.pathname)) {
+    try {
+      const body = await readBody(request), session = sessions.get(String(body.id || ""));
+      if (!session || session.sessionKey !== body.sessionKey) { sendJson(response, 401, { error: "Session expired" }); return; }
+      const now = Date.now();
+      session.shopTimes = (session.shopTimes || []).filter(time => now - time < 10_000);
+      if (session.shopTimes.length >= 20) { sendJson(response, 429, { error: "Slow down a little." }); return; }
+      session.shopTimes.push(now);
+      session.account = accounts.fromRequest(request);
+      if (session.account && session.guestCoins > 0) { shop.earn(session.account, session.guestCoins); session.guestCoins = 0; }
+      const skin = String(body.skin ?? "");
+      const view = url.pathname.endsWith("/buy") ? shop.buy(session.account, skin)
+        : url.pathname.endsWith("/equip") ? shop.equip(session.account, skin) : shop.view(session.account);
+      session.skin = shop.equipped(session.account);
+      sendJson(response, 200, { ...view, unsaved: Math.floor(session.guestCoins || 0) });
+    } catch (error) {
+      sendJson(response, 400, { error: error.shop ? error.message : "Invalid shop request" });
+    }
     return;
   }
 
@@ -1772,10 +1802,18 @@ const handleRequest = async (request, response) => {
           return;
         }
         if (targetRole === "owner" || targetRole === "host") { sendJson(response, 403, { error: `The ${ROLE_NAMES[targetRole]} is always an admin.` }); return; }
-        if (roomConfig && targetRole === "admin") { sendJson(response, 403, { error: `${target.name} is an admin on every server. That can only be changed on the main server.` }); return; }
+        // The owner and real admins make real admins (admin on every server), wherever they click MAKE ADMIN.
+        // A server owner or a server's own admin can only make admins of their server.
+        const everywhere = !roomConfig || role === "owner" || role === "admin";
+        if (targetRole === "admin" && !everywhere) { sendJson(response, 403, { error: `${target.name} is an admin on every server. Only the owner or another real admin can change that.` }); return; }
         const identities = identitiesOf(target.deviceId, target.account);
-        promotedAdmins = promotedAdmins.filter(identity => !identities.includes(identity));
-        if (body.admin === true) promotedAdmins.push(target.account ? `account:${target.account.username}` : `device:${target.deviceId}`);
+        const identity = target.account ? `account:${target.account.username}` : `device:${target.deviceId}`;
+        promotedAdmins = promotedAdmins.filter(id => !identities.includes(id));
+        if (everywhere) {
+          const list = globalAdmins().filter(id => !identities.includes(id));
+          if (body.admin === true) list.push(identity);
+          setGlobalAdmins(list.slice(-100));
+        } else if (body.admin === true) promotedAdmins.push(identity);
         promotedAdmins = promotedAdmins.slice(-100);
         target.isAdmin = Boolean(adminRole(target.deviceId, target.account));
         if (!target.isAdmin) target.immune = false;
@@ -1888,9 +1926,6 @@ const handleRequest = async (request, response) => {
       session.running = Boolean(body.running);
       if (body.cursor && world) session.cursor = { x: number(body.cursor.x, 0, 0, world.worldSize), y: number(body.cursor.y, 0, 0, world.worldSize) };
       session.botFeeding = Boolean(body.botFeeding);
-      if (typeof body.skin==="string" && body.skin.length<=60000 && (body.skin==="" || /^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(body.skin)) && body.skin!==session.skin) {
-        session.skin=body.skin; session.skinVersion=(session.skinVersion||0)+1;
-      }
       let botSplitError=null;
       for (const id of (Array.isArray(body.botSplitCommands) ? body.botSplitCommands : []).slice(0, 8)) {
         if (typeof id !== "string" || id.length > 100 || session.botActionIds.has(id)) continue;
@@ -1918,6 +1953,8 @@ const handleRequest = async (request, response) => {
           cell._moveFromX=old.x;cell._moveFromY=old.y;cell._moveUntil=session.lastSeen+80;
         }
       }
+      creditGrowth(session, wasRunning);
+      session.skin = shop.equipped(session.account);
       // Only isolated integration tests may inject a world fixture.
       if (process.env.NODE_ENV === "test" && process.env.SPLITFLUX_TEST_WORLD === "1" && session.isAdmin && session.running && body.world && number(body.ackBotRevision, 0, 0) >= botRevision && number(body.ackBotMassRevision, 0, 0) >= botMassRevision) {
         const sharedEjected = world ? world.ejected : [];
@@ -1958,6 +1995,7 @@ const handleRequest = async (request, response) => {
         players,
         playerCount: Math.max(1, activeCount),
         server: serverInfo(),
+        wallet: walletFor(session, body),
         // The newest announcement (for one minute), until this player's game says it has shown it.
         announcement: announcer.latest && announcer.latest.id !== body.ackAnnouncement && Date.now() - announcer.latest.at < 60_000 ? announcer.latest : undefined,
         world: compact && world ? worldView(body, session) : world,
@@ -1982,7 +2020,8 @@ const handleRequest = async (request, response) => {
       }
       response.writeHead(200, {
         "Content-Type": contentType,
-        "Cache-Control": "no-store",
+        // Skin pictures never change, so browsers may keep them for a day.
+        "Cache-Control": contentType.startsWith("image/") ? "public, max-age=86400" : "no-store",
       });
       response.end(data);
     });
@@ -2060,7 +2099,7 @@ function summary() {
   const list = [...sessions.values()];
   return { players: list.filter(session => session.running).length, connected: list.length, bots: !world.botsOff };
 }
-function shared() { return { accounts, moderation, signInGuard, realtime, globalAdmins, announcer }; }
+function shared() { return { accounts, moderation, signInGuard, realtime, globalAdmins, setGlobalAdmins, announcer, shop }; }
 // A made server uses the main server's accounts, bans, sign-in limits and live connection.
 function useShared(parts) {
   if (parts.accounts) accounts = parts.accounts;
@@ -2068,7 +2107,9 @@ function useShared(parts) {
   if (parts.signInGuard) signInGuard = parts.signInGuard;
   if (parts.realtime !== undefined) realtime = parts.realtime;
   if (parts.globalAdmins) globalAdmins = parts.globalAdmins;
+  if (parts.setGlobalAdmins) setGlobalAdmins = parts.setGlobalAdmins;
   if (parts.announcer) announcer = parts.announcer;
+  if (parts.shop) shop = parts.shop;
 }
 if (!cloudMode) server.listen(port, "0.0.0.0", () => {
   const addresses = [];
@@ -2109,12 +2150,14 @@ function importState(state) {
   promotedAdmins=Array.isArray(state.promotedAdmins)?state.promotedAdmins.filter(identity=>typeof identity==="string").slice(-100):[];
   serverBans=state.serverBans&&typeof state.serverBans==="object"?{...state.serverBans}:{};
   announcer.latest=state.announcement&&typeof state.announcement.text==="string"?state.announcement:null;
-  for (const session of state.sessions) sessions.set(session.id,{...session,feedIds:new Set(session.feedIds),
+  // (Old saves may hold uploaded skin pictures; only shop skins are kept.)
+  for (const session of state.sessions) sessions.set(session.id,{...session,skin:SkinShop.find(session.skin)?session.skin:"",skinVersion:undefined,feedIds:new Set(session.feedIds),
     botActionIds:new Set(session.botActionIds),teamedBots:new Set(session.teamedBots)});
 }
 module.exports = { server, handleRequest, advanceArena, exportState, importState, enableRealtime,
   getSession: id => sessions.get(id), serverInfo, configureRoom, summary, shared, useShared, cleanupSessions,
-  roomHost: () => roomConfig?.host || null, setRoomLimit, playerCount, roleFor };
+  roomHost: () => roomConfig?.host || null, setRoomLimit, playerCount, roleFor,
+  flushFiles: () => shop.flush() };
 
 // Running on a PC (node server.cjs, localhost:1000): the main server plus servers players make, just like the
 // live server. Made servers run in their own copy of this engine; this copy keeps its own 40 ms timer.
