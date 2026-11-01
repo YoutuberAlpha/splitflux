@@ -48,7 +48,7 @@ const {createServer} = require("./server-harness.cjs");
     assert.equal(game.run("world.bots.filter(bot => bot.botTeam === 'Alex').length"), 16);
   }
 
-  // A player's pop is checked by the server: the piece must have been 90+ mass, covered the spike (not just touched
+  // A player's pop is checked by the server: the piece must have been 90+ mass, hit the spike (not just come near
   // it), and actually split. Spikes far away, under small pieces, or "popped" without splitting stay.
   {
     const game = createServer({world: `cleanWorld({worldSize: 5200, autoSpikes: false, bots: [], viruses: [{id: "far", x: 4000, y: 4000}]})`});
@@ -60,11 +60,11 @@ const {createServer} = require("./server-harness.cjs");
       world.viruses.push({id: "edge", x: ${at.x + 75}, y: ${at.y}, r: 42, angle: 0}, {id: "under", x: ${at.x + 25}, y: ${at.y}, r: 42, angle: 0},
         {id: "small", x: 3000, y: 3000, r: 42, angle: 0});`);
     game.advance(100);
-    // Just touching a spike's edge (or not splitting at all) doesn't pop it.
+    // Not splitting at all doesn't pop anything.
     snap = await p.state({ackRevision: snap.self.revision, cells: [{...snap.self.cells[0], mass: 200}], virusPops: ["edge", "under", "far"]});
     let left = game.run("world.viruses.map(spike => spike.id)");
     assert(left.includes("edge") && left.includes("under") && left.includes("far"), "No split, no pop: " + left);
-    // A real pop: the piece covers "under", keeps half its mass and sends out a ring of shards.
+    // A real pop: the piece hits "under", keeps half its mass and sends out a ring of shards.
     const masses = physics.spikes.popMasses(200, 15);
     assert.deepEqual(masses.map(mass => +mass.toFixed(2)), [100, 20, 20, 20, 20, 20], "200 mass keeps 100, five shards of 20");
     // Like the real game, each piece says which share of the old piece it came from (massOrigins).
@@ -76,7 +76,7 @@ const {createServer} = require("./server-harness.cjs");
     snap = await p.state({ackRevision: snap.self.revision, cells: [kept, ...shards], virusPops: ["under", "edge", "far"]});
     left = game.run("world.viruses.map(spike => spike.id)");
     assert(!left.includes("under"), "A real pop removes the spike for everyone");
-    assert(left.includes("edge"), "A spike that was only touched stays (one split = one pop)");
+    assert(left.includes("edge"), "One split = one pop: a second spike in the same hit stays");
     assert(left.includes("far"), "A spike nowhere near the player cannot be popped");
     assert.equal(snap.self.revision, before, "A real pop is never corrected");
     // A 50-mass player cannot pop a spike, even standing on it.
@@ -89,15 +89,18 @@ const {createServer} = require("./server-harness.cjs");
     assert(game.run("world.viruses.some(spike => spike.id === 'small')"), "Pieces under 90 mass cannot pop spikes");
   }
 
-  // Bots follow the same rules: covering pops (half kept, ring of shards), touching doesn't.
+  // Bots follow the same rules: hitting a spike pops it (half kept, ring of shards); just missing it doesn't.
   {
-    const game = createServer({world: `cleanWorld({worldSize: 5200, autoSpikes: false, viruses: [{id: "covered", x: 2030, y: 2000}, {id: "touched", x: 3095, y: 3000}],
+    const game = createServer({world: `cleanWorld({worldSize: 5200, autoSpikes: false, viruses: [{id: "covered", x: 2030, y: 2000}, {id: "touched", x: 3095, y: 3000},
+      {id: "missed", x: 4000, y: 1350}],
       bots: [{netId: "big", name: "Alex", botTeam: "Alex", x: 2000, y: 2000, mass: 400, alive: true},
-        {netId: "side", name: "Bea", botTeam: "Bea", x: 3000, y: 3000, mass: 400, alive: true}]})`});
+        {netId: "side", name: "Bea", botTeam: "Bea", x: 3000, y: 3000, mass: 400, alive: true},
+        {netId: "far", name: "Cy", botTeam: "Cy", x: 4000, y: 1220, mass: 400, alive: true}]})`});
     game.run("simulateServerBots(.001)");
     const ids = game.run("world.viruses.map(spike => spike.id)");
-    assert(!ids.includes("covered"), "A bot covering a spike pops it");
-    assert(ids.includes("touched"), "A bot touching a spike's edge doesn't");
+    assert(!ids.includes("covered"), "A bot on top of a spike pops it");
+    assert(!ids.includes("touched"), "A bot running into a spike's edge pops it");
+    assert(ids.includes("missed"), "A bot that only comes near a spike doesn't");
     const alex = game.run("world.bots.filter(bot => bot.botTeam === 'Alex').map(bot => +bot.mass.toFixed(1)).sort((a, b) => b - a)");
     assert.deepEqual(Array.from(alex), [200, ...Array(7).fill(28.6)], "The bot keeps half; 7 shards share the rest");
   }
@@ -113,7 +116,7 @@ const {createServer} = require("./server-harness.cjs");
     const run = code => vm.runInContext(code, context);
     run(`playerCells = [{netId: "me", x: 1000, y: 1000, mass: 300, radius: ${physics.radius(300)}, alive: true, virusImmuneUntil: 0, _syncMassWeights: {me: 1}}];
       viruses = [{id: "edge", x: 1080, y: 1000, r: 42}, {id: "mid", x: 1040, y: 1000, r: 42}]; handleViruses();`);
-    assert.deepEqual(Array.from(run("viruses.map(v => v.id)")), ["edge"], "Only the covered spike pops");
+    assert.deepEqual(Array.from(run("viruses.map(v => v.id)")), ["edge"], "One hit = one pop: the next spike waits a moment");
     assert.deepEqual(Array.from(run("virusPops")), ["mid"]);
     const pieces = run("playerCells.map(c => ({mass: c.mass, x: c.x, y: c.y, w: c._syncMassWeights}))");
     assert.equal(pieces.length, 8); assert.equal(pieces[0].mass, 150);
@@ -122,6 +125,13 @@ const {createServer} = require("./server-harness.cjs");
     for (let i = 1; i < angles.length; i++) assert(Math.abs(angles[i] - angles[i - 1] - Math.PI * 2 / 7) < 1e-6, "Shards are evenly spaced");
     assert(Math.abs(pieces.reduce((sum, piece) => sum + (piece.w?.me || 0), 0) - 1) < 1e-9, "The server's mass bookkeeping still adds up");
     assert(Math.abs(pieces[0].w.me - .5) < 1e-9, "and follows each piece's real share");
+    // Hitting a spike's edge pops it; coming close without hitting it doesn't.
+    run(`playerCells = [{netId: "me", x: 1000, y: 1000, mass: 300, radius: ${physics.radius(300)}, alive: true, virusImmuneUntil: 0}];
+      viruses = [{id: "near", x: 1000, y: 1115, r: 42}]; virusPops = []; handleViruses();`);
+    assert.equal(run("viruses.length"), 1, "Coming close doesn't pop");
+    run(`viruses = [{id: "hit", x: 1000, y: 1100, r: 42}]; handleViruses();`);
+    assert.equal(run("viruses.length"), 0, "Running into the spike's edge pops it");
+    assert.equal(run("playerCells.length"), 8, "and splits the blob");
     // 16 pieces: no room to split, so the spike stays and nothing happens.
     run(`playerCells = Array.from({length: 16}, (_, i) => ({netId: "p" + i, x: 3000 + i * 200, y: 3000, mass: 300, radius: ${physics.radius(300)}, alive: true, virusImmuneUntil: 0}));
       viruses = [{id: "full", x: 3000, y: 3000, r: 42}]; virusPops = []; handleViruses();`);
@@ -146,5 +156,5 @@ const {createServer} = require("./server-harness.cjs");
     assert.deepEqual(context.labels, [false], "The owner's AUTO SPIKES label follows the server");
   }
 
-  console.log("PASS: pops need a 90+ piece covering the spike and a real split (touching does nothing, 16 pieces does nothing), half kept + even ring of shards for players and bots, server checks every pop; spikes grow back (22, spread out), remove-all keeps them gone until AUTO SPIKES is switched on, only the owner controls it, bots that can't split leave spikes alone, player pops are checked (near + big enough), popped spikes don't flash back.");
+  console.log("PASS: a 90+ piece pops a spike when it hits it (coming close does nothing), needs a real split, one hit = one pop, 16 pieces does nothing, half kept + even ring of shards for players and bots, server checks every pop; spikes grow back (22, spread out), remove-all keeps them gone until AUTO SPIKES is switched on, only the owner controls it, bots that can't split leave spikes alone, player pops are checked (near + big enough), popped spikes don't flash back.");
 })().catch(error => { console.error(error); process.exitCode = 1; });
