@@ -288,6 +288,7 @@
       viruses = serverViruses.filter(virus => !poppedVirusIds.has(virus.id));
     }
     if (typeof world.autoSpikes === "boolean" && world.autoSpikes !== autoSpikesOn) setAutoSpikesLabel(world.autoSpikes);
+    if (typeof world.botsOff === "boolean" && world.botsOff !== botsRemoved) setRemoveBotsLabel(world.botsOff);
     if (Array.isArray(world.ejected)) {
       const nextEjected = new Map();
       const localPending = ejected.filter(pellet => (
@@ -402,6 +403,7 @@
           isPlayer: false,
           isRemote: true,
           remoteSessionId: remote.id,
+          role: remote.role || null,
           botTeam: `remote-${remote.id}`,
         });
         const cachedSkin=remoteSkinImages.get(remote.id);
@@ -447,21 +449,24 @@
     bots.forEach(bot => smoothNetworkCell(bot, dt));
   }
 
+  const ROLE_LABELS = {owner: "OWNER", host: "HOST", admin: "ADMIN"};
   function updateAdminAccess() {
     isAdmin = Boolean(session && session.isAdmin);
+    adminRole = isAdmin ? (session.adminRole || "admin") : null;
     document.querySelector("#botBanOptions").hidden = !isAdmin;
     if (!isAdmin) document.querySelector("#moderationMenu").classList.add("hidden");
     updateBlobImageAccess();
-    document.querySelector("#mobileRole").textContent = isAdmin ? "OWNER" : "GUEST";
+    document.querySelector("#mobileRole").textContent = ROLE_LABELS[adminRole] || "GUEST";
     adminShortcut.classList.toggle("hidden", !isAdmin);
     adminShortcut.classList.toggle("inactive", !isAdmin || !running);
     if (!isAdmin) ui.admin.classList.add("hidden");
     const account = session && session.account;
+    const role = adminRole === "owner" ? "OWNER / ADMIN" : adminRole === "host" ? "HOST (ADMIN ON THIS SERVER)" : adminRole === "admin" ? "ADMIN ON THIS SERVER" : "PLAYER";
     document.querySelector("#adminUnlockStatus").textContent = account
-      ? `Signed in as ${account.username}${isAdmin ? " - OWNER / ADMIN" : " - PLAYER"}` : "Playing as guest. Sign in or create an account.";
+      ? `Signed in as ${account.username} - ${role}` : `Playing as guest${adminRole ? ` - ${role}` : ""}. Sign in or create an account.`;
     document.querySelector("#accountLogout").hidden = !account;
     document.querySelector("#accountTools").hidden = !account;
-    document.querySelector("#ownerReset").hidden = !(account && isAdmin);
+    document.querySelector("#ownerReset").hidden = !(account && account.isAdmin);
     document.querySelector("#accountLogin").hidden = Boolean(account);
     document.querySelector("#accountRegister").hidden = Boolean(account);
     document.querySelector("#accountUsername").disabled = Boolean(account);
@@ -486,6 +491,7 @@
       const result = await response.json();
       if (!response.ok) throw new Error(result.error);
       session.isAdmin = result.isAdmin;
+      session.adminRole = result.adminRole || null;
       session.account = result.account;
       roomTransport.reset();
       updateAdminAccess();
@@ -540,21 +546,70 @@
     }
   });
 
+  // ---- Servers ----
+  // The server this tab plays on. It is remembered for the tab, so a refresh stays on the same server.
+  // A private server gives a "pass" after the right password, so rejoining doesn't need the password again.
+  const MAIN_SERVER = {id: "main", name: "MAIN SERVER", pass: null};
+  let currentServer = MAIN_SERVER;
+  try {
+    const saved = JSON.parse(sessionStorage.getItem("splitflux-server") || "null");
+    if (saved && typeof saved.id === "string" && typeof saved.name === "string") currentServer = saved;
+  } catch {}
+  function rememberServer() {
+    try { sessionStorage.setItem("splitflux-server", JSON.stringify(currentServer)); } catch {}
+    document.querySelector("#currentServerName").textContent = currentServer.name;
+    const label = document.querySelector("#serverLabel");
+    label.textContent = currentServer.name;
+    label.hidden = false;
+  }
+
+  // Starts a player session on a server. Throws with the server's reason (wrong password, closed, full, banned).
+  async function openSession(server, password) {
+    let response;
+    if (server.id === "main") {
+      const ownerKey = new URLSearchParams(location.search).get("owner") || "";
+      response = await fetch(`/api/session${ownerKey ? `?owner=${encodeURIComponent(ownerKey)}` : ""}`, {cache: "no-store"});
+    } else {
+      response = await fetch("/api/session", {method: "POST", cache: "no-store", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({room: server.id, pass: server.pass || undefined, password: password || undefined})});
+    }
+    const answer = await response.json().catch(() => ({}));
+    if (!response.ok) throw Object.assign(new Error(answer.error || "The room server did not answer."), answer, {status: response.status});
+    return answer;
+  }
+
   async function createSession() {
-    const params = new URLSearchParams(location.search);
-    const ownerKey = params.get("owner") || "";
-    const response = await fetch(`/api/session${ownerKey ? `?owner=${encodeURIComponent(ownerKey)}` : ""}`, {
-      cache: "no-store",
-    });
-    if (response.status===403) {
-      const blocked=await response.json();
-      if (blocked.bannedUntil) {showBan(blocked.bannedUntil);session=null;return;}
+    let next;
+    try {
+      next = await openSession(currentServer);
+    } catch (error) {
+      if (error.bannedUntil && currentServer.id === "main") { showBan(error.bannedUntil); session = null; return; }
+      if (currentServer.id === "main" || error.full) throw error;
+      // That server closed, restarted, or can't be reached (backup mode only has the main server): back to main.
+      currentServer = MAIN_SERVER;
+      showGameNotice(error.roomGone ? "That server closed. You're back on the main server." : "You're back on the main server.", 5000);
+      return createSession();
     }
-    if (!response.ok) {
-      const answer = await response.json().catch(() => ({}));
-      throw Object.assign(new Error(answer.error || "The room server did not answer."), {full: Boolean(answer.full)});
+    useSession(next, currentServer);
+  }
+
+  async function joinServer(server, password) {
+    const next = await openSession(server, password);
+    if (running) returnToMainMenu();
+    useSession(next, server);
+  }
+
+  function useSession(next, server) {
+    const changedServer = server.id !== currentServer.id;
+    session = next;
+    currentServer = {id: server.id, name: next.server?.name || server.name, pass: next.pass || server.pass || null};
+    rememberServer();
+    if (changedServer || !lastWorld) {
+      // A different server: forget everything about the old arena.
+      bots = []; viruses = []; serverViruses = []; remotePlayerCells = []; remoteCellCache = new Map(); lastWorld = null;
+      teamedBots = new Set(); followedBotTeam = null; botFollowTargets = new Map(); bannedBotTeams = new Set();
+      foodClaims = []; virusPops = [];
     }
-    session = await response.json();
     roomTransport.reset();
     roomTransport.connect(session);
     networkRevision = 0;
@@ -579,7 +634,7 @@
       adminShortcut.classList.add("hidden", "inactive");
       ui.admin.classList.add("hidden");
     }
-    status.innerHTML = `<i class="status-dot"></i> ONLINE - ${isAdmin ? "OWNER" : "GUEST"}`;
+    status.innerHTML = `<i class="status-dot"></i> ONLINE - ${ROLE_LABELS[adminRole] || "GUEST"}`;
   }
 
   async function syncRoom() {
@@ -642,6 +697,14 @@
       }
       if (response.status===403) {
         const blocked=await response.json();
+        if (blocked.bannedUntil && currentServer.id !== "main") {
+          // Banned from a made server: go back to the main server instead of the ban screen.
+          currentServer = MAIN_SERVER;
+          await createSession();
+          returnToMainMenu();
+          showGameNotice("You were banned from that server.", 6000);
+          return;
+        }
         if (blocked.bannedUntil) {showBan(blocked.bannedUntil);return;}
       }
       if (!response.ok) throw new Error("Room sync failed.");
@@ -672,8 +735,11 @@
         followedBotTeam = snapshot.followedBotTeam || null;
       }
       botFollowTargets = new Map((snapshot.botControllers || []).map(entry => [entry.team, {x:entry.x,y:entry.y}]));
-      if (!accountBusy && (session.isAdmin !== snapshot.isAdmin || JSON.stringify(session.account) !== JSON.stringify(snapshot.account))) {
+      if (!accountBusy && (session.isAdmin !== snapshot.isAdmin || (session.adminRole || null) !== (snapshot.adminRole || null) || JSON.stringify(session.account) !== JSON.stringify(snapshot.account))) {
+        if (snapshot.isAdmin && !session.isAdmin) showGameNotice("You are now an admin on this server. Press P for the admin panel.", 6000);
+        if (!snapshot.isAdmin && session.isAdmin) showGameNotice("You are no longer an admin on this server.", 5000);
         session.isAdmin = snapshot.isAdmin;
+        session.adminRole = snapshot.adminRole || null;
         session.account = snapshot.account;
         updateAdminAccess();
       }
@@ -797,6 +863,7 @@
     return result;
   }
   window.banPlayerOnline=async(target,durationMs)=>adminCommand("ban",{...target,durationMs});
+  window.promotePlayerOnline=async(targetId,admin)=>adminCommand("promote",{targetId,admin});
   window.paintSpikesOnline=async(points)=>{
     const result=await adminCommand("paint-spikes",{points});
     serverViruses=result.viruses;
@@ -817,6 +884,127 @@
     }
     return result;
   };
+
+  // ---- SERVERS tab ----
+  const serverMessage = text => { document.querySelector("#serverMessage").textContent = text; };
+  function showMenuTab(tab) {
+    const servers = tab === "servers";
+    document.querySelector("#serversTab").hidden = !servers;
+    document.querySelector("#playTab").hidden = servers;
+    for (const [id, active] of [["#tabPlay", !servers], ["#tabServers", servers]]) {
+      const button = document.querySelector(id);
+      button.classList.toggle("active", active);
+      button.setAttribute("aria-selected", String(active));
+    }
+    if (servers) loadServers();
+  }
+
+  async function loadServers() {
+    try {
+      const response = await fetch("/api/rooms", {cache: "no-store"});
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Servers are not available right now.");
+      renderServers(result);
+    } catch (error) {
+      serverMessage(error.message || "Servers are not available right now.");
+    }
+  }
+
+  // Server names come from players, so they are only ever put on the page as text.
+  function renderServers(result) {
+    const list = document.querySelector("#serverList");
+    list.replaceChildren(...result.rooms.map(room => {
+      const row = document.createElement("li"), info = document.createElement("div"), name = document.createElement("b"), meta = document.createElement("small");
+      const here = room.id === currentServer.id;
+      row.classList.toggle("here", here);
+      name.textContent = room.name;
+      for (const tag of [room.private && "PRIVATE", room.mine && "YOURS"].filter(Boolean)) {
+        const badge = document.createElement("span"); badge.className = "tag"; badge.textContent = tag; name.append(badge);
+      }
+      const people = `${room.players} playing`;
+      meta.textContent = [room.main ? "the main arena" : `host ${room.host}`, people, room.bots ? "bots" : "no bots"].join(" · ");
+      info.append(name, meta);
+      const join = document.createElement("button");
+      join.type = "button";
+      join.textContent = here ? "YOU'RE HERE" : "JOIN";
+      join.disabled = here;
+      join.addEventListener("click", () => {
+        const known = currentServer.id === room.id ? currentServer.pass : null;
+        if (room.private && !room.mine && !known && !session?.account?.isAdmin) askPassword(row, room);
+        else tryJoin(room);
+      });
+      row.append(info, join);
+      return row;
+    }));
+    document.querySelector("#createServer").disabled = !result.canCreate;
+    serverMessage(result.canCreate ? "" : result.reason || `All ${result.max} server slots are in use.`);
+  }
+
+  function askPassword(row, room) {
+    if (row.querySelector(".password-row")) { row.querySelector(".password-row input").focus(); return; }
+    const box = document.createElement("div"), input = document.createElement("input"), go = document.createElement("button");
+    box.className = "password-row";
+    input.type = "password"; input.maxLength = 64; input.placeholder = "Server password"; input.autocomplete = "off";
+    go.type = "button"; go.textContent = "JOIN";
+    const submit = () => tryJoin(room, input.value);
+    go.addEventListener("click", submit);
+    input.addEventListener("keydown", event => { if (event.key === "Enter") { event.preventDefault(); submit(); } });
+    box.append(input, go);
+    row.append(box);
+    input.focus();
+  }
+
+  let joining = false;
+  async function tryJoin(room, password) {
+    if (joining) return;
+    joining = true;
+    serverMessage(`Joining ${room.name}...`);
+    try {
+      await joinServer({id: room.id, name: room.name, pass: null}, password);
+      serverMessage("");
+      showMenuTab("play");
+      showGameNotice(`You're on ${currentServer.name}. Press DEPLOY CELL to play.`, 5000);
+    } catch (error) {
+      serverMessage(error.message);
+      if (error.roomGone) loadServers();
+    } finally {
+      joining = false;
+    }
+  }
+
+  async function createServer() {
+    const button = document.querySelector("#createServer");
+    if (button.disabled) return;
+    button.disabled = true;
+    serverMessage("Making your server...");
+    try {
+      const response = await fetch("/api/rooms/create", {method: "POST", cache: "no-store", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({name: document.querySelector("#newServerName").value, password: document.querySelector("#newServerPassword").value,
+          bots: document.querySelector("#newServerBots").checked})});
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Couldn't make the server.");
+      document.querySelector("#newServerPassword").value = "";
+      document.querySelector("#makeServer").open = false;
+      await joinServer({id: result.room.id, name: result.room.name, pass: result.pass});
+      showMenuTab("play");
+      showGameNotice(`Your server "${currentServer.name}" is ready. You have the admin panel here (press P while playing).`, 6000);
+    } catch (error) {
+      serverMessage(error.message);
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  document.querySelector("#tabPlay").addEventListener("click", () => showMenuTab("play"));
+  document.querySelector("#tabServers").addEventListener("click", () => showMenuTab("servers"));
+  document.querySelector("#refreshServers").addEventListener("click", loadServers);
+  document.querySelector("#createServer").addEventListener("click", createServer);
+  for (const id of ["#newServerName", "#newServerPassword"]) document.querySelector(id).addEventListener("keydown", event => {
+    if (event.key === "Enter") { event.preventDefault(); createServer(); }
+  });
+  document.querySelector("#menuTabs").hidden = false;
+  document.querySelector("#currentServer").hidden = false;
+  rememberServer();
 
   setInterval(syncRoom, 50);
 })();

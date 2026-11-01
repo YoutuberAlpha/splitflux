@@ -1,5 +1,6 @@
 const fs=require("fs"),os=require("os"),path=require("path"),crypto=require("crypto"),http=require("http");
-const {createEngine,captureResponse,packSnapshot,BACKUP_TABLE,backupFiles,filesChanged,checkAccountsKept}=require("./cloud-runtime.cjs");
+const {createEngine,loadEngine,captureResponse,packSnapshot,BACKUP_TABLE,backupFiles,filesChanged,checkAccountsKept}=require("./cloud-runtime.cjs");
+const {createRoomManager}=require("./rooms.cjs");
 const privateFiles=["admin-key.json","accounts.json","bans.json"];
 
 async function createLiveRuntime(pool,options={}) {
@@ -17,6 +18,8 @@ async function createLiveRuntime(pool,options={}) {
     await client.query("UPDATE splitflux_arena SET payload=$1::jsonb,updated_at=now() WHERE id=1",[JSON.stringify({...snapshot,liveEpoch:epoch,liveOrigin:origin,liveFailingSince:undefined})]);
     await client.query("COMMIT");
   }catch(error){await client.query("ROLLBACK");throw error;}finally{client.release();}
+  // The main server is saved to the database; servers players make (rooms.cjs) live only in memory.
+  const rooms=createRoomManager({main:engine,loadEngine:()=>loadEngine(directory)});
   let writes=Promise.resolve(),requests=Promise.resolve(),lost=false,active=false;
   const snapshot=()=>{
     const files={};for(const file of privateFiles){const name=path.join(directory,file);if(fs.existsSync(name))files[file]=fs.readFileSync(name,"utf8");}
@@ -41,8 +44,8 @@ async function createLiveRuntime(pool,options={}) {
     if(lost){response.writeHead(503);response.end(JSON.stringify({error:"Server restarting"}));return;}
     active=true;
     const captured=captureResponse();
-    await engine.handleRequest(request,captured);
-    if(captured.statusCode<400&&["/api/accounts/register","/api/accounts/password","/api/admin/reset-password","/api/admin/ban"].includes(new URL(request.url,"http://game.invalid").pathname))await checkpoint();
+    await rooms.handle(request,captured);
+    if(captured.statusCode<400&&["/api/accounts/register","/api/accounts/password","/api/admin/reset-password","/api/admin/ban","/api/admin/promote"].includes(new URL(request.url,"http://game.invalid").pathname))await checkpoint();
     for(const [name,value]of captured.headers)response.setHeader(name,value);
     response.writeHead(captured.statusCode);response.end(captured.body);
   }
@@ -50,13 +53,13 @@ async function createLiveRuntime(pool,options={}) {
     const job=requests.then(()=>handle(request,response));
     requests=job.catch(()=>{});return job;
   }
-  const tick=options.timers===false?null:setInterval(()=>{if(!lost)engine.advanceArena();},40);
+  const tick=options.timers===false?null:setInterval(()=>{if(!lost)rooms.tick();},40);
   // The arena is saved every 30 s while people are playing (each save is ~50-100 KB of outgoing data, which
   // counts against Render's monthly allowance). New accounts and bans are saved straight away (see handle).
   // With nobody playing there is nothing worth saving, so the idle server stays quiet.
   const save=options.timers===false?null:setInterval(()=>{if(active)checkpoint().catch(error=>console.error("Game checkpoint failed",error.code||error.name));},options.saveEveryMs||30000);
   tick?.unref();save?.unref();
-  return {engine,dispatch,checkpoint,get active(){return active;},async close(){clearInterval(tick);clearInterval(save);await requests;if(!lost)await checkpoint();}};
+  return {engine,rooms,dispatch,checkpoint,get active(){return active;},async close(){clearInterval(tick);clearInterval(save);await requests;if(!lost)await checkpoint();}};
 }
 
 async function main(){
@@ -71,7 +74,7 @@ async function main(){
     response.end(JSON.stringify({error:"Unable to complete the request. Please retry."}));
   }));
   runtime=await createLiveRuntime(pool,{onLost(){realtime?.close();server.close();}});
-  realtime=runtime.engine.enableRealtime(server,runtime.dispatch);
+  realtime=runtime.engine.enableRealtime(server,runtime.dispatch,runtime.rooms.getSession);
   server.listen(Number(process.env.PORT)||1000,"0.0.0.0",()=>console.log("SPLITFLUX real-time server ready"));
   const shutdown=async()=>{try{realtime.close();await runtime.close();server.close();await pool.end();}catch{process.exitCode=1;}};
   process.once("SIGTERM",shutdown);process.once("SIGINT",shutdown);

@@ -63,6 +63,9 @@ let playerBlobImage = null;
 let playerBlobImageData = "";
 const onlineMode = location.protocol === "http:" || location.protocol === "https:";
 let isAdmin = !onlineMode;
+// "owner" (the alpha account), "host" (made this server), "admin" (made admin by an admin) or null.
+let adminRole = onlineMode ? null : "owner";
+let botsRemoved = false;
 let remotePlayerCells = [];
 let teamedBots = new Set();
 let selectedTeamBot = null;
@@ -413,6 +416,7 @@ function spawnBot(name) {
 
 function maintainBotPopulation(dt) {
   if (onlineMode) return;
+  if (botsRemoved) { bots = []; return; }
   bots = bots.filter(bot => bot.alive);
   if (performance.now() < botRespawnPausedUntil) return;
   botSpawnTimer -= dt;
@@ -1445,11 +1449,34 @@ function loop(time) {
 
 function showModeration(cell) {
   if (!isAdmin || !cell || cell.isPlayer) return;
-  selectedModerationTarget = {targetId:cell.remoteSessionId || null,botTeam:cell.isRemote?null:cell.botTeam||cell.name,name:cell.name};
+  selectedModerationTarget = {targetId:cell.remoteSessionId || null,botTeam:cell.isRemote?null:cell.botTeam||cell.name,name:cell.name,role:cell.role||null};
   document.querySelector("#moderationName").textContent=cell.name;
-  document.querySelector("#moderationMessage").textContent="Choose how long this player should be banned.";
+  // Only the owner's bans count on every server; a host's or admin's ban removes the player from this server.
+  document.querySelector("#moderationMessage").textContent=adminRole==="owner"||!onlineMode
+    ?"Choose how long this player should be banned.":"Choose how long to ban this player from this server.";
+  updateAdminRoleButton();
   document.querySelector("#moderationMenu").classList.remove("hidden");
 }
+// Players (not bots) can be made admin on this server, or have it taken away. The owner and host always stay admin.
+function updateAdminRoleButton() {
+  const button=document.querySelector("#toggleAdminRole"), target=selectedModerationTarget;
+  button.hidden=!onlineMode||!target||!target.targetId;
+  if (button.hidden) return;
+  button.disabled=target.role==="owner"||target.role==="host";
+  button.textContent=target.role==="owner"?"OWNER (ALWAYS ADMIN)":target.role==="host"?"HOST (ALWAYS ADMIN)":target.role==="admin"?"REMOVE ADMIN":"MAKE ADMIN";
+}
+document.querySelector("#toggleAdminRole").addEventListener("click",async()=>{
+  const target=selectedModerationTarget, message=document.querySelector("#moderationMessage"), button=document.querySelector("#toggleAdminRole");
+  if (!isAdmin||!target?.targetId||button.disabled) return;
+  const makeAdmin=target.role!=="admin";
+  button.disabled=true;
+  try {
+    const result=await window.promotePlayerOnline(target.targetId,makeAdmin);
+    target.role=result.admin?"admin":null;
+    for (const cell of remotePlayerCells) if (cell.remoteSessionId===target.targetId) cell.role=target.role;
+    message.textContent=result.admin?`${target.name} is now an admin on this server.`:`${target.name} is no longer an admin.`;
+  } catch(error) {message.textContent=error.message;} finally {button.disabled=false;updateAdminRoleButton();}
+});
 document.querySelector("#closeModeration").addEventListener("click",()=>document.querySelector("#moderationMenu").classList.add("hidden"));
 document.querySelector("#botBanOptions").addEventListener("click",()=>showModeration(bots.find(bot=>(bot.botTeam||bot.name)===selectedTeamBot)));
 document.querySelector("#confirmBan").addEventListener("click",async()=>{
@@ -1589,6 +1616,7 @@ document.querySelector("#clearBlobImage").addEventListener("click", () => {
 document.querySelector("#instantMerge").addEventListener("pointerdown", instantlyRemerge);
 document.querySelector("#removeSpikes").addEventListener("pointerdown", removeAllSpikes);
 document.querySelector("#autoSpikes").addEventListener("pointerdown", toggleAutoSpikes);
+document.querySelector("#removeBots").addEventListener("pointerdown", toggleRemoveBots);
 document.querySelector("#killEveryone").addEventListener("pointerdown", killEveryone);
 document.querySelectorAll("[data-multiplier]").forEach(button => button.addEventListener("pointerdown", () => multiplyPlayer(Number(button.dataset.multiplier))));
 document.querySelectorAll("[data-divisor]").forEach(button => button.addEventListener("pointerdown", () => dividePlayer(Number(button.dataset.divisor))));
@@ -1745,6 +1773,22 @@ function toggleAutoSpikes() {
   if (onlineMode) { window.configureArenaOnline({autoSpikes:!autoSpikesOn}).catch(showArenaError); return; }
   setAutoSpikesLabel(!autoSpikesOn);
   while (autoSpikesOn && viruses.length < VIRUS_COUNT) viruses.push(makeVirus());
+}
+
+// REMOVE ALL BOTS is a switch: ON = every bot is gone and none come back, OFF = bots spawn again.
+function toggleRemoveBots() {
+  if (!isAdmin) return;
+  if (onlineMode) { window.configureArenaOnline({botsOff:!botsRemoved}).catch(showArenaError); return; }
+  setRemoveBotsLabel(!botsRemoved);
+  if (botsRemoved) bots = [];
+  else { botSpawnTimer = 0; maintainBotPopulation(1); }
+}
+
+function setRemoveBotsLabel(on) {
+  botsRemoved = on;
+  const state = document.querySelector("#removeBotsState");
+  if (state) state.textContent = on ? "ON" : "OFF";
+  document.querySelector("#removeBots")?.classList.toggle("active", on);
 }
 
 function setAutoSpikesLabel(on) {
