@@ -19,6 +19,7 @@ function createServer({world = "cleanWorld({worldSize: 5200, bots: [], viruses: 
         fromRequest: request => request.headers["x-test-owner"] ? {username: "alpha", role: "owner", isAdmin: true}
           : request.headers["x-test-user"] ? {username: request.headers["x-test-user"], role: "player", isAdmin: false} : null,
         remember() {}, forget() {},
+        exists: username => ["alpha", "bob", "carl", "zed", "shopper", "newbie"].includes(username),
       });
       if (name === "./moderation.cjs") return () => ({device: () => "device", until: () => 0, bannedBotTeams: () => []});
       if (name === "./physics.js") return physics;

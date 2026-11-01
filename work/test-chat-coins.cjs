@@ -36,6 +36,26 @@ const {createServer} = require("./server-harness.cjs");
   assert.equal((await post(bob, "/api/admin/coins", {amount: 100})).status, 403, "Server owners can't make coins");
   game.run(`roomConfig = null; globalAdmins = () => promotedAdmins`);
 
+  // ---- GIFTS between players (by account username, from their own coins) ----
+  const carlBefore = coinsOf("carl"), bobBefore = coinsOf("bob");
+  assert.match((await post(amy, "/api/shop/gift", {to: "bob", amount: 5})).body.error, /Sign in/, "Guests can't gift");
+  assert.match((await post(bob, "/api/shop/gift", {to: "nobody_here", amount: 5})).body.error, /no account called "nobody_here"/);
+  assert.match((await post(bob, "/api/shop/gift", {to: "BOB", amount: 5})).body.error, /yourself/);
+  assert.match((await post(bob, "/api/shop/gift", {to: "carl", amount: bobBefore + 1})).body.error, /only have/, "Only coins you have");
+  for (const amount of [0, -3, 2.5, "x"]) assert.equal((await post(bob, "/api/shop/gift", {to: "carl", amount})).status, 400);
+  answer = await post(bob, "/api/shop/gift", {to: " Carl ", amount: 100});
+  assert.equal(answer.status, 200); assert.equal(answer.body.coins, bobBefore - 100, "The sender's coins go down");
+  assert.equal(coinsOf("carl"), carlBefore + 100, "and the other player's go up");
+  assert((await carl.state()).notices.includes("bob gifted you 100 coins!"), "They're told who sent it (by account name)");
+  // The owner and real admins can gift coins they don't have; their own coins stay the same.
+  const ownerBefore = coinsOf("alpha"), zedBefore = coinsOf("zed");
+  answer = await post(owner, "/api/shop/gift", {to: "zed", amount: 1_000_000});
+  assert.equal(answer.status, 200); assert.equal(answer.body.coins, ownerBefore, "The owner's coins don't go down");
+  assert.equal(coinsOf("zed"), zedBefore + 1_000_000);
+  assert.equal((await post(carl, "/api/shop/gift", {to: "zed", amount: 5})).body.coins, coinsOf("carl"), "Real admins too");
+  assert.equal(coinsOf("zed"), zedBefore + 1_000_005);
+  assert.match((await post(owner, "/api/shop/gift", {to: "alpha", amount: 5})).body.error, /yourself/);
+
   // ---- CHAT ----
   await amy.state();
   assert.equal((await post(bob, "/api/chat", {text: "   "})).status, 400, "Empty messages are refused");
@@ -73,5 +93,5 @@ const {createServer} = require("./server-harness.cjs");
   game.run("chatLog = []; chatSeq = 0"); game.run("importState")(saved);
   assert.equal(game.run("chatLog.length"), 40); assert(game.run("chatSeq") >= 50);
 
-  console.log("PASS: owner and real admins add coins to themselves and gift them to signed-in players (who are told once), not players/guests/server owners, amounts 1-1,000,000; chat per server, cleaned and cut to 120 characters, owner/admin tags, only new messages sent, 1 per 0.7 s and 5 per 10 s, newest 40 kept, saved with the arena.");
+  console.log("PASS: players gift their own coins by username (not as guests, not to themselves, not more than they have; the owner and real admins can gift coins they don't have), owner and real admins add coins to themselves and gift them to signed-in players (who are told once), not players/guests/server owners, amounts 1-1,000,000; chat per server, cleaned and cut to 120 characters, owner/admin tags, only new messages sent, 1 per 0.7 s and 5 per 10 s, newest 40 kept, saved with the arena.");
 })().catch(error => { console.error(error); process.exitCode = 1; });

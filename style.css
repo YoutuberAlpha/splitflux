@@ -86,6 +86,11 @@ button, input, select { font: inherit; }
 .coin-row input { min-width: 0; padding: 8px; border: 1px solid rgba(255,255,255,.14); background: rgba(0,0,0,.3); color: white; font-family: Consolas, monospace; }
 .coin-row button { width: auto; margin-top: 0 !important; padding: 8px 10px; background: #ffd34d; color: #1a1300; justify-content: center; }
 .coin-box small { display: block; margin-top: 6px; color: var(--muted); font-size: 11px; }
+.shop-row { margin: 0 0 10px; }
+.shop-row button { padding: 10px 12px; font-size: 11px; letter-spacing: .08em; }
+.shop-row input { font-size: 13px; }
+.gift-coins { margin: 0 0 12px; }
+#sendGift { justify-content: center; background: #ffd34d; color: #1a1300; }
 .minimap-shell { right: 20px; bottom: 24px; padding: 8px; }
 #minimap { display: block; width: 130px; height: 130px; opacity: .9; }
 .minimap-shell span { padding: 5px 2px 1px; text-align: center; }

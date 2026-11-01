@@ -103,5 +103,6 @@ module.exports = function createAccounts(directory, signingKey, ownerPassword) {
     await setPassword(account, newPassword);
     return profile(username);
   }
-  return { fromRequest, remember, forget, authenticate, changePassword, resetPassword };
+  const exists = username => Object.hasOwn(accounts, String(username || "").toLowerCase());
+  return { fromRequest, remember, forget, authenticate, changePassword, resetPassword, exists };
 };

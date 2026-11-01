@@ -930,6 +930,7 @@
     const state = shopState || {signedIn: false, coins: 0, unsaved: 0, owned: [], skin: "", ownsAll: false};
     const coins = state.coins + (state.unsaved || 0);
     document.querySelector("#shopCoins").textContent = coins.toLocaleString();
+    document.querySelector("#shopAdminCoins").hidden = !(adminRole === "owner" || adminRole === "admin");
     document.querySelector("#shopNote").textContent = state.ownsAll ? "You're the owner: every skin is yours to wear."
       : !state.signedIn ? (state.unsaved ? `You have ${state.unsaved} unsaved coins. Sign in on the PLAY tab to keep them and buy skins.`
         : "Sign in on the PLAY tab to earn coins and buy skins. Grow to earn: 1 coin for every 10 mass.")
@@ -957,19 +958,22 @@
       return card;
     }));
   }
-  async function shopCommand(route, skin, done) {
-    if (!session) { shopMessage("Connecting to the server..."); return; }
+  async function shopCommand(route, skin, done, extra = {}) {
+    if (!session) { shopMessage("Connecting to the server..."); return false; }
+    let ok = false;
     try {
       const response = await fetch(`/api/shop${route ? "/" + route : ""}`, {method: "POST", headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({id: session.id, sessionKey: session.sessionKey, skin})});
+        body: JSON.stringify({id: session.id, sessionKey: session.sessionKey, skin, ...extra})});
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || "The shop isn't available right now.");
       shopState = result;
       playerSkin = result.skin || "";
       walletSig = "";  // the next update brings the new wallet
       if (done) shopMessage(done);
+      ok = true;
     } catch (error) { shopMessage(error.message); }
     renderShop();
+    return ok;
   }
   function loadShop() { return shopCommand("", ""); }
   // BUY needs two clicks (so a stray click doesn't spend coins); WEAR and TAKE OFF are one click.
@@ -1214,6 +1218,39 @@
       message.textContent = `Gave ${result.amount.toLocaleString()} coins to ${result.name}.`;
     } catch (error) { message.textContent = error.message; }
   });
+  // On the home screen (SHOP tab): the owner and real admins add coins to themselves...
+  document.querySelector("#shopAddCoins").addEventListener("click", async () => {
+    try {
+      const result = await coinCommand({amount: document.querySelector("#shopAddAmount").value});
+      shopMessage(`Added ${result.amount.toLocaleString()} coins. You have ${result.coins.toLocaleString()}.`);
+      await loadShop();
+    } catch (error) { shopMessage(error.message); }
+  });
+  // ...and anyone signed in can gift some of their coins to another player by username (two clicks: gifts can't be undone).
+  let giftConfirm = null, giftTimer = 0;
+  const giftButton = document.querySelector("#sendGift");
+  const resetGift = () => { giftConfirm = null; clearTimeout(giftTimer); giftButton.textContent = "SEND COINS"; };
+  giftButton.addEventListener("click", async () => {
+    const to = document.querySelector("#giftUsername").value.trim(), amount = Math.floor(Number(document.querySelector("#giftAmount").value));
+    if (!to) { shopMessage("Type the player's account username."); return; }
+    if (!(amount >= 1)) { shopMessage("Type how many coins to send."); return; }
+    const key = `${to.toLowerCase()}:${amount}`;
+    if (giftConfirm !== key) {
+      resetGift();
+      giftConfirm = key;
+      giftButton.textContent = `SEND ${amount.toLocaleString()} TO ${to.toUpperCase()}?`;
+      shopMessage("Click again to send. Gifts can't be undone.");
+      giftTimer = setTimeout(resetGift, 5000);
+      return;
+    }
+    resetGift();
+    giftButton.disabled = true;
+    if (await shopCommand("gift", "", `You sent ${amount.toLocaleString()} coins to ${to.toLowerCase()}.`, {to, amount})) {
+      document.querySelector("#giftAmount").value = "";
+    }
+    giftButton.disabled = false;
+  });
+  for (const id of ["#giftUsername", "#giftAmount"]) document.querySelector(id).addEventListener("input", resetGift);
   for (const id of ["#addCoinsAmount", "#giveCoinsAmount"]) document.querySelector(id).addEventListener("keydown", event => event.stopPropagation());
 
   // ---- CHAT (lower left): one chat per server. Enter opens it while playing, Enter sends, Esc closes. ----
