@@ -56,17 +56,23 @@ async function state(who,extra={}) {
   await state(owner,{running:false});
   await state(owner,{running:true});
   assert.equal(owner.snapshot.followedBotTeam,'Alex','Returning through the menu must not silently stop teammate control');
-  const skin='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=';
-  await state(owner,{skin});await state(guest);
-  assert(guest.snapshot.players.find(player=>player.id===owner.session.id).skinVersion>0);
-  const image=await request(guest,'/api/skins/'+owner.session.id);assert.equal(image.status,200);assert(image.body.length>20);
+  // Skins come from the shop now: uploaded pictures are ignored, and everyone sees the skin the server says you wear.
+  const upload='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=';
+  await state(owner,{skin:upload});await state(guest);
+  assert(!guest.snapshot.players.find(player=>player.id===owner.session.id).skin,'An uploaded picture is not a skin');
+  assert.equal((await request(guest,'/api/skins/'+owner.session.id)).status,404,'The old skin upload route is gone');
+  assert.equal((await request(owner,'/api/shop/equip',{...credentials(owner),skin:'dragon'})).body.skin,'dragon','The owner can wear any skin');
+  await state(owner);await state(guest);
+  assert.equal(guest.snapshot.players.find(player=>player.id===owner.session.id).skin,'dragon');
+  const image=await request(guest,'/skins/dragon.webp');assert.equal(image.status,200);assert(image.body.length>1000);
+  assert.equal((await request(guest,'/api/shop/equip',{...credentials(guest),skin:'dragon'})).status,400,'A guest can\'t wear a skin');
   assert.equal((await request(guest,'/api/admin/ban',{...credentials(guest),targetId:owner.session.id,durationMs:1000})).status,403);
   assert.equal((await request(owner,'/api/admin/ban',{...credentials(owner),targetId:owner.session.id,durationMs:1000})).status,403);
   const ban=await request(owner,'/api/admin/ban',{...credentials(owner),targetId:guest.session.id,durationMs:1000});assert.equal(ban.status,200);
   assert.equal((await state(guest)).status,403);assert.equal((await session(guest)).status,403,'Ban must survive rejoining with same browser');
   await wait(1100);assert.equal((await session(guest)).status,200,'Timed ban must expire');
   const stored=fs.readFileSync(path.join(directory,'bans.json'),'utf8');assert(stored.includes('device:'));
-  console.log('PASS: cursor convergence, automatic teammate follow, exactly-once bot split, bot feeding, cached shared skins, owner-only spike painting, owner protection, timed bans, rejoin enforcement, and expiration.');
+  console.log('PASS: cursor convergence, automatic teammate follow, exactly-once bot split, bot feeding, shop skins seen by everyone (uploads ignored), owner-only spike painting, owner protection, timed bans, rejoin enforcement, and expiration.');
  } finally {
   if(processHandle&&processHandle.exitCode===null)await new Promise(resolve=>{processHandle.once('exit',resolve);processHandle.kill();});
   fs.rmSync(directory,{recursive:true,force:true});

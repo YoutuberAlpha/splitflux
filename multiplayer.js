@@ -19,10 +19,9 @@
   let remoteCellCache = new Map();
   let ejectedCache = new Map();
   let networkDelay = 0;
-  let skinSource = null;
-  let networkSkin = "";
-  let lastSentSkin = null;
-  let skinResentAt = -Infinity;
+  // SKIN SHOP: coins and the worn skin, from the server (sent only when they change; walletSig says which we have).
+  let walletSig = "";
+  let shopState = null, confirmBuy = null, confirmTimer = 0;  // the SHOP tab (see below)
   let teamRevision = 0;
   let lastSyncAt = -Infinity;
   // Compact updates: the server only resends the bot team table and the spike list when they change,
@@ -32,15 +31,6 @@
   let spikesSig = "";
   let serverViruses = [];
   const roomTransport=RoomTransport.create({fetch:(...args)=>fetch(...args),WebSocket});
-  function updateNetworkSkin() {
-    if (skinSource === playerBlobImageData) return;
-    skinSource = playerBlobImageData;
-    if (!playerBlobImageData) { networkSkin=""; return; }
-    if (!playerBlobImage?.complete || !playerBlobImage.naturalWidth) {skinSource=null;return;}
-    const thumbnail=document.createElement("canvas");thumbnail.width=128;thumbnail.height=128;
-    thumbnail.getContext("2d").drawImage(playerBlobImage,0,0,128,128);
-    networkSkin=thumbnail.toDataURL("image/webp",.75);
-  }
   function showBan(until) {
     currentBanUntil=until;
     returnToMainMenu();
@@ -405,12 +395,8 @@
           remoteSessionId: remote.id,
           role: remote.role || null,
           botTeam: `remote-${remote.id}`,
+          skin: remote.skin || "",
         });
-        const cachedSkin=remoteSkinImages.get(remote.id);
-        if (remote.skinVersion && cachedSkin?.version!==remote.skinVersion) {
-          const image=new Image();image.src=`/api/skins/${encodeURIComponent(remote.id)}?v=${remote.skinVersion}`;
-          remoteSkinImages.set(remote.id,{image,version:remote.skinVersion});
-        } else if (!remote.skinVersion) remoteSkinImages.delete(remote.id);
         nextCache.set(key, networkCell);
         nextCells.push(networkCell);
       }
@@ -455,7 +441,8 @@
     adminRole = isAdmin ? (session.adminRole || "admin") : null;
     document.querySelector("#botBanOptions").hidden = !isAdmin;
     if (!isAdmin) document.querySelector("#moderationMenu").classList.add("hidden");
-    updateBlobImageAccess();
+    // Signing in or out changes the wallet: refresh the shop if it is open.
+    if (!document.querySelector("#shopTab").hidden && Boolean(account) !== Boolean(shopState?.signedIn)) loadShop();
     document.querySelector("#mobileRole").textContent = ROLE_LABELS[adminRole] || "GUEST";
     adminShortcut.classList.toggle("hidden", !isAdmin);
     adminShortcut.classList.toggle("inactive", !isAdmin || !running);
@@ -631,7 +618,7 @@
     botTeamInfo = new Map();
     teamsSig = "";
     spikesSig = "";
-    lastSentSkin=null;
+    walletSig = "";
     updateAdminAccess();
     connected = true;
     if (isAdmin) {
@@ -655,7 +642,6 @@
     lastSyncAt = performance.now();
     syncing = true;
     try {
-      updateNetworkSkin();
       const payload = {
         id: session.id,
         sessionKey: session.sessionKey,
@@ -684,8 +670,8 @@
         ackSpikes: spikesSig,
         ackEjected: newestPelletSeq(),
         ackAnnouncement: lastAnnouncementId,
+        ackWallet: walletSig,
       };
-      if (networkSkin!==lastSentSkin) payload.skin=networkSkin;
       for (const cell of playerCells) cell._syncMassWeights = { [cell.netId]: 1 };
       const sentMapSize = worldSize;
       const requestAt=performance.now();
@@ -726,12 +712,7 @@
       virusPops = virusPops.filter(id => !sentPops.has(id));
       applyFoodSync(snapshot.food);
       networkDelay=Math.min(.15,(performance.now()-requestAt)/2000);
-      if (Object.hasOwn(payload,"skin")) lastSentSkin=payload.skin;
-      // A restarted server doesn't keep skin pictures; send ours again (at most every 10 s).
-      if (networkSkin && snapshot.self && !snapshot.self.skinVersion && performance.now() - skinResentAt > 10000) {
-        skinResentAt = performance.now();
-        lastSentSkin = null;
-      }
+      if (snapshot.wallet) applyWallet(snapshot.wallet);
       (snapshot.acceptedBotSplitCommands||[]).forEach(id=>pendingBotSplitCommands.delete(id));
       if (snapshot.botSplitError) showArenaError(new Error(snapshot.botSplitError));
       bannedBotTeams=new Set(snapshot.bannedBotTeams||[]);
@@ -912,16 +893,99 @@
   // ---- SERVERS tab ----
   const serverMessage = text => { document.querySelector("#serverMessage").textContent = text; };
   function showMenuTab(tab) {
-    const servers = tab === "servers";
-    document.querySelector("#serversTab").hidden = !servers;
-    document.querySelector("#playTab").hidden = servers;
-    for (const [id, active] of [["#tabPlay", !servers], ["#tabServers", servers]]) {
+    for (const [name, panel, id] of [["play", "#playTab", "#tabPlay"], ["servers", "#serversTab", "#tabServers"], ["shop", "#shopTab", "#tabShop"]]) {
+      const active = tab === name;
+      document.querySelector(panel).hidden = !active;
       const button = document.querySelector(id);
       button.classList.toggle("active", active);
       button.setAttribute("aria-selected", String(active));
     }
-    if (servers) loadServers();
+    if (tab === "servers") loadServers();
+    if (tab === "shop") { renderShop(); loadShop(); }
   }
+
+  // ---- SHOP tab ----
+  // shopState is the server's answer: {signedIn, coins, unsaved (a guest's coins), owned: [skin ids], skin, ownsAll}.
+  // The server decides everything (prices, who owns what); this only shows it and sends BUY / WEAR clicks.
+  const shopMessage = text => { document.querySelector("#shopMessage").textContent = text; };
+  function applyWallet(next) {
+    walletSig = next.sig || "";
+    playerSkin = next.skin || "";
+    const shown = (next.coins || 0) + (next.unsaved || 0);
+    document.querySelector("#coins").textContent = shown.toLocaleString();
+    document.querySelector("#coinStat").hidden = false;
+    if (!shopState) return;
+    if (Boolean(next.signedIn) !== shopState.signedIn) { loadShop(); return; }
+    Object.assign(shopState, {coins: next.coins || 0, unsaved: next.unsaved || 0, skin: next.skin || ""});
+    if (!document.querySelector("#shopTab").hidden) renderShop();
+  }
+  function renderShop() {
+    const state = shopState || {signedIn: false, coins: 0, unsaved: 0, owned: [], skin: "", ownsAll: false};
+    const coins = state.coins + (state.unsaved || 0);
+    document.querySelector("#shopCoins").textContent = coins.toLocaleString();
+    document.querySelector("#shopNote").textContent = state.ownsAll ? "You're the owner: every skin is yours to wear."
+      : !state.signedIn ? (state.unsaved ? `You have ${state.unsaved} unsaved coins. Sign in on the PLAY tab to keep them and buy skins.`
+        : "Sign in on the PLAY tab to earn coins and buy skins. Grow to earn: 1 coin for every 10 mass.")
+      : isAdmin ? "You don't earn coins on a server where you're an admin (admin powers can change your size)."
+      : "Grow to earn coins: 1 coin for every 10 mass you grow past your biggest size in each life.";
+    document.querySelector("#shopGrid").replaceChildren(...SkinShop.list.map(skin => {
+      const owned = state.owned.includes(skin.id), worn = state.skin === skin.id;
+      const card = document.createElement("div");
+      card.className = `skin-card tier-${skin.tier}${owned ? " owned" : ""}${worn ? " worn" : ""}`;
+      const picture = document.createElement("img");
+      picture.src = skin.image; picture.alt = ""; picture.loading = "lazy";
+      const name = document.createElement("b"); name.textContent = skin.name;
+      const tier = document.createElement("small"); tier.textContent = skin.tier.toUpperCase();
+      const button = document.createElement("button");
+      button.type = "button"; button.dataset.skin = skin.id;
+      if (worn) button.textContent = "TAKE OFF";
+      else if (owned) button.textContent = "WEAR";
+      else if (confirmBuy === skin.id) { button.textContent = `BUY FOR ${skin.price}?`; button.classList.add("confirm"); }
+      else {
+        const coin = document.createElement("i"); coin.className = "coin";
+        button.append(coin, String(skin.price));
+        if (!state.signedIn || state.coins < skin.price) button.classList.add("short");
+      }
+      card.append(picture, name, tier, button);
+      return card;
+    }));
+  }
+  async function shopCommand(route, skin, done) {
+    if (!session) { shopMessage("Connecting to the server..."); return; }
+    try {
+      const response = await fetch(`/api/shop${route ? "/" + route : ""}`, {method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({id: session.id, sessionKey: session.sessionKey, skin})});
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "The shop isn't available right now.");
+      shopState = result;
+      playerSkin = result.skin || "";
+      walletSig = "";  // the next update brings the new wallet
+      if (done) shopMessage(done);
+    } catch (error) { shopMessage(error.message); }
+    renderShop();
+  }
+  function loadShop() { return shopCommand("", ""); }
+  // BUY needs two clicks (so a stray click doesn't spend coins); WEAR and TAKE OFF are one click.
+  document.querySelector("#shopGrid").addEventListener("click", async event => {
+    const button = event.target.closest("button[data-skin]");
+    const skin = button && SkinShop.find(button.dataset.skin);
+    if (!skin || !shopState) return;
+    const owned = shopState.owned.includes(skin.id), worn = shopState.skin === skin.id;
+    if (!shopState.signedIn) { shopMessage("Sign in on the PLAY tab to buy and wear skins."); return; }
+    if (!owned && confirmBuy !== skin.id) {
+      if (shopState.coins < skin.price) { shopMessage(`You need ${skin.price - shopState.coins} more coins for ${skin.name}. Keep growing!`); return; }
+      confirmBuy = skin.id;
+      clearTimeout(confirmTimer);
+      confirmTimer = setTimeout(() => { confirmBuy = null; renderShop(); }, 4000);
+      shopMessage(`Click again to buy ${skin.name} for ${skin.price} coins.`);
+      renderShop();
+      return;
+    }
+    confirmBuy = null; clearTimeout(confirmTimer);
+    button.disabled = true;
+    if (!owned) await shopCommand("buy", skin.id, `You bought ${skin.name}! You're wearing it now.`);
+    else await shopCommand("equip", worn ? "" : skin.id, worn ? `You took off ${skin.name}.` : `You're wearing ${skin.name}.`);
+  });
 
   async function loadServers() {
     try {
@@ -1111,6 +1175,7 @@
 
   document.querySelector("#tabPlay").addEventListener("click", () => showMenuTab("play"));
   document.querySelector("#tabServers").addEventListener("click", () => showMenuTab("servers"));
+  document.querySelector("#tabShop").addEventListener("click", () => showMenuTab("shop"));
   document.querySelector("#refreshServers").addEventListener("click", loadServers);
   document.querySelector("#createServer").addEventListener("click", createServer);
   for (const id of ["#newServerName", "#newServerPassword"]) document.querySelector(id).addEventListener("keydown", event => {

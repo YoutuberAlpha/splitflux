@@ -6,8 +6,9 @@ const staticDirectory = path.join(root, "public");
 if (path.relative(root,staticDirectory)!=="public" || fs.existsSync(staticDirectory)&&fs.lstatSync(staticDirectory).isSymbolicLink()) throw new Error("Unsafe build output directory");
 fs.rmSync(staticDirectory, { recursive: true, force: true });
 fs.mkdirSync(staticDirectory, { recursive: true });
-for (const file of ["index.html", "style.css", "feeding.js", "physics.js", "game.js", "transport.js", "multiplayer.js", "THIRD-PARTY-NOTICES.txt"]) {
+for (const file of ["index.html", "style.css", "feeding.js", "physics.js", "game.js", "transport.js", "multiplayer.js", "skins.js", "THIRD-PARTY-NOTICES.txt"]) {
   fs.copyFileSync(path.join(root, file), path.join(staticDirectory, file));
 }
 fs.cpSync(path.join(root, "licenses"), path.join(staticDirectory, "licenses"), { recursive: true });
+fs.cpSync(path.join(root, "skins"), path.join(staticDirectory, "skins"), { recursive: true });  // the shop's skin pictures
 console.log("Built SPLITFLUX public assets. Vercel compiles the private API separately.");

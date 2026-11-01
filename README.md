@@ -1,8 +1,8 @@
 # SPLITFLUX
 
 A dark, silent multiplayer cell arena with bots, trick splits, feeding, accounts,
-and owner controls. The owner account is `alpha`; regular accounts can upload
-their own blob pictures.
+and owner controls. The owner account is `alpha`. Players earn coins by growing
+(1 coin per 10 mass) and spend them on skins in the SHOP tab (`skins.js` lists the skins and prices).
 
 # Play online at splitflux-agario.vercel.app
 

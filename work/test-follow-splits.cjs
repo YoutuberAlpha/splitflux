@@ -26,6 +26,8 @@ const context=vm.createContext({require(name){
   if(name==='fs')return {mkdirSync(){},existsSync:()=>true,readFileSync:()=>JSON.stringify({key:'test-key'})};
   if(name==='./accounts.cjs')return ()=>({});
   if(name==='./physics.js')return physics;
+  if(name==='./skins.js')return require('../skins.js');
+  if(name==='./shop.cjs')return ()=>({coins:()=>0,equipped:()=>'',earn(){},flush(){}});
   if(name==='./moderation.cjs')return ()=>({until:()=>0,bannedBotTeams:()=>[]});
   return require(name);
 },__dirname:path.join(__dirname,'..'),process:{env:{}},Buffer,module:{exports:{}},console,setInterval:()=>({unref(){}})});

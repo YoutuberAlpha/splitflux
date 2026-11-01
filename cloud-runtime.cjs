@@ -4,7 +4,8 @@ const path = require("path");
 const zlib = require("zlib");
 const {proxyBackend, forwardRequest, sendForwarded} = require("./backend-proxy.cjs");
 
-const privateFiles = ["admin-key.json", "accounts.json", "bans.json"];
+// shop.json holds coins and skins; it is saved with the rest but (changing all the time) doesn't trigger backups.
+const privateFiles = ["admin-key.json", "accounts.json", "bans.json", "shop.json"];
 
 // The arena is saved compressed (roughly a third of the size). Every read and write of it counts against
 // the database's monthly data allowance, so smaller saves mean the free plan lasts longer.
@@ -25,7 +26,8 @@ async function backupFiles(db, files) {
   await db.query("INSERT INTO splitflux_backups (files) VALUES ($1::jsonb)", [JSON.stringify(files)]);
   await db.query("DELETE FROM splitflux_backups WHERE id <= (SELECT id FROM splitflux_backups ORDER BY id DESC OFFSET 50 LIMIT 1)");
 }
-const filesChanged = (before, after) => JSON.stringify(before || {}) !== JSON.stringify(after || {});
+const backupTriggers = ["admin-key.json", "accounts.json", "bans.json"];
+const filesChanged = (before, after) => backupTriggers.some(name => (before || {})[name] !== (after || {})[name]);
 function checkAccountsKept(before, after) {
   const previous = Object.keys(JSON.parse(before?.["accounts.json"] || "{}"));
   const next = JSON.parse(after?.["accounts.json"] || "{}");
@@ -133,6 +135,7 @@ function createCloudHandler(pool, options={}) {
       const captured=captureResponse();
       await engine.handleRequest(request,captured);
       if (!captured.ended) throw new Error("The game did not complete its response");
+      engine.flushFiles?.();  // coins waiting to be written go into this save
       const files={};
       for (const name of privateFiles) {
         const filename=path.join(directory,name);

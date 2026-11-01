@@ -1,7 +1,7 @@
 const fs=require("fs"),os=require("os"),path=require("path"),crypto=require("crypto"),http=require("http");
 const {createEngine,loadEngine,captureResponse,packSnapshot,BACKUP_TABLE,backupFiles,filesChanged,checkAccountsKept}=require("./cloud-runtime.cjs");
 const {createRoomManager}=require("./rooms.cjs");
-const privateFiles=["admin-key.json","accounts.json","bans.json"];
+const privateFiles=["admin-key.json","accounts.json","bans.json","shop.json"];
 
 async function createLiveRuntime(pool,options={}) {
   const directory=options.directory||fs.mkdtempSync(path.join(os.tmpdir(),"splitflux-live-"));
@@ -22,10 +22,9 @@ async function createLiveRuntime(pool,options={}) {
   const rooms=createRoomManager({main:engine,loadEngine:()=>loadEngine(directory)});
   let writes=Promise.resolve(),requests=Promise.resolve(),lost=false,active=false;
   const snapshot=()=>{
+    engine.flushFiles?.();  // coins waiting to be written go into this save
     const files={};for(const file of privateFiles){const name=path.join(directory,file);if(fs.existsSync(name))files[file]=fs.readFileSync(name,"utf8");}
     const arena=engine.exportState();
-    // Skin pictures (up to 60 KB each) are left out of saves; after a restart the game sends its skin again.
-    arena.sessions=arena.sessions.map(session=>({...session,skin:"",skinVersion:0}));
     return packSnapshot({version:1,liveEpoch:epoch,liveOrigin:origin,arena,files});
   };
   function checkpoint(){
@@ -45,7 +44,7 @@ async function createLiveRuntime(pool,options={}) {
     active=true;
     const captured=captureResponse();
     await rooms.handle(request,captured);
-    if(captured.statusCode<400&&["/api/accounts/register","/api/accounts/password","/api/admin/reset-password","/api/admin/ban","/api/admin/promote"].includes(new URL(request.url,"http://game.invalid").pathname))await checkpoint();
+    if(captured.statusCode<400&&["/api/accounts/register","/api/accounts/password","/api/admin/reset-password","/api/admin/ban","/api/admin/promote","/api/shop/buy"].includes(new URL(request.url,"http://game.invalid").pathname))await checkpoint();
     for(const [name,value]of captured.headers)response.setHeader(name,value);
     response.writeHead(captured.statusCode);response.end(captured.body);
   }

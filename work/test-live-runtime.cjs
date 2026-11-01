@@ -55,12 +55,15 @@ const credentials=who=>({id:who.session.id,sessionKey:who.session.sessionKey});
     assert.equal(lost,true);assert.equal(JSON.stringify(payload),committed,"An obsolete server must not overwrite newer accounts or arena state");
     assert.equal((await request(first,owner,"/health")).status,503);
 
-    // Saves leave out skin pictures, and the food table is stored compressed.
-    const skin="data:image/png;base64,"+"A".repeat(20000);
-    await request(second,owner,"/api/state",{...credentials(owner),running:false,cells:[],skin});
-    assert.equal(second.engine.exportState().sessions.find(session=>session.id===owner.session.id).skin,skin,"The running server keeps the skin");
+    // Skins are shop skins (short names) saved with the coins in shop.json; uploaded pictures are ignored.
+    // A skin or coin change is saved but doesn't add a backup. The food table is stored compressed.
+    const upload="data:image/png;base64,"+"A".repeat(20000);
+    assert.equal((await request(second,owner,"/api/shop/equip",{...credentials(owner),skin:"wolf"})).status,200);
+    await request(second,owner,"/api/state",{...credentials(owner),running:false,cells:[],skin:upload});
+    assert.equal(second.engine.exportState().sessions.find(session=>session.id===owner.session.id).skin,"wolf","The server keeps the shop skin, not uploads");
     await second.checkpoint();
-    assert(arenaOf(payload).sessions.every(session=>session.skin===""&&session.skinVersion===0),"Saves must not carry skin pictures");
+    assert(!JSON.stringify(payload).includes("A".repeat(100)),"Saves never carry pictures");
+    assert.equal(JSON.parse(payload.files["shop.json"]).alpha.skin,"wolf","Coins and skins are saved with the accounts");
     assert(typeof arenaOf(payload).food.packed==="string"&&arenaOf(payload).food.packed.length<2000,"A fresh food table saves in under 2 KB");
     assert(typeof payload.packedArena==="string"&&payload.arena===undefined,"The live server saves the arena compressed");
     assert.equal(second.active,false,"A save clears the activity flag");
@@ -85,7 +88,7 @@ const credentials=who=>({id:who.session.id,sessionKey:who.session.sessionKey});
       assert.equal(saves,1,"One save after activity, then quiet again");
       pool.query=original;
     }finally{await third.close();}
-    console.log("PASS: live input bypasses the database, new accounts save before success, signing keys and owner cookies survive restart, old servers cannot overwrite a newer arena, saves skip skins and idle time, food saves compressed.");
+    console.log("PASS: live input bypasses the database, new accounts save before success, signing keys and owner cookies survive restart, old servers cannot overwrite a newer arena, shop skins and coins saved (no pictures, no extra backups), idle time skipped, food saves compressed.");
   }finally{
     await first?.close();await second?.close();
     for(const key of Object.keys(process.env))if(!(key in savedEnv))delete process.env[key];Object.assign(process.env,savedEnv);
