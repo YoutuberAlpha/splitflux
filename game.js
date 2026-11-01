@@ -753,11 +753,12 @@ function shareMassCorrection(cell, shares) {
   });
 }
 
-// Spike pop (rules in BlobPhysics.spikes): the piece keeps half its mass, the rest bursts out as an even ring
-// of shards. Returns false when there is no room for a shard: then the spike stays and nothing happens.
+// Spike pop (rules in BlobPhysics.spikes): the blob becomes 15 blobs of the same mass, one in the middle and an
+// even ring of 14 around it. Returns false only at the 64-piece safety limit: then the spike stays.
 function popPlayerCell(cell) {
   if (!cell.alive) return false;
-  const masses = BlobPhysics.spikes.popMasses(cell.mass, MAX_PLAYER_CELLS - playerCells.filter(c => c.alive).length);
+  // Always 15 blobs, even past the normal 16-piece limit (only the 64-piece safety limit counts here).
+  const masses = BlobPhysics.spikes.popMasses(cell.mass, BlobPhysics.spikes.maxPieces - playerCells.filter(c => c.alive).length);
   if (!masses.length) return false;
   const now = performance.now(), turn = Math.random() * Math.PI * 2, total = cell.mass;
   const parts = shareMassCorrection(cell, masses.map(mass => mass / total));
@@ -801,7 +802,7 @@ function popBotCell(bot) {
   return true;
 }
 
-// A spike pops the biggest piece hitting it. If that piece can't pop (no room to split), the spike stays.
+// A spike pops the biggest piece hitting it (at the 64-piece safety limit nothing pops and the spike stays).
 function handleViruses() {
   const now = performance.now();
   for (let virusIndex = viruses.length - 1; virusIndex >= 0; virusIndex--) {
@@ -1161,7 +1162,7 @@ function requestMainMenu(message) {
   showGameNotice(message, 1500);
 }
 
-function showGameNotice(text, milliseconds) {
+function showGameNotice(text, milliseconds, important = false) {
   let notice = document.querySelector("#gameNotice");
   if (!notice) {
     notice = document.createElement("div");
@@ -1171,6 +1172,8 @@ function showGameNotice(text, milliseconds) {
     document.body.append(notice);
   }
   notice.textContent = text;
+  notice.classList.toggle("important", Boolean(important));
+  notice.classList.remove("announcement");
   notice.classList.toggle("visible", Boolean(text && milliseconds));
   clearTimeout(showGameNotice.timer);
   if (milliseconds) showGameNotice.timer = setTimeout(() => notice.classList.remove("visible"), milliseconds);
@@ -1467,26 +1470,32 @@ function showModeration(cell) {
   document.querySelector("#moderationMessage").textContent=adminRole==="owner"||!onlineMode
     ?"Choose how long this player should be banned.":"Choose how long to ban this player from this server.";
   updateAdminRoleButton();
+  window.updateServerOwnerButton?.();
   document.querySelector("#moderationMenu").classList.remove("hidden");
 }
-// Players (not bots) can be made admin on this server, or have it taken away. The owner and host always stay admin.
+// Players (not bots) can be made admin, or have it taken away. On the main server that makes a real admin (admin on
+// every server); on a made server, an admin of that server. The owner and server owner always stay admin, and
+// a real admin can only lose it on the main server.
 function updateAdminRoleButton() {
   const button=document.querySelector("#toggleAdminRole"), target=selectedModerationTarget;
   button.hidden=!onlineMode||!target||!target.targetId;
   if (button.hidden) return;
-  button.disabled=target.role==="owner"||target.role==="host";
-  button.textContent=target.role==="owner"?"OWNER (ALWAYS ADMIN)":target.role==="host"?"HOST (ALWAYS ADMIN)":target.role==="admin"?"REMOVE ADMIN":"MAKE ADMIN";
+  const onMadeServer=window.onMadeServer?.()===true;
+  button.disabled=target.role==="owner"||target.role==="host"||(target.role==="admin"&&onMadeServer);
+  button.textContent=target.role==="owner"?"OWNER (ALWAYS ADMIN)":target.role==="host"?"SERVER OWNER (ALWAYS ADMIN)"
+    :target.role==="admin"?(onMadeServer?"ADMIN ON EVERY SERVER":"REMOVE ADMIN"):target.role==="serveradmin"?"REMOVE ADMIN":"MAKE ADMIN";
 }
 document.querySelector("#toggleAdminRole").addEventListener("click",async()=>{
   const target=selectedModerationTarget, message=document.querySelector("#moderationMessage"), button=document.querySelector("#toggleAdminRole");
   if (!isAdmin||!target?.targetId||button.disabled) return;
-  const makeAdmin=target.role!=="admin";
+  const makeAdmin=target.role!=="admin"&&target.role!=="serveradmin";
   button.disabled=true;
   try {
     const result=await window.promotePlayerOnline(target.targetId,makeAdmin);
-    target.role=result.admin?"admin":null;
+    target.role=result.role||null;
     for (const cell of remotePlayerCells) if (cell.remoteSessionId===target.targetId) cell.role=target.role;
-    message.textContent=result.admin?`${target.name} is now an admin on this server.`:`${target.name} is no longer an admin.`;
+    message.textContent=!result.admin?`${target.name} is no longer an admin.`
+      :result.role==="admin"?`${target.name} is now an admin on every server.`:`${target.name} is now an admin on this server.`;
   } catch(error) {message.textContent=error.message;} finally {button.disabled=false;updateAdminRoleButton();}
 });
 document.querySelector("#closeModeration").addEventListener("click",()=>document.querySelector("#moderationMenu").classList.add("hidden"));

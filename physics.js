@@ -56,18 +56,19 @@
   // One set of rules for players, bots, the game and the server, so a pop looks and counts the same everywhere.
   // - A piece pops a spike as soon as it hits it (overlaps the spike's edge) and is big enough (90+ mass).
   //   Smaller pieces slide under spikes.
-  // - A popped piece keeps half its mass in the middle; the other half bursts out as up to 7 equal shards in an
-  //   even ring. If there is no room for even one shard (16 pieces already), nothing pops and the spike stays.
-  const SPIKE_RADIUS = 42, POP_MASS = 90, MAX_SHARDS = 7, MIN_PIECE = 17.5;
+  // - A popped blob always turns into 15 blobs of the same mass: one stays in the middle and 14 burst out in an
+  //   even ring. This is an exception to the normal 16-piece limit; only a hard safety limit of 64 pieces
+  //   (so the game stays smooth) can make a pop smaller.
+  const SPIKE_RADIUS = 42, POP_MASS = 90, MAX_SHARDS = 14, MAX_PIECES = 64;
   function spikeCovered(cell, spike) {
     const size = Number(cell.radius) || radius(cell.mass), spikeSize = Number(spike.r) || SPIKE_RADIUS;
     return cell.mass >= POP_MASS && size > spikeSize && Math.hypot(cell.x - spike.x, cell.y - spike.y) < size + spikeSize * .65;
   }
-  // [mass the piece keeps, ...shard masses], or [] when it can't pop.
+  // [mass of the middle piece, ...shard masses] (all equal), or [] when it can't pop (no room left at all).
   function popMasses(mass, freeSlots) {
-    const shards = Math.min(MAX_SHARDS, Math.floor(freeSlots), Math.floor(mass / 2 / MIN_PIECE));
-    if (!(shards >= 1)) return [];
-    return [mass / 2, ...Array.from({ length: shards }, () => mass / 2 / shards)];
+    const shards = Math.min(MAX_SHARDS, Math.floor(freeSlots));
+    if (!(shards >= 1) || !(mass > 0)) return [];
+    return Array.from({ length: shards + 1 }, () => mass / (shards + 1));
   }
   // Where shard i of n starts and how fast it flies out: an even ring around the piece, turned by `turn`.
   function shardLaunch(parent, index, count, turn, keptRadius) {
@@ -75,7 +76,7 @@
     const dir = { x: Math.cos(angle), y: Math.sin(angle) };
     return { x: parent.x + dir.x * keptRadius, y: parent.y + dir.y * keptRadius, launchX: dir.x * 540, launchY: dir.y * 540 };
   }
-  const spikes = { radius: SPIKE_RADIUS, popMass: POP_MASS, maxShards: MAX_SHARDS, covered: spikeCovered, popMasses, shardLaunch };
+  const spikes = { radius: SPIKE_RADIUS, popMass: POP_MASS, maxShards: MAX_SHARDS, maxPieces: MAX_PIECES, covered: spikeCovered, popMasses, shardLaunch };
 
   return { radius, direction, moveBoost, moveFeed:feeding.move, createFeed:feeding.create, catchesFeed,
     feedCost:feeding.cost, feedValue:feeding.value, minFeedMass:feeding.minimumMass, feeding, food, spikes };

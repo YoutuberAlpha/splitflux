@@ -12,7 +12,8 @@ const JOIN_FAILURES_PER_10_MIN = 10;    // wrong passwords per browser
 const NAME_PATTERN = /^[\p{L}\p{N} _'!?.&#-]{3,24}$/u;
 
 function createRoomManager({main, loadEngine, now = () => Date.now(), tickMain = true}) {
-  const rooms = new Map();         // id -> {id, name, host, salt, passwordHash, createdAt, emptySince, engine}
+  const rooms = new Map();         // id -> {id, name, salt, passwordHash, createdAt, emptySince, engine}
+  const stopped = new Map();       // id -> when an admin stopped it (so its players are told why it's gone)
   const sessionRooms = new Map();  // player session id -> made server id
   const creations = new Map();     // host identity -> times a server was made (last hour)
   const joinFailures = new Map();  // browser -> times a wrong password was tried (last 10 minutes)
@@ -22,7 +23,11 @@ function createRoomManager({main, loadEngine, now = () => Date.now(), tickMain =
   const hash = (salt, password) => crypto.createHash("sha256").update(salt).update(String(password)).digest();
   // A private server hands out a "pass" after the right password, so a page refresh can rejoin without retyping it.
   const passFor = room => crypto.createHmac("sha256", secret).update(room.id + room.salt).digest("base64url");
-  const isHostOf = (room, deviceId, account) => room.host.username ? account?.username === room.host.username : room.host.deviceId === deviceId;
+  // The server owner can change (an admin can hand the server to someone else), so always ask the server itself.
+  const isHostOf = (room, deviceId, account) => {
+    const host = room.engine.roomHost();
+    return host.username ? account?.username === host.username : host.deviceId === deviceId;
+  };
   const recent = (map, key, windowMs) => (map.get(key) || []).filter(time => now() - time < windowMs);
 
   function sendJson(response, status, body) {
@@ -57,8 +62,8 @@ function createRoomManager({main, loadEngine, now = () => Date.now(), tickMain =
     const list = [{...main.serverInfo(), main: true, private: false, ...main.summary()}];
     for (const room of rooms.values()) {
       room.engine.cleanupSessions();
-      list.push({id: room.id, name: room.name, private: Boolean(room.passwordHash), host: room.host.username || "guest",
-        mine: isHostOf(room, deviceId, account), ...room.engine.summary()});
+      list.push({id: room.id, name: room.name, private: Boolean(room.passwordHash), host: room.engine.roomHost().username || "guest",
+        mine: isHostOf(room, deviceId, account), ...room.engine.summary(), people: room.engine.playerCount(), maxPlayers: room.engine.serverInfo().maxPlayers});
     }
     return {rooms: list, canCreate: rooms.size < MAX_SERVERS, max: MAX_SERVERS};
   }
@@ -83,13 +88,15 @@ function createRoomManager({main, loadEngine, now = () => Date.now(), tickMain =
     if (made.length >= CREATES_PER_HOUR) return sendJson(response, 429, {error: "You made a lot of servers this hour. Try again later."});
     creations.set(hostKey, [...made, now()]);
 
+    const maxPlayers = Math.round(Number(body.maxPlayers ?? 10));
+    if (!(maxPlayers >= 2 && maxPlayers <= 50)) return sendJson(response, 400, {error: "Choose 2-50 players."});
     const engine = loadEngine();
     engine.useShared(shared());
     const id = crypto.randomBytes(6).toString("base64url");
     const host = {username: account?.username || null, deviceId: account ? null : deviceId};
-    engine.configureRoom({id, name, host, bots: body.bots !== false});
+    engine.configureRoom({id, name, host, bots: body.bots !== false, maxPlayers});
     const salt = crypto.randomBytes(16).toString("hex");
-    const room = {id, name, host, salt, passwordHash: password ? hash(salt, password) : null, createdAt: now(), emptySince: now(), engine};
+    const room = {id, name, salt, passwordHash: password ? hash(salt, password) : null, createdAt: now(), emptySince: now(), engine};
     rooms.set(id, room);
     sendJson(response, 200, {room: {id, name, private: Boolean(password)}, pass: passFor(room)});
   }
@@ -100,8 +107,14 @@ function createRoomManager({main, loadEngine, now = () => Date.now(), tickMain =
     const roomId = String(body.room || "main");
     if (roomId === "main") return main.handleRequest({method: "GET", url: "/api/session", headers: request.headers}, response);
     const room = rooms.get(roomId);
+    if (!room && stopped.has(roomId)) return sendJson(response, 404, {error: "The server owner or an admin has stopped this server.", roomGone: true, stopped: true});
     if (!room) return sendJson(response, 404, {error: "That server has closed.", roomGone: true});
     const account = shared().accounts.fromRequest(request), {deviceId, headers} = withDevice(request, response);
+    // The player limit counts people (bots don't). The owner and the server owner can always get in.
+    const limit = room.engine.serverInfo().maxPlayers, people = room.engine.playerCount(deviceId);
+    if (people >= limit && !account?.isAdmin && !isHostOf(room, deviceId, account)) {
+      return sendJson(response, 503, {error: `This server is full (${people}/${limit} players).`, full: true});
+    }
     if (room.passwordHash && !account?.isAdmin && !isHostOf(room, deviceId, account)) {
       const pass = typeof body.pass === "string" ? body.pass : "";
       const passOk = pass.length > 0 && pass.length < 100 && crypto.timingSafeEqual(Buffer.from(pass.padEnd(64)), Buffer.from(passFor(room).padEnd(64)));
@@ -131,12 +144,36 @@ function createRoomManager({main, loadEngine, now = () => Date.now(), tickMain =
     response.end(answer);
   }
 
+  // STOP THIS SERVER (server owner or admin): everyone in it is sent back to the main server with a message.
+  async function stop(request, response) {
+    const body = await readJson(request);
+    const room = rooms.get(sessionRooms.get(String(body.id || "")));
+    if (!room) return sendJson(response, 404, {error: "You're not on a server you can stop."});
+    if (!room.engine.roleFor(body.id, body.sessionKey, request)) return sendJson(response, 403, {error: "Only the server owner or an admin can stop this server."});
+    rooms.delete(room.id);
+    stopped.set(room.id, now());
+    for (const [id, time] of stopped) if (now() - time > 3_600_000) stopped.delete(id);
+    sendJson(response, 200, {stopped: room.name});
+  }
+
+  // MAX PLAYERS (server owner or admin), any time. Lowering it doesn't kick anyone; it only stops new players.
+  async function setLimit(request, response) {
+    const body = await readJson(request);
+    const room = rooms.get(sessionRooms.get(String(body.id || "")));
+    if (!room) return sendJson(response, 404, {error: "The main server has no player limit to change."});
+    if (!room.engine.roleFor(body.id, body.sessionKey, request)) return sendJson(response, 403, {error: "Only the server owner or an admin can change this."});
+    try { sendJson(response, 200, {maxPlayers: room.engine.setRoomLimit(body.maxPlayers)}); }
+    catch (error) { sendJson(response, 400, {error: error.message}); }
+  }
+
   async function handle(request, response) {
     const url = new URL(request.url, "http://game.invalid");
     try {
       if (request.method === "GET" && url.pathname === "/api/rooms") return sendJson(response, 200, listing(request, response));
       if (request.method === "POST" && url.pathname === "/api/rooms/create") return await create(request, response);
       if (request.method === "POST" && url.pathname === "/api/session") return await join(request, response);
+      if (request.method === "POST" && url.pathname === "/api/rooms/stop") return await stop(request, response);
+      if (request.method === "POST" && url.pathname === "/api/rooms/limit") return await setLimit(request, response);
       let engine = main;
       if (request.method === "POST" && url.pathname.startsWith("/api/")) {
         request.body = await readJson(request);

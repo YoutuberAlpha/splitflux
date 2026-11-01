@@ -449,7 +449,7 @@
     bots.forEach(bot => smoothNetworkCell(bot, dt));
   }
 
-  const ROLE_LABELS = {owner: "OWNER", host: "HOST", admin: "ADMIN"};
+  const ROLE_LABELS = {owner: "OWNER", host: "SERVER OWNER", admin: "ADMIN", serveradmin: "ADMIN"};
   function updateAdminAccess() {
     isAdmin = Boolean(session && session.isAdmin);
     adminRole = isAdmin ? (session.adminRole || "admin") : null;
@@ -461,12 +461,13 @@
     adminShortcut.classList.toggle("inactive", !isAdmin || !running);
     if (!isAdmin) ui.admin.classList.add("hidden");
     const account = session && session.account;
-    const role = adminRole === "owner" ? "OWNER / ADMIN" : adminRole === "host" ? "HOST (ADMIN ON THIS SERVER)" : adminRole === "admin" ? "ADMIN ON THIS SERVER" : "PLAYER";
+    const role = adminRole === "owner" ? "OWNER / ADMIN" : adminRole === "host" ? "SERVER OWNER (ADMIN ON THIS SERVER)" : adminRole === "admin" ? "ADMIN (EVERY SERVER)" : adminRole === "serveradmin" ? "ADMIN ON THIS SERVER" : "PLAYER";
     document.querySelector("#adminUnlockStatus").textContent = account
       ? `Signed in as ${account.username} - ${role}` : `Playing as guest${adminRole ? ` - ${role}` : ""}. Sign in or create an account.`;
     document.querySelector("#accountLogout").hidden = !account;
     document.querySelector("#accountTools").hidden = !account;
     document.querySelector("#ownerReset").hidden = !(account && account.isAdmin);
+    updateServerAdmin();
     document.querySelector("#accountLogin").hidden = Boolean(account);
     document.querySelector("#accountRegister").hidden = Boolean(account);
     document.querySelector("#accountUsername").disabled = Boolean(account);
@@ -585,12 +586,18 @@
     } catch (error) {
       if (error.bannedUntil && currentServer.id === "main") { showBan(error.bannedUntil); session = null; return; }
       if (currentServer.id === "main" || error.full) throw error;
-      // That server closed, restarted, or can't be reached (backup mode only has the main server): back to main.
+      // That server was stopped, closed, restarted, or can't be reached (backup mode only has the main server):
+      // back to the main menu on the main server, with an announcement saying why.
       currentServer = MAIN_SERVER;
-      showGameNotice(error.roomGone ? "That server closed. You're back on the main server." : "You're back on the main server.", 5000);
-      return createSession();
+      if (error.stopped) {
+        if (running) returnToMainMenu();
+        showGameNotice("The server owner or an admin has stopped this server. You're back on the main server.", 9000, true);
+      } else showGameNotice(error.roomGone ? "That server closed. You're back on the main server." : "You're back on the main server.", 5000);
+      await createSession();
+      return {moved: error.stopped ? "stopped" : "closed"};
     }
     useSession(next, currentServer);
+    return {moved: null};
   }
 
   async function joinServer(server, password) {
@@ -602,7 +609,7 @@
   function useSession(next, server) {
     const changedServer = server.id !== currentServer.id;
     session = next;
-    currentServer = {id: server.id, name: next.server?.name || server.name, pass: next.pass || server.pass || null};
+    currentServer = {id: server.id, name: next.server?.name || server.name, pass: next.pass || server.pass || null, maxPlayers: next.server?.maxPlayers};
     rememberServer();
     if (changedServer || !lastWorld) {
       // A different server: forget everything about the old arena.
@@ -676,6 +683,7 @@
         ackTeams: teamsSig,
         ackSpikes: spikesSig,
         ackEjected: newestPelletSeq(),
+        ackAnnouncement: lastAnnouncementId,
       };
       if (networkSkin!==lastSentSkin) payload.skin=networkSkin;
       for (const cell of playerCells) cell._syncMassWeights = { [cell.netId]: 1 };
@@ -688,7 +696,9 @@
         // End the round cleanly instead of silently shrinking them back to a starting cell.
         const lostRound = running;
         // If the arena is full or waking up, wait 3 s before asking again instead of every update.
-        try { await createSession(); } catch (error) { lastSyncAt = performance.now() + 3000; throw error; }
+        let result;
+        try { result = await createSession(); } catch (error) { lastSyncAt = performance.now() + 3000; throw error; }
+        if (result?.moved === "stopped") return;
         if (lostRound && session) {
           returnToMainMenu();
           document.querySelector("#adminUnlockStatus").textContent = "Connection to the arena was lost, so that round ended. Deploy again to keep playing.";
@@ -736,8 +746,11 @@
       }
       botFollowTargets = new Map((snapshot.botControllers || []).map(entry => [entry.team, {x:entry.x,y:entry.y}]));
       if (!accountBusy && (session.isAdmin !== snapshot.isAdmin || (session.adminRole || null) !== (snapshot.adminRole || null) || JSON.stringify(session.account) !== JSON.stringify(snapshot.account))) {
-        if (snapshot.isAdmin && !session.isAdmin) showGameNotice("You are now an admin on this server. Press P for the admin panel.", 6000);
-        if (!snapshot.isAdmin && session.isAdmin) showGameNotice("You are no longer an admin on this server.", 5000);
+        const before = session.adminRole || null, after = snapshot.adminRole || null;
+        if (after === "host" && before !== "host") showGameNotice("You are now the server owner. Press P for the admin panel (you can stop the server or change its player limit).", 7000);
+        else if (before === "host" && after === "admin") showGameNotice("You are no longer the server owner, but you are still an admin here.", 6000);
+        else if (snapshot.isAdmin && !session.isAdmin) showGameNotice("You are now an admin on this server. Press P for the admin panel.", 6000);
+        else if (!snapshot.isAdmin && session.isAdmin) showGameNotice("You are no longer an admin on this server.", 5000);
         session.isAdmin = snapshot.isAdmin;
         session.adminRole = snapshot.adminRole || null;
         session.account = snapshot.account;
@@ -761,6 +774,17 @@
         returnToMainMenu();
       }
       lastPlayerCount = snapshot.playerCount || 1;
+      // An announcement from the owner or a real admin: shown big on everyone's screen, once.
+      if (snapshot.announcement && snapshot.announcement.id !== lastAnnouncementId) {
+        lastAnnouncementId = snapshot.announcement.id;
+        showGameNotice(`ANNOUNCEMENT FROM ${String(snapshot.announcement.from).toUpperCase()}: ${snapshot.announcement.text}`, 10000, true);
+        document.querySelector("#gameNotice")?.classList.add("announcement");
+      }
+      // Another admin may have changed this server's player limit.
+      if (snapshot.server && snapshot.server.id === currentServer.id && snapshot.server.maxPlayers !== currentServer.maxPlayers) {
+        currentServer.maxPlayers = snapshot.server.maxPlayers;
+        updateServerAdmin();
+      }
       if (hasPlayerCorrection) applyOwnCells(snapshot.self && snapshot.self.cells, payload.cells);
       applyRemotePlayers(snapshot.players);
       applyWorld(snapshot.world || lastWorld, hasBotCorrection, isAdmin && worldSize !== sentMapSize);
@@ -921,8 +945,8 @@
       for (const tag of [room.private && "PRIVATE", room.mine && "YOURS"].filter(Boolean)) {
         const badge = document.createElement("span"); badge.className = "tag"; badge.textContent = tag; name.append(badge);
       }
-      const people = `${room.players} playing`;
-      meta.textContent = [room.main ? "the main arena" : `host ${room.host}`, people, room.bots ? "bots" : "no bots"].join(" · ");
+      const people = room.main ? `${room.players} playing` : `${room.people}/${room.maxPlayers} players`;
+      meta.textContent = [room.main ? "the main arena" : `owner ${room.host}`, people, room.bots ? "bots" : "no bots"].join(" · ");
       info.append(name, meta);
       const join = document.createElement("button");
       join.type = "button";
@@ -980,7 +1004,7 @@
     try {
       const response = await fetch("/api/rooms/create", {method: "POST", cache: "no-store", headers: {"Content-Type": "application/json"},
         body: JSON.stringify({name: document.querySelector("#newServerName").value, password: document.querySelector("#newServerPassword").value,
-          bots: document.querySelector("#newServerBots").checked})});
+          bots: document.querySelector("#newServerBots").checked, maxPlayers: Number(document.querySelector("#newServerLimit").value)})});
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || "Couldn't make the server.");
       document.querySelector("#newServerPassword").value = "";
@@ -994,6 +1018,96 @@
       button.disabled = false;
     }
   }
+
+  // ---- Admin panel: ANNOUNCEMENT (owner and real admins only) ----
+  let lastAnnouncementId = null;
+  window.onMadeServer = () => currentServer.id !== "main";
+  async function sendAnnouncement() {
+    const box = document.querySelector("#announceText"), button = document.querySelector("#sendAnnouncement");
+    if (!box.value.trim() || button.disabled) return;
+    button.disabled = true;
+    try {
+      await serverCommand("/api/admin/announce", {text: box.value});
+      box.value = "";
+    } catch (error) { showArenaError(error); }
+    finally { button.disabled = false; }
+  }
+  document.querySelector("#sendAnnouncement").addEventListener("click", sendAnnouncement);
+  document.querySelector("#announceText").addEventListener("keydown", event => {
+    if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendAnnouncement(); }
+  });
+
+  // ---- Admin panel: THIS SERVER (made servers only) ----
+  function updateServerAdmin() {
+    document.querySelector("#announceBox").hidden = !(adminRole === "owner" || adminRole === "admin");
+    const box = document.querySelector("#serverAdmin");
+    box.hidden = !(isAdmin && currentServer.id !== "main");
+    const input = document.querySelector("#serverLimitInput");
+    if (currentServer.maxPlayers && document.activeElement !== input) input.value = currentServer.maxPlayers;
+  }
+
+  async function serverCommand(route, fields) {
+    if (!session) throw new Error("Not connected yet.");
+    const response = await fetch(route, {method: "POST", cache: "no-store", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({id: session.id, sessionKey: session.sessionKey, ...fields})});
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.error || "That didn't work.");
+    return result;
+  }
+
+  async function applyServerLimit() {
+    const value = Number(document.querySelector("#serverLimitInput").value);
+    try {
+      const result = await serverCommand("/api/rooms/limit", {maxPlayers: value});
+      currentServer.maxPlayers = result.maxPlayers;
+      rememberServer();
+      showGameNotice(`Max players is now ${result.maxPlayers}. Nobody already here is removed.`, 4000);
+    } catch (error) { showArenaError(error); }
+  }
+
+  // Two clicks so nobody stops a server by accident.
+  let stopArmedUntil = 0;
+  async function stopServer() {
+    const button = document.querySelector("#stopServer");
+    if (performance.now() > stopArmedUntil) {
+      stopArmedUntil = performance.now() + 3000;
+      button.textContent = "CLICK AGAIN TO STOP THE SERVER";
+      setTimeout(() => { if (performance.now() > stopArmedUntil) button.textContent = "STOP THIS SERVER"; }, 3100);
+      return;
+    }
+    stopArmedUntil = 0;
+    button.textContent = "STOP THIS SERVER";
+    try {
+      await serverCommand("/api/rooms/stop", {});
+      // Everyone (this player too) is sent back to the main server with the announcement.
+      lastSyncAt = -Infinity;
+    } catch (error) { showArenaError(error); }
+  }
+
+  // MAKE SERVER OWNER in the player menu: only on made servers, for a player who isn't the server owner yet.
+  window.updateServerOwnerButton = () => {
+    const button = document.querySelector("#makeServerOwner"), target = selectedModerationTarget;
+    button.hidden = !(isAdmin && currentServer.id !== "main" && target && target.targetId);
+    if (button.hidden) return;
+    button.disabled = target.role === "host";
+    button.textContent = target.role === "host" ? "ALREADY THE SERVER OWNER" : "MAKE SERVER OWNER";
+  };
+  document.querySelector("#makeServerOwner").addEventListener("click", async () => {
+    const target = selectedModerationTarget, button = document.querySelector("#makeServerOwner"), message = document.querySelector("#moderationMessage");
+    if (!isAdmin || !target?.targetId || button.disabled) return;
+    button.disabled = true;
+    try {
+      await adminCommand("promote", {targetId: target.targetId, host: true});
+      target.role = "host";
+      for (const cell of remotePlayerCells) if (cell.remoteSessionId === target.targetId) cell.role = "host";
+      message.textContent = `${target.name} is now the server owner.`;
+    } catch (error) { message.textContent = error.message; }
+    finally { window.updateServerOwnerButton(); updateAdminRoleButton(); }
+  });
+
+  document.querySelector("#applyServerLimit").addEventListener("click", applyServerLimit);
+  document.querySelector("#serverLimitInput").addEventListener("keydown", event => { if (event.key === "Enter") { event.preventDefault(); applyServerLimit(); } });
+  document.querySelector("#stopServer").addEventListener("click", stopServer);
 
   document.querySelector("#tabPlay").addEventListener("click", () => showMenuTab("play"));
   document.querySelector("#tabServers").addEventListener("click", () => showMenuTab("servers"));

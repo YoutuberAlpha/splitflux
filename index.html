@@ -55,6 +55,7 @@
             <input id="newServerName" maxlength="24" autocomplete="off" placeholder="Server name" />
             <input id="newServerPassword" type="password" maxlength="64" autocomplete="new-password" placeholder="Password (optional, makes it private)" />
             <label class="check-field"><input id="newServerBots" type="checkbox" checked /> Add bots</label>
+            <label class="check-field">Max players <input id="newServerLimit" type="number" min="2" max="50" step="1" value="10" /></label>
             <button id="createServer" type="button">CREATE SERVER</button>
             <p class="server-note">You get the admin panel in your server. It closes after 10 minutes with no players in it (bots don't count).</p>
           </details>
@@ -154,6 +155,7 @@
       <select id="banUnit"><option value="1000">Seconds</option><option value="60000" selected>Minutes</option><option value="3600000">Hours</option><option value="86400000">Days</option><option value="forever">Forever</option></select>
       <button id="confirmBan" type="button">BAN PLAYER</button>
       <button id="toggleAdminRole" type="button" hidden>MAKE ADMIN</button>
+      <button id="makeServerOwner" type="button" hidden>MAKE SERVER OWNER</button>
       <p id="moderationMessage"></p>
     </section>
     <section id="adminPanel" class="admin-panel hidden">
@@ -165,6 +167,11 @@
         </div>
       </div>
       <div id="adminControls" class="admin-controls">
+        <div id="announceBox" class="server-admin announce-box" hidden>
+          <p>ANNOUNCEMENT</p>
+          <textarea id="announceText" maxlength="200" rows="2" placeholder="Type a message for every player on every server"></textarea>
+          <button id="sendAnnouncement" type="button">SEND TO EVERY PLAYER</button>
+        </div>
         <p>Multiply your current mass and score.</p>
         <label class="admin-speed">
           <span>PLAYER SPEED</span>
@@ -193,6 +200,15 @@
         <button id="removeBots" class="admin-danger">REMOVE ALL BOTS <span id="removeBotsState">OFF</span></button>
         <button id="spikePainter" type="button">SPIKE PAINTER: OFF</button>
         <p>Turn on the painter, then click or drag on the map. Team bot: hold T to feed, press 1 to split.</p>
+        <div id="serverAdmin" class="server-admin" hidden>
+          <p>THIS SERVER</p>
+          <label class="admin-speed">
+            <span>MAX PLAYERS</span>
+            <input id="serverLimitInput" type="number" min="2" max="50" step="1" value="10" />
+            <button id="applyServerLimit" type="button">SET LIMIT</button>
+          </label>
+          <button id="stopServer" class="admin-danger" type="button">STOP THIS SERVER</button>
+        </div>
         <button id="killEveryone" class="admin-danger">KILL EVERYONE</button>
         <div class="admin-shortcuts">
           <b>KEYBOARD SHORTCUTS</b>

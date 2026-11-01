@@ -30,9 +30,15 @@ let ownerId = null;
 // Who is what:  owner = the alpha account (everything, on every server, bans everywhere)
 //               host  = whoever made this server        admin = promoted by an admin on this server
 // Bans by hosts and admins only remove the player from this server.
-let roomConfig = null;     // {id, name, host: {username, deviceId}}
+let roomConfig = null;     // {id, name, host: {username, deviceId}, maxPlayers}
+const ROLE_NAMES = { owner: "owner", host: "server owner", admin: "admin", serveradmin: "admin" };
 let promotedAdmins = [];   // "account:name" / "device:id" of players made admin on this server
 let serverBans = {};       // identity -> banned until (this server only)
+// "Real" admins are the ones made on the MAIN server: they are admins on every server and can send announcements.
+// A made server reads them from the main server (see useShared); on the main server they are its own admins.
+let globalAdmins = () => promotedAdmins;
+// One announcement board for every server: the newest announcement, shown to every player once.
+let announcer = { latest: null };
 let world = null;
 // Shared food: one seed for the arena plus how many times each slot was eaten (0-255).
 // Positions come from BlobPhysics.food.at(), so only these small numbers are stored and sent.
@@ -65,6 +71,8 @@ const SPAWN_PROTECTION_MS = 5000;
 // Food is dense, so a new cell (28 mass) can eat a little before its first update reaches the server.
 const SPAWN_MASS_LIMIT = 50;
 const MAX_PLAYER_CELLS = 16;
+// A spike pop is the one exception: it makes 15 blobs even past 16 pieces, up to 64 in total.
+const POP_EXTRA_PIECES = BlobPhysics.spikes.maxShards, MAX_PIECES_WITH_POPS = BlobPhysics.spikes.maxPieces;
 const PLAYER_BASE_SPEED = 235;
 // The smallest piece the rules can make is a spike burst (90 mass into 7 = ~12.9).
 // Speed is never computed below this, so made-up tiny pieces cannot zip across the map.
@@ -550,11 +558,13 @@ function isHost(deviceId, account) {
   return host.username ? account?.username === host.username : deviceId === host.deviceId;
 }
 
-// "owner", "host", "admin" or null for a player (by browser and account).
+// "owner", "host", "admin" (real admin, everywhere), "serveradmin" (admin on this made server only) or null.
 function adminRole(deviceId, account) {
   if (account?.isAdmin) return "owner";
   if (isHost(deviceId, account)) return "host";
-  if (identitiesOf(deviceId, account).some(identity => promotedAdmins.includes(identity))) return "admin";
+  const identities = identitiesOf(deviceId, account);
+  if (identities.some(identity => globalAdmins().includes(identity))) return "admin";
+  if (roomConfig && identities.some(identity => promotedAdmins.includes(identity))) return "serveradmin";
   return null;
 }
 
@@ -727,7 +737,7 @@ function simulateSharedEjected(dt) {
   return changed;
 }
 
-// A bot popped by a spike: like a player, it keeps half its mass and the rest bursts out as an even ring of shards.
+// A bot popped by a spike: like a player, it becomes equal pieces (up to 15, within the bot's own piece limit).
 function popServerBot(bot) {
   const team = bot.botTeam || bot.name;
   const teamPieces = world.bots.filter(other => other.alive && (other.botTeam || other.name) === team).length;
@@ -1192,16 +1202,22 @@ function validateClientCells(session, previousCells, cells, rawCells, spawning, 
     entries.push({ cell, ref, isNew });
   }
 
-  if (entries.length > MAX_PLAYER_CELLS) {
+  // Piece limit: 16, or more only from spike pops (+14 each, up to 64). Pieces kept from earlier pops stay until
+  // they merge. The claimed pops are checked further down; pieces from a pop that doesn't check out are removed.
+  const baseLimit = Math.max(MAX_PLAYER_CELLS, Math.min(MAX_PIECES_WITH_POPS, previous.size));
+  const popLimit = popped => Math.min(MAX_PIECES_WITH_POPS, baseLimit + POP_EXTRA_PIECES * popped);
+  function trimPieces(limit) {
+    if (entries.length <= limit) return;
     // Keep existing pieces first, then the biggest new ones. Extra mass goes back to the
     // largest kept piece so an old client that over-splits does not lose size.
     entries.sort((a, b) => (a.isNew - b.isNew) || (b.cell.mass - a.cell.mass));
-    const dropped = entries.splice(MAX_PLAYER_CELLS);
+    const dropped = entries.splice(limit);
     const extra = dropped.reduce((sum, entry) => sum + entry.cell.mass, 0);
     const largest = entries.reduce((best, entry) => entry.cell.mass > best.cell.mass ? entry : best, entries[0]);
     largest.cell.mass += extra;
     corrected = true;
   }
+  trimPieces(popLimit(Math.min(16, Array.isArray(rawPops) ? rawPops.length : 0)));
 
   const grace = now < (Number(session.positionGraceUntil) || 0);
   const severalPieces = entries.length > 1 || previous.size > 1;
@@ -1271,7 +1287,7 @@ function validateClientCells(session, previousCells, cells, rawCells, spawning, 
   // (Being eaten, eating others and feeding are applied by the server itself.)
   const paths = entries.flatMap(entry => entry.paths);
   const earned = claimFood(paths, rawClaims, rejectedFood);
-  popSpikes(paths, rawPops, splitParents);
+  trimPieces(popLimit(popSpikes(paths, rawPops, splitParents)));
   const kept = entries.map(entry => entry.cell);
   const previousTotal = [...previous.values()].reduce((sum, cell) => sum + cell.mass, 0);
   const total = kept.reduce((sum, cell) => sum + cell.mass, 0);
@@ -1742,14 +1758,28 @@ const handleRequest = async (request, response) => {
         const target = sessions.get(String(body.targetId || ""));
         if (!target) { sendJson(response, 404, { error: "Player is no longer in the arena." }); return; }
         const targetRole = adminRole(target.deviceId, target.account);
-        if (targetRole === "owner" || targetRole === "host") { sendJson(response, 403, { error: `The ${targetRole} is always an admin.` }); return; }
+        if (body.host === true) {
+          // Hand this made server to another player. They become its server owner; the old one stays an admin.
+          if (!roomConfig) { sendJson(response, 400, { error: "The main server has no server owner." }); return; }
+          if (targetRole === "host") { sendJson(response, 400, { error: `${target.name} already owns this server.` }); return; }
+          const old = roomConfig.host;
+          const oldIdentity = old.username ? `account:${old.username}` : `device:${old.deviceId}`;
+          roomConfig.host = target.account ? { username: target.account.username, deviceId: null } : { username: null, deviceId: target.deviceId };
+          const identities = identitiesOf(target.deviceId, target.account);
+          promotedAdmins = [...promotedAdmins.filter(identity => !identities.includes(identity) && identity !== oldIdentity), oldIdentity].slice(-100);
+          for (const session of sessions.values()) session.isAdmin = Boolean(adminRole(session.deviceId, session.account));
+          sendJson(response, 200, { host: true, admin: true, name: target.name });
+          return;
+        }
+        if (targetRole === "owner" || targetRole === "host") { sendJson(response, 403, { error: `The ${ROLE_NAMES[targetRole]} is always an admin.` }); return; }
+        if (roomConfig && targetRole === "admin") { sendJson(response, 403, { error: `${target.name} is an admin on every server. That can only be changed on the main server.` }); return; }
         const identities = identitiesOf(target.deviceId, target.account);
         promotedAdmins = promotedAdmins.filter(identity => !identities.includes(identity));
         if (body.admin === true) promotedAdmins.push(target.account ? `account:${target.account.username}` : `device:${target.deviceId}`);
         promotedAdmins = promotedAdmins.slice(-100);
         target.isAdmin = Boolean(adminRole(target.deviceId, target.account));
         if (!target.isAdmin) target.immune = false;
-        sendJson(response, 200, { admin: target.isAdmin, name: target.name });
+        sendJson(response, 200, { admin: target.isAdmin, role: adminRole(target.deviceId, target.account), name: target.name });
       } else if (url.pathname.endsWith("/ban")) {
         const target = sessions.get(String(body.targetId || ""));
         const team = typeof body.botTeam === "string" ? body.botTeam : null;
@@ -1758,7 +1788,7 @@ const handleRequest = async (request, response) => {
         if (target) {
           const targetRole = adminRole(target.deviceId, target.account);
           if (target.id === admin.id || target.deviceId === admin.deviceId) { sendJson(response, 403, { error: "You can't ban yourself." }); return; }
-          if (targetRole === "owner" || (targetRole === "host" && role !== "owner")) { sendJson(response, 403, { error: `The ${targetRole} cannot be banned.` }); return; }
+          if (targetRole === "owner" || (targetRole === "host" && role !== "owner")) { sendJson(response, 403, { error: `The ${ROLE_NAMES[targetRole]} cannot be banned.` }); return; }
           const until = ban(identitiesOf(target.deviceId, target.account), body.durationMs);
           for (const session of sessions.values()) if (playerBanUntil(session)) stopBannedPlayer(session);
           sendJson(response, 200, { bannedUntil: until });
@@ -1780,6 +1810,23 @@ const handleRequest = async (request, response) => {
         sendJson(response, 200, {added,viruses:world.viruses});
       }
     } catch (error) { sendJson(response, 400, {error:error.message}); }
+    return;
+  }
+
+  // ANNOUNCEMENT: the owner and real admins (not server owners) send a message to every player on every server.
+  if (request.method === "POST" && url.pathname === "/api/admin/announce") {
+    try {
+      const body = await readBody(request);
+      const admin = sessions.get(String(body.id || ""));
+      const role = admin && admin.sessionKey === body.sessionKey ? adminRole(admin.deviceId, accounts.fromRequest(request)) : null;
+      if (role !== "owner" && role !== "admin") { sendJson(response, 403, { error: "Only the owner and real admins can send announcements." }); return; }
+      const text = String(body.text ?? "").replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
+      if (!text || text.length > 200) { sendJson(response, 400, { error: "Write 1-200 characters." }); return; }
+      if (Date.now() - (Number(admin.lastAnnouncedAt) || 0) < 5000) { sendJson(response, 429, { error: "Wait a few seconds between announcements." }); return; }
+      admin.lastAnnouncedAt = Date.now();
+      announcer.latest = { id: crypto.randomBytes(6).toString("base64url"), text, from: admin.account?.username || admin.name || "ADMIN", at: Date.now() };
+      sendJson(response, 200, { sent: true });
+    } catch { sendJson(response, 400, { error: "Invalid announcement" }); }
     return;
   }
 
@@ -1910,6 +1957,9 @@ const handleRequest = async (request, response) => {
         food: foodSyncFor(body, rejectedFood),
         players,
         playerCount: Math.max(1, activeCount),
+        server: serverInfo(),
+        // The newest announcement (for one minute), until this player's game says it has shown it.
+        announcement: announcer.latest && announcer.latest.id !== body.ackAnnouncement && Date.now() - announcer.latest.at < 60_000 ? announcer.latest : undefined,
         world: compact && world ? worldView(body, session) : world,
         worldRevision,
         botRevision,
@@ -1980,24 +2030,45 @@ function enableRealtime(target=server,dispatch=handleRequest,getSession=id=>sess
 
 // ---- Used by the server list (rooms.cjs) ----
 function serverInfo() {
-  return roomConfig ? { id: roomConfig.id, name: roomConfig.name } : { id: "main", name: "MAIN SERVER" };
+  return roomConfig ? { id: roomConfig.id, name: roomConfig.name, maxPlayers: roomConfig.maxPlayers } : { id: "main", name: "MAIN SERVER" };
 }
-// A made server: its name and host, and whether it starts with bots.
+// How many players a made server allows (the server owner and admins can change it at any time).
+const MIN_ROOM_PLAYERS = 2, MAX_ROOM_PLAYERS = 50;
+function setRoomLimit(value) {
+  const limit = Math.round(Number(value));
+  if (!roomConfig || !Number.isFinite(limit) || limit < MIN_ROOM_PLAYERS || limit > MAX_ROOM_PLAYERS) throw new Error(`Choose ${MIN_ROOM_PLAYERS}-${MAX_ROOM_PLAYERS} players.`);
+  roomConfig.maxPlayers = limit;
+  return limit;
+}
+// A made server: its name, host and player limit, and whether it starts with bots.
 function configureRoom(config) {
-  roomConfig = { id: String(config.id), name: String(config.name), host: { username: config.host?.username || null, deviceId: config.host?.deviceId || null } };
+  roomConfig = { id: String(config.id), name: String(config.name), host: { username: config.host?.username || null, deviceId: config.host?.deviceId || null }, maxPlayers: 10 };
+  if (config.maxPlayers !== undefined) setRoomLimit(config.maxPlayers);
   if (config.bots === false) { world.botsOff = true; world.bots = []; botRevision++; }
+}
+// People in this server (one per browser; bots never count). `except` leaves out a browser that is rejoining.
+function playerCount(except) {
+  return new Set([...sessions.values()].map(session => session.deviceId).filter(device => device !== except)).size;
+}
+// The admin role of a request's player on this server (checks the session key and the login cookie), or null.
+function roleFor(sessionId, sessionKey, request) {
+  const session = sessions.get(String(sessionId || ""));
+  if (!session || session.sessionKey !== sessionKey) return null;
+  return adminRole(session.deviceId, accounts.fromRequest(request));
 }
 function summary() {
   const list = [...sessions.values()];
   return { players: list.filter(session => session.running).length, connected: list.length, bots: !world.botsOff };
 }
-function shared() { return { accounts, moderation, signInGuard, realtime }; }
+function shared() { return { accounts, moderation, signInGuard, realtime, globalAdmins, announcer }; }
 // A made server uses the main server's accounts, bans, sign-in limits and live connection.
 function useShared(parts) {
   if (parts.accounts) accounts = parts.accounts;
   if (parts.moderation) moderation = parts.moderation;
   if (parts.signInGuard) signInGuard = parts.signInGuard;
   if (parts.realtime !== undefined) realtime = parts.realtime;
+  if (parts.globalAdmins) globalAdmins = parts.globalAdmins;
+  if (parts.announcer) announcer = parts.announcer;
 }
 if (!cloudMode) server.listen(port, "0.0.0.0", () => {
   const addresses = [];
@@ -2022,7 +2093,7 @@ if (!cloudMode) server.listen(port, "0.0.0.0", () => {
 
 function exportState() {
   return {world,food:exportFoodState(),signInGuard,worldRevision,botRevision,botMassRevision,serverBotCounter,ejectedSeq,serverFallbackActive,
-    botRespawnBlockedUntil,targetBotTeams,botPieceCap,lastFallbackTick,ownerId,promotedAdmins,serverBans,
+    botRespawnBlockedUntil,targetBotTeams,botPieceCap,lastFallbackTick,ownerId,promotedAdmins,serverBans,announcement:announcer.latest,
     sessions:[...sessions.values()].map(session=>({...session,feedIds:[...session.feedIds],
       botActionIds:[...session.botActionIds],teamedBots:[...session.teamedBots]}))};
 }
@@ -2037,11 +2108,13 @@ function importState(state) {
   lastFallbackTick=state.lastFallbackTick||Date.now();ownerId=state.ownerId||null;sessions.clear();
   promotedAdmins=Array.isArray(state.promotedAdmins)?state.promotedAdmins.filter(identity=>typeof identity==="string").slice(-100):[];
   serverBans=state.serverBans&&typeof state.serverBans==="object"?{...state.serverBans}:{};
+  announcer.latest=state.announcement&&typeof state.announcement.text==="string"?state.announcement:null;
   for (const session of state.sessions) sessions.set(session.id,{...session,feedIds:new Set(session.feedIds),
     botActionIds:new Set(session.botActionIds),teamedBots:new Set(session.teamedBots)});
 }
 module.exports = { server, handleRequest, advanceArena, exportState, importState, enableRealtime,
-  getSession: id => sessions.get(id), serverInfo, configureRoom, summary, shared, useShared, cleanupSessions };
+  getSession: id => sessions.get(id), serverInfo, configureRoom, summary, shared, useShared, cleanupSessions,
+  roomHost: () => roomConfig?.host || null, setRoomLimit, playerCount, roleFor };
 
 // Running on a PC (node server.cjs, localhost:1000): the main server plus servers players make, just like the
 // live server. Made servers run in their own copy of this engine; this copy keeps its own 40 ms timer.

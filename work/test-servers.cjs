@@ -1,6 +1,7 @@
 // Servers: anyone can make a server (name, optional password, bots or not). Each server is its own arena; its host
 // gets the admin panel there, admins can make other players admins, their bans only cover their server, and
 // REMOVE ALL BOTS is a switch on every server (main included). Servers close after 10 minutes without players.
+// Made servers have a player limit, can be handed to a new server owner, and can be stopped by their admins.
 const assert = require("assert/strict"), fs = require("fs"), os = require("os"), path = require("path");
 const {createEngine, captureResponse, arenaOf} = require("../cloud-runtime.cjs");
 const {createLiveRuntime} = require("../live-runtime.cjs");
@@ -73,7 +74,7 @@ function browser(runtime) {
     assert.equal((await alice.call("/api/rooms/create", {name: "x"})).status, 400, "Names need 3+ characters");
     assert.equal((await alice.call("/api/rooms/create", {name: "main server"})).status, 409, "The main server's name is taken");
     assert.equal((await alice.call("/api/rooms/create", {name: "Alice's Room", password: "abc"})).status, 400, "Passwords need 4+ characters");
-    const made = await alice.call("/api/rooms/create", {name: "Alice's Room", password: "secret-pw", bots: false});
+    let made = await alice.call("/api/rooms/create", {name: "Alice's Room", password: "secret-pw", bots: false});
     assert.equal(made.status, 200); assert.equal(made.body.room.private, true);
     const roomId = made.body.room.id;
     assert.equal((await bob.call("/api/rooms/create", {name: "alice's room"})).status, 409, "Two servers can't share a name");
@@ -117,7 +118,7 @@ function browser(runtime) {
     let promoted = await alice.post("/api/admin/promote", {targetId: bob.session.id, admin: true});
     assert.equal(promoted.status, 200); assert.equal(promoted.body.admin, true);
     bobView = await bob.state();
-    assert.equal(bobView.body.isAdmin, true); assert.equal(bobView.body.adminRole, "admin");
+    assert.equal(bobView.body.isAdmin, true); assert.equal(bobView.body.adminRole, "serveradmin", "An admin of this server only");
     assert.equal((await bob.post("/api/admin/promote", {targetId: alice.session.id, admin: false})).status, 403, "The host always stays admin");
 
     // Admins flip the REMOVE ALL BOTS switch: off brings bots, on removes them and keeps them away.
@@ -160,6 +161,30 @@ function browser(runtime) {
     assert(arenaOf(payload).promotedAdmins.length === 1, "Main server admins are saved right away");
     assert.equal((await carol.post("/api/admin/ban", {targetId: owner.session.id, durationMs: 60_000})).status, 403, "Nobody can ban the owner");
 
+    // Carol was made admin on the MAIN server, so she is a real admin: an admin on every server.
+    assert.equal((await carol.join(roomId, {password: "secret-pw"})).status, 200);
+    assert.equal(carol.session.adminRole, "admin", "A real admin is an admin on made servers too");
+    assert.equal((await alice.post("/api/admin/promote", {targetId: carol.session.id, admin: false})).status, 403, "A server owner can't take that away");
+    // Admins made inside a made server only count there.
+    const ivan = browser(runtime); ivan.name = "IVAN";
+    await ivan.join(roomId, {password: "secret-pw"}); await ivan.state();
+    assert.equal((await alice.post("/api/admin/promote", {targetId: ivan.session.id, admin: true})).body.role, "serveradmin");
+    assert.equal((await ivan.state()).body.adminRole, "serveradmin");
+
+    // ANNOUNCEMENTS: only the owner and real admins, to every player on every server.
+    assert.equal((await alice.post("/api/admin/announce", {text: "hi"})).status, 403, "Server owners can't send announcements");
+    assert.equal((await ivan.post("/api/admin/announce", {text: "hi"})).status, 403, "Server-only admins can't either");
+    assert.equal((await bob.post("/api/admin/announce", {text: "hi"})).status, 403, "Players can't");
+    assert.equal((await carol.post("/api/admin/announce", {text: "   "})).status, 400, "An empty announcement is refused");
+    assert.equal((await carol.post("/api/admin/announce", {text: "x".repeat(201)})).status, 400, "200 characters at most");
+    assert.equal((await carol.post("/api/admin/announce", {text: "Game night starts in 5 minutes!"})).status, 200);
+    assert.equal((await carol.post("/api/admin/announce", {text: "again"})).status, 429, "A few seconds between announcements");
+    const heardInRoom = (await ivan.state()).body.announcement, heardOnMain = (await owner.state()).body.announcement;
+    assert.equal(heardInRoom?.text, "Game night starts in 5 minutes!", "Players on made servers get it");
+    assert.equal(heardOnMain?.text, "Game night starts in 5 minutes!", "Players on the main server get it");
+    assert.equal((await owner.state({ackAnnouncement: heardOnMain.id})).body.announcement, undefined, "Shown once per player");
+    assert.equal((await owner.post("/api/admin/announce", {text: "From the owner"})).status, 200, "The owner can announce");
+
     // The owner gets into private servers without the password.
     assert.equal((await owner.join(roomId)).status, 200);
     assert.equal(owner.session.adminRole, "owner");
@@ -181,7 +206,53 @@ function browser(runtime) {
     joined = await bob.join(roomId, {pass});
     assert.equal(joined.status, 404); assert.equal(joined.body.roomGone, true, "Joining a closed server says it closed");
 
-    console.log("PASS: make servers (name, optional password, bots or not), separate arenas, host gets admin, admins make admins, server-only bans, REMOVE ALL BOTS switch on main and made servers, owner powers everywhere, servers close after 10 minutes without players (bots don't count).");
+    // Player limit: set when making the server, changed by its server owner or admins at any time.
+    const erin = browser(runtime), finn = browser(runtime), gail = browser(runtime), hank = browser(runtime);
+    erin.name = "ERIN"; finn.name = "FINN"; gail.name = "GAIL"; hank.name = "HANK";
+    assert.equal((await erin.call("/api/rooms/create", {name: "Tiny Room", maxPlayers: 1})).status, 400, "At least 2 players");
+    made = await erin.call("/api/rooms/create", {name: "Tiny Room", maxPlayers: 2, bots: false});
+    assert.equal(made.status, 200);
+    const tinyId = made.body.room.id;
+    assert.equal((await erin.join(tinyId)).status, 200); await erin.state();
+    assert.equal(erin.session.server.maxPlayers, 2);
+    assert.equal((await finn.join(tinyId)).status, 200); await finn.state();
+    let tiny = (await gail.call("/api/rooms")).body.rooms.find(room => room.id === tinyId);
+    assert.equal(tiny.people, 2); assert.equal(tiny.maxPlayers, 2);
+    joined = await gail.join(tinyId);
+    assert.equal(joined.status, 503); assert.equal(joined.body.full, true); assert.match(joined.body.error, /full \(2\/2/, "A full server says so");
+    assert.equal((await finn.post("/api/rooms/limit", {maxPlayers: 3})).status, 403, "Players can't change the limit");
+    assert.equal((await erin.post("/api/rooms/limit", {maxPlayers: 99})).status, 400, "At most 50");
+    assert.equal((await erin.post("/api/rooms/limit", {maxPlayers: 3})).body.maxPlayers, 3);
+    assert.equal((await finn.state()).body.server.maxPlayers, 3, "Everyone's game learns the new limit");
+    assert.equal((await gail.join(tinyId)).status, 200, "A higher limit lets more in"); await gail.state();
+    await erin.post("/api/rooms/limit", {maxPlayers: 2});
+    assert.equal((await gail.state()).status, 200, "Lowering the limit doesn't remove anyone");
+    assert.equal((await hank.join(tinyId)).status, 503, "but nobody new gets in");
+    assert.equal((await owner.join(tinyId)).status, 200, "The owner can always get in"); await owner.state();
+
+    // MAKE SERVER OWNER: the new one gets the server, the old one stays an admin.
+    assert.equal((await finn.post("/api/admin/promote", {targetId: gail.session.id, host: true})).status, 403, "Players can't hand the server over");
+    const handed = await erin.post("/api/admin/promote", {targetId: finn.session.id, host: true});
+    assert.equal(handed.status, 200); assert.equal(handed.body.host, true);
+    assert.equal((await finn.state()).body.adminRole, "host", "Finn owns the server now");
+    assert.equal((await erin.state()).body.adminRole, "serveradmin", "Erin is still an admin of this server");
+    assert.equal((await finn.call("/api/rooms")).body.rooms.find(room => room.id === tinyId).mine, true);
+    assert.equal((await erin.post("/api/admin/promote", {targetId: finn.session.id, host: true})).status, 400, "Already the server owner");
+    await carol.join("main");
+    assert.equal((await carol.post("/api/admin/promote", {targetId: dave.session.id, host: true})).status, 400, "The main server has no server owner");
+
+    // STOP THIS SERVER: players can't, admins can; everyone is told it was stopped.
+    assert.equal((await gail.post("/api/rooms/stop")).status, 403, "Players can't stop a server");
+    assert.equal((await carol.post("/api/rooms/stop")).status, 404, "The main server can't be stopped");
+    const stoppedNow = await erin.post("/api/rooms/stop");
+    assert.equal(stoppedNow.status, 200, "An admin (the old server owner) can stop it"); assert.equal(stoppedNow.body.stopped, "Tiny Room");
+    assert.equal((await gail.state()).status, 401, "Its players lose their place right away");
+    joined = await gail.join(tinyId);
+    assert.equal(joined.status, 404); assert.equal(joined.body.stopped, true);
+    assert.match(joined.body.error, /server owner or an admin has stopped this server/);
+    assert(!(await gail.call("/api/rooms")).body.rooms.some(room => room.id === tinyId), "A stopped server is gone from the list");
+
+    console.log("PASS: make servers (name, optional password, bots or not), separate arenas, host gets admin, admins make admins, server-only bans, REMOVE ALL BOTS switch on main and made servers, owner powers everywhere, servers close after 10 minutes without players (bots don't count), player limits (2-50, changeable, owner and server owner always get in), MAKE SERVER OWNER, STOP THIS SERVER, real admins (made on main) are admins everywhere, announcements from the owner and real admins reach every server.");
   } finally {
     await runtime?.close();
     for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key];
