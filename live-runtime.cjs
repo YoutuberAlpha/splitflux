@@ -55,7 +55,7 @@ async function createLiveRuntime(pool,options={}) {
     active=true;
     const captured=captureResponse();
     await rooms.handle(request,captured);
-    if(captured.statusCode<400&&["/api/accounts/register","/api/accounts/password","/api/admin/reset-password","/api/admin/ban","/api/admin/promote","/api/shop/buy","/api/admin/coins"].includes(new URL(request.url,"http://game.invalid").pathname))await checkpoint();
+    if(captured.statusCode<400&&["/api/accounts/register","/api/accounts/password","/api/admin/reset-password","/api/admin/ban","/api/admin/promote","/api/shop/buy","/api/shop/gift","/api/admin/coins"].includes(new URL(request.url,"http://game.invalid").pathname))await checkpoint();
     for(const [name,value]of captured.headers)response.setHeader(name,value);
     response.writeHead(captured.statusCode);response.end(captured.body);
   }

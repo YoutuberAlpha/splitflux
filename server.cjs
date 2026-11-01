@@ -384,6 +384,29 @@ function chatFor(body) {
   return {seq: chatSeq, messages};
 }
 
+// GIFT COINS: a signed-in player sends some of their own coins to another account (typed by username).
+// The gift says who sent it by account name (not the in-game name, which anyone can type).
+function giftCoins(session, body) {
+  const problem = message => Object.assign(new Error(message), {shop: true});
+  if (!session.account) throw problem("Sign in to gift coins.");
+  const typed = String(body.to ?? "").trim().slice(0, 20), to = typed.toLowerCase();
+  if (!to) throw problem("Type the player's account username.");
+  if (!/^[a-z0-9_]{3,20}$/.test(to) || !accounts.exists(to)) throw problem(`There's no account called "${typed}".`);
+  const amount = Number(body.amount);
+  // The owner and real admins can gift coins they don't have (new coins); everyone else gives their own.
+  const role = adminRole(session.deviceId, session.account);
+  let view;
+  if (role === "owner" || role === "admin") {
+    if (!Number.isInteger(amount) || amount < 1 || amount > 1_000_000) throw problem("Choose 1 to 1,000,000 coins.");
+    if (to === session.account.username) throw problem("You can't gift coins to yourself. Use ADD COINS TO ME.");
+    shop.give({username: to}, amount);
+    view = shop.view(session.account);
+  } else view = shop.gift(session.account, to, amount);
+  for (const other of sessions.values()) if (other.account?.username === to)
+    (other.notices ||= []).push(`${session.account.username} gifted you ${amount.toLocaleString("en-US")} coins!`);
+  return {...view, gifted: {to, amount}};
+}
+
 // The player's coins and skin, sent only when something changed (the game sends back the "sig" it last got).
 function walletFor(session, body) {
   const wallet = {coins: shop.coins(session.account), unsaved: Math.floor(session.guestCoins || 0), skin: session.skin || "", signedIn: Boolean(session.account)};
@@ -1649,8 +1672,9 @@ const handleRequest = async (request, response) => {
     return;
   }
 
-  // SKIN SHOP: see your coins and skins (/api/shop), buy one (/api/shop/buy) or choose which to wear (/api/shop/equip).
-  if (request.method === "POST" && ["/api/shop", "/api/shop/buy", "/api/shop/equip"].includes(url.pathname)) {
+  // SKIN SHOP: see your coins and skins (/api/shop), buy one (/api/shop/buy), choose which to wear (/api/shop/equip)
+  // or gift some of your coins to another player by their account username (/api/shop/gift).
+  if (request.method === "POST" && ["/api/shop", "/api/shop/buy", "/api/shop/equip", "/api/shop/gift"].includes(url.pathname)) {
     try {
       const body = await readBody(request), session = sessions.get(String(body.id || ""));
       if (!session || session.sessionKey !== body.sessionKey) { sendJson(response, 401, { error: "Session expired" }); return; }
@@ -1662,7 +1686,8 @@ const handleRequest = async (request, response) => {
       if (session.account && session.guestCoins > 0) { shop.earn(session.account, session.guestCoins); session.guestCoins = 0; }
       const skin = String(body.skin ?? "");
       const view = url.pathname.endsWith("/buy") ? shop.buy(session.account, skin)
-        : url.pathname.endsWith("/equip") ? shop.equip(session.account, skin) : shop.view(session.account);
+        : url.pathname.endsWith("/equip") ? shop.equip(session.account, skin)
+        : url.pathname.endsWith("/gift") ? giftCoins(session, body) : shop.view(session.account);
       session.skin = shop.equipped(session.account);
       sendJson(response, 200, { ...view, unsaved: Math.floor(session.guestCoins || 0) });
     } catch (error) {

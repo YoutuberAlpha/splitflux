@@ -57,6 +57,19 @@ module.exports = function createShop(directory) {
     save();
     return mine.coins;
   }
+  // A player gives some of their own coins to another account.
+  function gift(account, to, amount) {
+    if (!account) throw problem("Sign in to gift coins.");
+    if (!Number.isInteger(amount) || amount < 1 || amount > 1_000_000) throw problem("Choose 1 to 1,000,000 coins.");
+    if (to === account.username) throw problem("You can't gift coins to yourself.");
+    const mine = wallet(account);
+    if (mine.coins < amount) throw problem(`You only have ${mine.coins.toLocaleString("en-US")} coins.`);
+    mine.coins -= amount;
+    const theirs = wallet({ username: to });
+    theirs.coins = Math.min(1_000_000_000, theirs.coins + amount);
+    save();
+    return view(account);
+  }
   function buy(account, id) {
     if (!account) throw problem("Sign in to buy skins (your coins are saved on your account).");
     const skin = SkinShop.find(id);
@@ -77,5 +90,5 @@ module.exports = function createShop(directory) {
     save();
     return view(account);
   }
-  return { view, coins, equipped, earn, give, buy, equip, flush };
+  return { view, coins, equipped, earn, give, gift, buy, equip, flush };
 };

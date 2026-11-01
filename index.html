@@ -70,6 +70,16 @@
         <div id="shopTab" class="shop-tab" hidden>
           <div class="servers-head"><b>SKIN SHOP</b><span class="coin-balance"><i class="coin" aria-hidden="true"></i><strong id="shopCoins">0</strong> COINS</span></div>
           <p id="shopNote" class="server-note">Grow to earn coins: 1 coin for every 10 mass you grow past your biggest size in each life.</p>
+          <div id="shopAdminCoins" class="coin-row shop-row" hidden>
+            <input id="shopAddAmount" type="number" min="1" max="1000000" step="1" value="1000" aria-label="Coins to add" />
+            <button id="shopAddCoins" type="button">ADD COINS TO ME</button>
+          </div>
+          <details id="giftCoins" class="account-tools gift-coins">
+            <summary>GIFT COINS TO A PLAYER</summary>
+            <input id="giftUsername" maxlength="20" autocomplete="off" placeholder="Player's account username" />
+            <input id="giftAmount" type="number" min="1" max="1000000" step="1" placeholder="How many coins" />
+            <button id="sendGift" type="button">SEND COINS</button>
+          </details>
           <div id="shopGrid" class="shop-grid"></div>
           <p id="shopMessage" class="server-message" role="status" aria-live="polite"></p>
         </div>
