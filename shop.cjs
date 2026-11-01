@@ -50,6 +50,13 @@ module.exports = function createShop(directory) {
     wallet(account).coins += amount;
     saveSoon();
   }
+  // Coins from a real admin (to themselves or as a gift). Saved straight away.
+  function give(account, amount) {
+    const mine = wallet(account);
+    mine.coins = Math.min(1_000_000_000, mine.coins + Math.floor(amount));
+    save();
+    return mine.coins;
+  }
   function buy(account, id) {
     if (!account) throw problem("Sign in to buy skins (your coins are saved on your account).");
     const skin = SkinShop.find(id);
@@ -70,5 +77,5 @@ module.exports = function createShop(directory) {
     save();
     return view(account);
   }
-  return { view, coins, equipped, earn, buy, equip, flush };
+  return { view, coins, equipped, earn, give, buy, equip, flush };
 };

@@ -15,6 +15,7 @@ const pool={
     if(sql.startsWith("CREATE TABLE"))return {rows:[]};
     if(sql.startsWith("INSERT INTO splitflux_backups")){backups.push(JSON.parse(values[0]));return {rows:[]};}
     if(sql.startsWith("DELETE FROM splitflux_backups"))return {rows:[]};
+    if(sql.startsWith("SELECT payload->>'liveEpoch'"))return {rows:[{epoch:payload.liveEpoch}]};
     if(values[1]!==payload.liveEpoch)return {rowCount:0};
     payload=JSON.parse(values[0]);return {rowCount:1};
   },
@@ -88,7 +89,18 @@ const credentials=who=>({id:who.session.id,sessionKey:who.session.sessionKey});
       assert.equal(saves,1,"One save after activity, then quiet again");
       pool.query=original;
     }finally{await third.close();}
-    console.log("PASS: live input bypasses the database, new accounts save before success, signing keys and owner cookies survive restart, old servers cannot overwrite a newer arena, shop skins and coins saved (no pictures, no extra backups), idle time skipped, food saves compressed.");
+
+    // An old live server that is still being sent requests (Render once kept one running after a new version
+    // started) notices the takeover by itself, without having to save first, and stops answering.
+    let oldLost=false;
+    const old=await createLiveRuntime(pool,{directory:path.join(directory,"old"),origin:"https://game.example",timers:false,ownerCheckMs:0,onLost(){oldLost=true;}});
+    const newer=await createLiveRuntime(pool,{directory:path.join(directory,"newer"),origin:"https://game.example",timers:false});
+    try{
+      assert.equal((await request(newer,owner,"/health")).status,200);
+      assert.equal((await request(old,owner,"/health")).status,503,"The replaced server stops answering");
+      assert.equal(oldLost,true,"and is told to shut down");
+    }finally{await newer.close();}
+    console.log("PASS: replaced live servers stop by themselves, live input bypasses the database, new accounts save before success, signing keys and owner cookies survive restart, old servers cannot overwrite a newer arena, shop skins and coins saved (no pictures, no extra backups), idle time skipped, food saves compressed.");
   }finally{
     await first?.close();await second?.close();
     for(const key of Object.keys(process.env))if(!(key in savedEnv))delete process.env[key];Object.assign(process.env,savedEnv);

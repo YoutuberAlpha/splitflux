@@ -22,6 +22,7 @@
   // SKIN SHOP: coins and the worn skin, from the server (sent only when they change; walletSig says which we have).
   let walletSig = "";
   let shopState = null, confirmBuy = null, confirmTimer = 0;  // the SHOP tab (see below)
+  let lastChatSeq = 0;  // the newest chat message this game has (see CHAT below)
   let teamRevision = 0;
   let lastSyncAt = -Infinity;
   // Compact updates: the server only resends the bot team table and the spike list when they change,
@@ -619,6 +620,9 @@
     teamsSig = "";
     spikesSig = "";
     walletSig = "";
+    // A new connection (or another server) gets that server's recent chat again.
+    lastChatSeq = 0;
+    document.querySelector("#chatLog").replaceChildren();
     updateAdminAccess();
     connected = true;
     if (isAdmin) {
@@ -671,6 +675,7 @@
         ackEjected: newestPelletSeq(),
         ackAnnouncement: lastAnnouncementId,
         ackWallet: walletSig,
+        ackChat: lastChatSeq,
       };
       for (const cell of playerCells) cell._syncMassWeights = { [cell.netId]: 1 };
       const sentMapSize = worldSize;
@@ -713,6 +718,8 @@
       applyFoodSync(snapshot.food);
       networkDelay=Math.min(.15,(performance.now()-requestAt)/2000);
       if (snapshot.wallet) applyWallet(snapshot.wallet);
+      if (snapshot.chat) applyChat(snapshot.chat);
+      for (const text of snapshot.notices || []) showGameNotice(text, 7000, true);
       (snapshot.acceptedBotSplitCommands||[]).forEach(id=>pendingBotSplitCommands.delete(id));
       if (snapshot.botSplitError) showArenaError(new Error(snapshot.botSplitError));
       bannedBotTeams=new Set(snapshot.bannedBotTeams||[]);
@@ -1104,6 +1111,7 @@
   // ---- Admin panel: THIS SERVER (made servers only) ----
   function updateServerAdmin() {
     document.querySelector("#announceBox").hidden = !(adminRole === "owner" || adminRole === "admin");
+    document.querySelector("#coinBox").hidden = !(adminRole === "owner" || adminRole === "admin");
     const box = document.querySelector("#serverAdmin");
     box.hidden = !(isAdmin && currentServer.id !== "main");
     const input = document.querySelector("#serverLimitInput");
@@ -1151,6 +1159,8 @@
   // MAKE SERVER OWNER in the player menu: only on made servers, for a player who isn't the server owner yet.
   window.updateServerOwnerButton = () => {
     const button = document.querySelector("#makeServerOwner"), target = selectedModerationTarget;
+    // GIVE COINS: the owner and real admins, to another player.
+    document.querySelector("#giveCoinsRow").hidden = !((adminRole === "owner" || adminRole === "admin") && target && target.targetId);
     button.hidden = !(isAdmin && currentServer.id !== "main" && target && target.targetId);
     if (button.hidden) return;
     button.disabled = target.role === "host";
@@ -1176,6 +1186,83 @@
   document.querySelector("#tabPlay").addEventListener("click", () => showMenuTab("play"));
   document.querySelector("#tabServers").addEventListener("click", () => showMenuTab("servers"));
   document.querySelector("#tabShop").addEventListener("click", () => showMenuTab("shop"));
+
+  // ---- COINS from the owner or a real admin ----
+  async function coinCommand(fields) {
+    if (!session) throw new Error("Not connected yet.");
+    const amount = Math.floor(Number(fields.amount));
+    if (!(amount >= 1 && amount <= 1_000_000)) throw new Error("Choose 1 to 1,000,000 coins.");
+    const response = await fetch("/api/admin/coins", {method: "POST", cache: "no-store", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({id: session.id, sessionKey: session.sessionKey, ...fields, amount})});
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.error || "Couldn't give coins.");
+    walletSig = "";  // the next update brings the new balance
+    return {...result, amount};
+  }
+  document.querySelector("#addCoins").addEventListener("click", async () => {
+    const message = document.querySelector("#coinBoxMessage");
+    try {
+      const result = await coinCommand({amount: document.querySelector("#addCoinsAmount").value});
+      message.textContent = `Added ${result.amount.toLocaleString()} coins. You have ${result.coins.toLocaleString()}.`;
+    } catch (error) { message.textContent = error.message; }
+  });
+  document.querySelector("#giveCoins").addEventListener("click", async () => {
+    const target = selectedModerationTarget, message = document.querySelector("#moderationMessage");
+    if (!target?.targetId) return;
+    try {
+      const result = await coinCommand({targetId: target.targetId, amount: document.querySelector("#giveCoinsAmount").value});
+      message.textContent = `Gave ${result.amount.toLocaleString()} coins to ${result.name}.`;
+    } catch (error) { message.textContent = error.message; }
+  });
+  for (const id of ["#addCoinsAmount", "#giveCoinsAmount"]) document.querySelector(id).addEventListener("keydown", event => event.stopPropagation());
+
+  // ---- CHAT (lower left): one chat per server. Enter opens it while playing, Enter sends, Esc closes. ----
+  const chatLogEl = document.querySelector("#chatLog"), chatInput = document.querySelector("#chatInput");
+  const CHAT_TAGS = {owner: "OWNER", host: "SERVER OWNER", admin: "ADMIN", serveradmin: "ADMIN"};
+  function addChatLine(message) {
+    const line = document.createElement("li");
+    if (message.system) { line.className = "system"; line.textContent = message.text; }
+    else {
+      if (CHAT_TAGS[message.role]) {
+        const tag = document.createElement("span"); tag.className = "tag"; tag.textContent = CHAT_TAGS[message.role]; line.append(tag);
+      }
+      const name = document.createElement("b"); name.textContent = `${message.name}: `;
+      line.append(name, document.createTextNode(message.text));  // text, never HTML
+    }
+    const atBottom = chatLogEl.scrollHeight - chatLogEl.scrollTop - chatLogEl.clientHeight < 30;
+    chatLogEl.append(line);
+    while (chatLogEl.children.length > 40) chatLogEl.firstChild.remove();
+    if (atBottom) chatLogEl.scrollTop = chatLogEl.scrollHeight;
+  }
+  function applyChat(chat) {
+    const restarted = chat.seq < lastChatSeq;  // the server restarted: start the list again
+    if (restarted) chatLogEl.replaceChildren();
+    for (const message of chat.messages || []) if (restarted || message.seq > lastChatSeq) addChatLine(message);
+    lastChatSeq = chat.seq;
+  }
+  async function sendChat(text) {
+    if (!session) return;
+    try {
+      const response = await fetch("/api/chat", {method: "POST", cache: "no-store", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({id: session.id, sessionKey: session.sessionKey, text, name: (running && player && player.name) || ui.name.value || "PLAYER"})});
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.error || "Message not sent.");
+      lastSyncAt = -Infinity;  // get it back on the next update
+    } catch (error) { addChatLine({system: true, text: error.message}); chatInput.value = chatInput.value || text; }
+  }
+  chatInput.addEventListener("keydown", event => {
+    event.stopPropagation();
+    if (event.key === "Enter") {
+      event.preventDefault();
+      const text = chatInput.value.trim();
+      chatInput.value = "";
+      if (text) sendChat(text);
+      chatInput.blur();
+    } else if (event.key === "Escape") chatInput.blur();
+  });
+  window.focusChat = () => { for (const code in keys) keys[code] = false; chatInput.focus(); };
+  if (matchMedia("(pointer: coarse)").matches) chatInput.placeholder = "Tap to chat";
+  document.querySelector("#chat").hidden = false;
   document.querySelector("#refreshServers").addEventListener("click", loadServers);
   document.querySelector("#createServer").addEventListener("click", createServer);
   for (const id of ["#newServerName", "#newServerPassword"]) document.querySelector(id).addEventListener("keydown", event => {

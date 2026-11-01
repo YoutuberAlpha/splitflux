@@ -373,6 +373,17 @@ function creditGrowth(session, wasRunning) {
   if (session.account && session.guestCoins > 0) { shop.earn(session.account, session.guestCoins); session.guestCoins = 0; }
 }
 
+// CHAT: the newest 40 messages on this server. Each game sends back the number of the newest one it has
+// (ackChat) and gets only newer ones; a game new to this server gets the last 20.
+const CHAT_KEEP = 40;
+let chatLog = [], chatSeq = 0;
+function chatFor(body) {
+  const after = Number(body.ackChat) || 0;
+  if (after === chatSeq) return undefined;
+  const messages = (after > chatSeq ? chatLog : chatLog.filter(message => message.seq > after)).slice(-20);
+  return {seq: chatSeq, messages};
+}
+
 // The player's coins and skin, sent only when something changed (the game sends back the "sig" it last got).
 function walletFor(session, body) {
   const wallet = {coins: shop.coins(session.account), unsaved: Math.floor(session.guestCoins || 0), skin: session.skin || "", signedIn: Boolean(session.account)};
@@ -1593,6 +1604,51 @@ const handleRequest = async (request, response) => {
     return;
   }
 
+  // CHAT: 1-120 characters, at most 5 messages per 10 seconds per player.
+  if (request.method === "POST" && url.pathname === "/api/chat") {
+    try {
+      const body = await readBody(request), session = sessions.get(String(body.id || ""));
+      if (!session || session.sessionKey !== body.sessionKey) { sendJson(response, 401, { error: "Session expired" }); return; }
+      session.account = accounts.fromRequest(request);
+      if (playerBanUntil(session)) { sendJson(response, 403, { error: "You are banned from this arena." }); return; }
+      const text = String(body.text ?? "").replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/g, " ").replace(/\s+/g, " ").trim().slice(0, 120);
+      if (!text) { sendJson(response, 400, { error: "Type a message first." }); return; }
+      const now = Date.now();
+      session.chatTimes = (session.chatTimes || []).filter(time => now - time < 10_000);
+      if (session.chatTimes.length >= 5 || now - (session.chatTimes.at(-1) || 0) < 700) { sendJson(response, 429, { error: "Slow down a little." }); return; }
+      session.chatTimes.push(now);
+      if (typeof body.name === "string") session.name = cleanText(body.name, "PLAYER", 14);
+      const role = adminRole(session.deviceId, session.account) || undefined;
+      chatLog = [...chatLog, { seq: ++chatSeq, id: session.id, name: session.name, text, role, at: now }].slice(-CHAT_KEEP);
+      sendJson(response, 200, { seq: chatSeq });
+    } catch {
+      sendJson(response, 400, { error: "Invalid chat message" });
+    }
+    return;
+  }
+
+  // COINS from the owner or a real admin: add to yourself (no targetId) or gift to a signed-in player.
+  if (request.method === "POST" && url.pathname === "/api/admin/coins") {
+    try {
+      const body = await readBody(request), admin = sessions.get(String(body.id || ""));
+      const account = accounts.fromRequest(request);
+      const role = admin && admin.sessionKey === body.sessionKey ? adminRole(admin.deviceId, account) : null;
+      if (role !== "owner" && role !== "admin") { sendJson(response, 403, { error: "Only the owner and real admins can give coins." }); return; }
+      const amount = Number(body.amount);
+      if (!Number.isInteger(amount) || amount < 1 || amount > 1_000_000) { sendJson(response, 400, { error: "Choose 1 to 1,000,000 coins." }); return; }
+      const target = body.targetId ? sessions.get(String(body.targetId)) : admin;
+      if (!target) { sendJson(response, 404, { error: "Player is no longer in the arena." }); return; }
+      const self = target === admin, targetAccount = self ? account : target.account;
+      if (!targetAccount) { sendJson(response, 400, { error: self ? "Sign in first: coins are kept on your account." : `${target.name} is a guest. They need to sign in to get coins.` }); return; }
+      const coins = shop.give(targetAccount, amount);
+      if (!self) (target.notices ||= []).push(`${admin.name} gave you ${amount.toLocaleString("en-US")} coins!`);
+      sendJson(response, 200, { coins, name: target.name, self });
+    } catch {
+      sendJson(response, 400, { error: "Invalid coin request" });
+    }
+    return;
+  }
+
   // SKIN SHOP: see your coins and skins (/api/shop), buy one (/api/shop/buy) or choose which to wear (/api/shop/equip).
   if (request.method === "POST" && ["/api/shop", "/api/shop/buy", "/api/shop/equip"].includes(url.pathname)) {
     try {
@@ -1996,6 +2052,9 @@ const handleRequest = async (request, response) => {
         playerCount: Math.max(1, activeCount),
         server: serverInfo(),
         wallet: walletFor(session, body),
+        chat: chatFor(body),
+        // Messages just for this player (for example a coin gift), shown once.
+        notices: session.notices?.length ? session.notices.splice(0) : undefined,
         // The newest announcement (for one minute), until this player's game says it has shown it.
         announcement: announcer.latest && announcer.latest.id !== body.ackAnnouncement && Date.now() - announcer.latest.at < 60_000 ? announcer.latest : undefined,
         world: compact && world ? worldView(body, session) : world,
@@ -2134,7 +2193,7 @@ if (!cloudMode) server.listen(port, "0.0.0.0", () => {
 
 function exportState() {
   return {world,food:exportFoodState(),signInGuard,worldRevision,botRevision,botMassRevision,serverBotCounter,ejectedSeq,serverFallbackActive,
-    botRespawnBlockedUntil,targetBotTeams,botPieceCap,lastFallbackTick,ownerId,promotedAdmins,serverBans,announcement:announcer.latest,
+    botRespawnBlockedUntil,targetBotTeams,botPieceCap,lastFallbackTick,ownerId,promotedAdmins,serverBans,announcement:announcer.latest,chatLog,chatSeq,
     sessions:[...sessions.values()].map(session=>({...session,feedIds:[...session.feedIds],
       botActionIds:[...session.botActionIds],teamedBots:[...session.teamedBots]}))};
 }
@@ -2150,6 +2209,7 @@ function importState(state) {
   promotedAdmins=Array.isArray(state.promotedAdmins)?state.promotedAdmins.filter(identity=>typeof identity==="string").slice(-100):[];
   serverBans=state.serverBans&&typeof state.serverBans==="object"?{...state.serverBans}:{};
   announcer.latest=state.announcement&&typeof state.announcement.text==="string"?state.announcement:null;
+  chatLog=Array.isArray(state.chatLog)?state.chatLog.slice(-CHAT_KEEP):[];chatSeq=Number(state.chatSeq)||0;
   // (Old saves may hold uploaded skin pictures; only shop skins are kept.)
   for (const session of state.sessions) sessions.set(session.id,{...session,skin:SkinShop.find(session.skin)?session.skin:"",skinVersion:undefined,feedIds:new Set(session.feedIds),
     botActionIds:new Set(session.botActionIds),teamedBots:new Set(session.teamedBots)});

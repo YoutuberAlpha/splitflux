@@ -1659,6 +1659,8 @@ addEventListener("keydown", e => {
     document.querySelector("#playerSpeedInput").value = playerSpeed;
     return;
   }
+  // Enter while playing opens the chat (on the menu and after dying it still deploys).
+  if ((e.code === "Enter" || e.code === "NumpadEnter") && running && !gameOver && window.focusChat) { e.preventDefault(); window.focusChat(); return; }
   keys[e.code] = true;
   if (e.code === "Enter" && (!running || gameOver)) resetGame();
   if (e.code === "KeyW") {
