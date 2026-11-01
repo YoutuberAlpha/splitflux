@@ -170,6 +170,16 @@ function browser(runtime) {
     await ivan.join(roomId, {password: "secret-pw"}); await ivan.state();
     assert.equal((await alice.post("/api/admin/promote", {targetId: ivan.session.id, admin: true})).body.role, "serveradmin");
     assert.equal((await ivan.state()).body.adminRole, "serveradmin");
+    // But when the owner or a real admin clicks MAKE ADMIN (on any server), that player is admin everywhere.
+    const june = browser(runtime); june.name = "JUNE";
+    await june.join(roomId, {password: "secret-pw"}); await june.state();
+    assert.equal((await carol.post("/api/admin/promote", {targetId: june.session.id, admin: true})).body.role, "admin", "A real admin's MAKE ADMIN counts on every server");
+    assert.equal((await june.state()).body.adminRole, "admin");
+    assert.equal(arenaOf(payload).promotedAdmins.length, 2, "and goes on the main server's saved list");
+    assert.equal((await alice.post("/api/admin/promote", {targetId: june.session.id, admin: false})).status, 403, "A server owner can't take it away");
+    assert.equal((await carol.post("/api/admin/promote", {targetId: june.session.id, admin: false})).body.admin, false, "A real admin can, from any server");
+    assert.equal((await june.state()).body.adminRole ?? null, null);
+    assert.equal(arenaOf(payload).promotedAdmins.length, 1);
 
     // ANNOUNCEMENTS: only the owner and real admins, to every player on every server.
     assert.equal((await alice.post("/api/admin/announce", {text: "hi"})).status, 403, "Server owners can't send announcements");
@@ -252,7 +262,7 @@ function browser(runtime) {
     assert.match(joined.body.error, /server owner or an admin has stopped this server/);
     assert(!(await gail.call("/api/rooms")).body.rooms.some(room => room.id === tinyId), "A stopped server is gone from the list");
 
-    console.log("PASS: make servers (name, optional password, bots or not), separate arenas, host gets admin, admins make admins, server-only bans, REMOVE ALL BOTS switch on main and made servers, owner powers everywhere, servers close after 10 minutes without players (bots don't count), player limits (2-50, changeable, owner and server owner always get in), MAKE SERVER OWNER, STOP THIS SERVER, real admins (made on main) are admins everywhere, announcements from the owner and real admins reach every server.");
+    console.log("PASS: make servers (name, optional password, bots or not), separate arenas, host gets admin, admins make admins, server-only bans, REMOVE ALL BOTS switch on main and made servers, owner powers everywhere, servers close after 10 minutes without players (bots don't count), player limits (2-50, changeable, owner and server owner always get in), MAKE SERVER OWNER, STOP THIS SERVER, real admins (made by the owner or a real admin, on any server) are admins everywhere, announcements from the owner and real admins reach every server.");
   } finally {
     await runtime?.close();
     for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key];
