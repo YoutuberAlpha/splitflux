@@ -1480,10 +1480,11 @@ function updateAdminRoleButton() {
   const button=document.querySelector("#toggleAdminRole"), target=selectedModerationTarget;
   button.hidden=!onlineMode||!target||!target.targetId;
   if (button.hidden) return;
-  const onMadeServer=window.onMadeServer?.()===true;
-  button.disabled=target.role==="owner"||target.role==="host"||(target.role==="admin"&&onMadeServer);
+  // Only the owner and real admins can change a real admin while on a made server.
+  const lockedAdmin=target.role==="admin"&&window.onMadeServer?.()===true&&adminRole!=="owner"&&adminRole!=="admin";
+  button.disabled=target.role==="owner"||target.role==="host"||lockedAdmin;
   button.textContent=target.role==="owner"?"OWNER (ALWAYS ADMIN)":target.role==="host"?"SERVER OWNER (ALWAYS ADMIN)"
-    :target.role==="admin"?(onMadeServer?"ADMIN ON EVERY SERVER":"REMOVE ADMIN"):target.role==="serveradmin"?"REMOVE ADMIN":"MAKE ADMIN";
+    :lockedAdmin?"ADMIN ON EVERY SERVER":target.role==="admin"||target.role==="serveradmin"?"REMOVE ADMIN":"MAKE ADMIN";
 }
 document.querySelector("#toggleAdminRole").addEventListener("click",async()=>{
   const target=selectedModerationTarget, message=document.querySelector("#moderationMessage"), button=document.querySelector("#toggleAdminRole");

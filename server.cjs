@@ -37,6 +37,7 @@ let serverBans = {};       // identity -> banned until (this server only)
 // "Real" admins are the ones made on the MAIN server: they are admins on every server and can send announcements.
 // A made server reads them from the main server (see useShared); on the main server they are its own admins.
 let globalAdmins = () => promotedAdmins;
+let setGlobalAdmins = list => { promotedAdmins = list; };  // a made server writes the main server's list through this
 // One announcement board for every server: the newest announcement, shown to every player once.
 let announcer = { latest: null };
 let world = null;
@@ -1772,10 +1773,18 @@ const handleRequest = async (request, response) => {
           return;
         }
         if (targetRole === "owner" || targetRole === "host") { sendJson(response, 403, { error: `The ${ROLE_NAMES[targetRole]} is always an admin.` }); return; }
-        if (roomConfig && targetRole === "admin") { sendJson(response, 403, { error: `${target.name} is an admin on every server. That can only be changed on the main server.` }); return; }
+        // The owner and real admins make real admins (admin on every server), wherever they click MAKE ADMIN.
+        // A server owner or a server's own admin can only make admins of their server.
+        const everywhere = !roomConfig || role === "owner" || role === "admin";
+        if (targetRole === "admin" && !everywhere) { sendJson(response, 403, { error: `${target.name} is an admin on every server. Only the owner or another real admin can change that.` }); return; }
         const identities = identitiesOf(target.deviceId, target.account);
-        promotedAdmins = promotedAdmins.filter(identity => !identities.includes(identity));
-        if (body.admin === true) promotedAdmins.push(target.account ? `account:${target.account.username}` : `device:${target.deviceId}`);
+        const identity = target.account ? `account:${target.account.username}` : `device:${target.deviceId}`;
+        promotedAdmins = promotedAdmins.filter(id => !identities.includes(id));
+        if (everywhere) {
+          const list = globalAdmins().filter(id => !identities.includes(id));
+          if (body.admin === true) list.push(identity);
+          setGlobalAdmins(list.slice(-100));
+        } else if (body.admin === true) promotedAdmins.push(identity);
         promotedAdmins = promotedAdmins.slice(-100);
         target.isAdmin = Boolean(adminRole(target.deviceId, target.account));
         if (!target.isAdmin) target.immune = false;
@@ -2060,7 +2069,7 @@ function summary() {
   const list = [...sessions.values()];
   return { players: list.filter(session => session.running).length, connected: list.length, bots: !world.botsOff };
 }
-function shared() { return { accounts, moderation, signInGuard, realtime, globalAdmins, announcer }; }
+function shared() { return { accounts, moderation, signInGuard, realtime, globalAdmins, setGlobalAdmins, announcer }; }
 // A made server uses the main server's accounts, bans, sign-in limits and live connection.
 function useShared(parts) {
   if (parts.accounts) accounts = parts.accounts;
@@ -2068,6 +2077,7 @@ function useShared(parts) {
   if (parts.signInGuard) signInGuard = parts.signInGuard;
   if (parts.realtime !== undefined) realtime = parts.realtime;
   if (parts.globalAdmins) globalAdmins = parts.globalAdmins;
+  if (parts.setGlobalAdmins) setGlobalAdmins = parts.setGlobalAdmins;
   if (parts.announcer) announcer = parts.announcer;
 }
 if (!cloudMode) server.listen(port, "0.0.0.0", () => {
