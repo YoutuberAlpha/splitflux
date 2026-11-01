@@ -21,6 +21,16 @@ async function createLiveRuntime(pool,options={}) {
   // The main server is saved to the database; servers players make (rooms.cjs) live only in memory.
   const rooms=createRoomManager({main:engine,loadEngine:()=>loadEngine(directory)});
   let writes=Promise.resolve(),requests=Promise.resolve(),lost=false,active=false;
+  // Is this still the live server? When a new version starts it takes the arena over. An old copy that is still
+  // being sent requests (it happened: Render kept one running) finds out here, at most every 15 s and only while
+  // it is getting requests (a tiny query, so an idle server leaves the database alone), and stops answering.
+  let ownerCheckedAt=Date.now();
+  async function stillLive(){
+    if(Date.now()-ownerCheckedAt<(options.ownerCheckMs??15000))return true;
+    ownerCheckedAt=Date.now();
+    try{return (await pool.query("SELECT payload->>'liveEpoch' AS epoch FROM splitflux_arena WHERE id=1")).rows[0]?.epoch===epoch;}
+    catch{return true;}  // a database hiccup is not a takeover
+  }
   const snapshot=()=>{
     engine.flushFiles?.();  // coins waiting to be written go into this save
     const files={};for(const file of privateFiles){const name=path.join(directory,file);if(fs.existsSync(name))files[file]=fs.readFileSync(name,"utf8");}
@@ -40,11 +50,12 @@ async function createLiveRuntime(pool,options={}) {
     writes=job.catch(()=>{});return job;
   }
   async function handle(request,response){
+    if(!lost&&!(await stillLive())){lost=true;options.onLost?.();}
     if(lost){response.writeHead(503);response.end(JSON.stringify({error:"Server restarting"}));return;}
     active=true;
     const captured=captureResponse();
     await rooms.handle(request,captured);
-    if(captured.statusCode<400&&["/api/accounts/register","/api/accounts/password","/api/admin/reset-password","/api/admin/ban","/api/admin/promote","/api/shop/buy"].includes(new URL(request.url,"http://game.invalid").pathname))await checkpoint();
+    if(captured.statusCode<400&&["/api/accounts/register","/api/accounts/password","/api/admin/reset-password","/api/admin/ban","/api/admin/promote","/api/shop/buy","/api/admin/coins"].includes(new URL(request.url,"http://game.invalid").pathname))await checkpoint();
     for(const [name,value]of captured.headers)response.setHeader(name,value);
     response.writeHead(captured.statusCode);response.end(captured.body);
   }
@@ -72,7 +83,11 @@ async function main(){
     if(!response.headersSent)response.writeHead(503,{"Content-Type":"application/json","Cache-Control":"no-store"});
     response.end(JSON.stringify({error:"Unable to complete the request. Please retry."}));
   }));
-  runtime=await createLiveRuntime(pool,{onLost(){realtime?.close();server.close();}});
+  // Replaced by a newer live server: stop, and end this process so an old copy can't keep answering.
+  runtime=await createLiveRuntime(pool,{onLost(){
+    console.error("A newer live server took over; this one is stopping");
+    realtime?.close();server.close();setTimeout(()=>process.exit(0),2000).unref();
+  }});
   realtime=runtime.engine.enableRealtime(server,runtime.dispatch,runtime.rooms.getSession);
   server.listen(Number(process.env.PORT)||1000,"0.0.0.0",()=>console.log("SPLITFLUX real-time server ready"));
   const shutdown=async()=>{try{realtime.close();await runtime.close();server.close();await pool.end();}catch{process.exitCode=1;}};

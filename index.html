@@ -35,6 +35,11 @@
       <div id="coinStat" hidden><span>COINS</span><strong id="coins">0</strong></div>
     </aside>
 
+    <section id="chat" class="chat panel" hidden>
+      <ol id="chatLog" class="chat-log" aria-live="polite"></ol>
+      <input id="chatInput" maxlength="120" autocomplete="off" placeholder="Press Enter to chat" aria-label="Chat message" />
+    </section>
+
     <div class="minimap-shell panel">
       <canvas id="minimap" width="150" height="150"></canvas>
       <span>SECTOR MAP</span>
@@ -158,6 +163,10 @@
       <button id="confirmBan" type="button">BAN PLAYER</button>
       <button id="toggleAdminRole" type="button" hidden>MAKE ADMIN</button>
       <button id="makeServerOwner" type="button" hidden>MAKE SERVER OWNER</button>
+      <div id="giveCoinsRow" class="coin-row" hidden>
+        <input id="giveCoinsAmount" type="number" min="1" max="1000000" step="1" value="100" aria-label="Coins to give" />
+        <button id="giveCoins" type="button">GIVE COINS</button>
+      </div>
       <p id="moderationMessage"></p>
     </section>
     <section id="adminPanel" class="admin-panel hidden">
@@ -173,6 +182,14 @@
           <p>ANNOUNCEMENT</p>
           <textarea id="announceText" maxlength="200" rows="2" placeholder="Type a message for every player on every server"></textarea>
           <button id="sendAnnouncement" type="button">SEND TO EVERY PLAYER</button>
+        </div>
+        <div id="coinBox" class="server-admin coin-box" hidden>
+          <p>COINS</p>
+          <div class="coin-row">
+            <input id="addCoinsAmount" type="number" min="1" max="1000000" step="1" value="1000" aria-label="Coins to add" />
+            <button id="addCoins" type="button">ADD COINS TO ME</button>
+          </div>
+          <small id="coinBoxMessage">To gift coins, click a player's name or blob.</small>
         </div>
         <p>Multiply your current mass and score.</p>
         <label class="admin-speed">

@@ -70,6 +70,22 @@ button, input, select { font: inherit; }
 .stats span, .minimap-shell span { display: block; color: #667080; font-family: Consolas, monospace; font-size: 8px; font-weight: 700; letter-spacing: .14em; }
 .stats strong { display: block; margin-top: 4px; font-family: Consolas, monospace; font-size: 17px; }
 #coinStat strong { color: #ffd34d; }
+
+/* CHAT (lower left, above the score panel). */
+.chat { left: 20px; bottom: 100px; width: min(320px, calc(100vw - 40px)); padding: 8px 10px; display: grid; gap: 6px; pointer-events: auto; }
+.chat[hidden] { display: none; }
+.chat-log { list-style: none; margin: 0; padding: 0; max-height: 150px; overflow-y: auto; display: grid; gap: 2px; font-size: 12px; line-height: 1.35; overflow-wrap: anywhere; }
+.chat-log li { color: #d9dee6; }
+.chat-log b { color: var(--lime); font-weight: 700; }
+.chat-log .tag { margin-right: 4px; padding: 0 4px; border-radius: 2px; background: #ffb547; color: #1a1205; font-family: Consolas, monospace; font-size: 9px; font-weight: 700; letter-spacing: .08em; }
+.chat-log .system { color: var(--muted); font-style: italic; }
+.chat input { width: 100%; padding: 7px 9px; border: 1px solid rgba(255,255,255,.12); outline: none; background: rgba(0,0,0,.35); color: white; font: 12px Inter, system-ui, sans-serif; }
+.chat input:focus { border-color: var(--lime); }
+.coin-row { display: grid; grid-template-columns: 1fr auto; gap: 6px; margin-top: 10px; }
+.coin-row[hidden], .coin-box[hidden] { display: none; }
+.coin-row input { min-width: 0; padding: 8px; border: 1px solid rgba(255,255,255,.14); background: rgba(0,0,0,.3); color: white; font-family: Consolas, monospace; }
+.coin-row button { width: auto; margin-top: 0 !important; padding: 8px 10px; background: #ffd34d; color: #1a1300; justify-content: center; }
+.coin-box small { display: block; margin-top: 6px; color: var(--muted); font-size: 11px; }
 .minimap-shell { right: 20px; bottom: 24px; padding: 8px; }
 #minimap { display: block; width: 130px; height: 130px; opacity: .9; }
 .minimap-shell span { padding: 5px 2px 1px; text-align: center; }
@@ -261,6 +277,9 @@ kbd { padding: 4px 7px; border: 1px solid rgba(0,0,0,.25); background: rgba(0,0,
   .minimap-shell { right: 10px; top: 66px; bottom: auto; }
   #minimap { width: 70px; height: 70px; }
   .stats { left: 10px; top: 66px; bottom: auto; gap: 9px; padding: 8px 10px; }
+  .chat { left: 10px; top: 214px; bottom: auto; width: min(215px, calc(100vw - 175px)); padding: 6px 8px; gap: 4px; }
+  .chat-log { max-height: 66px; font-size: 11px; }
+  .chat input { padding: 6px 7px; font-size: 16px; }
   .stats div { min-width: 42px; }
   .stats strong { font-size: 14px; }
   .hint { display: none; }
