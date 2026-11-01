@@ -230,7 +230,7 @@ function respawnSpikes(now) {
 
 // A player's game reports which spikes it popped; the server removes a spike only if one of that
 // player's pieces big enough to pop it (over 90 mass) really passed over it.
-// A player's pop counts if the piece that popped was big enough before popping (path.popMass), covered the
+// A player's pop counts if the piece that popped was big enough before popping (path.popMass), hit the
 // spike somewhere along the way it moved (same rule as BlobPhysics.spikes.covered, plus a little room for lag),
 // and really split this update (`poppers`: pieces that sent out new pieces; each can pop one spike).
 // The owner's game is trusted to split, so `poppers` is null there.
@@ -246,7 +246,7 @@ function popSpikes(paths, rawPops, poppers = null) {
       if (poppers && (!poppers.has(path.id) || used.has(path.id))) return false;
       const mass = Math.max(path.popMass || 0, path.mass || 0);
       if (mass < BlobPhysics.spikes.popMass) return false;
-      return distanceToPath(virus.x, virus.y, path.fromX, path.fromY, path.toX, path.toY) < cellRadius(mass) - (virus.r || 42) * .28 + path.margin;
+      return distanceToPath(virus.x, virus.y, path.fromX, path.fromY, path.toX, path.toY) < cellRadius(mass) + (virus.r || 42) * .65 + path.margin;
     });
     if (!hit) continue;
     used.add(hit.id);
@@ -738,6 +738,7 @@ function popServerBot(bot) {
   bot.radius = radiusForMass(bot.mass);
   bot.splitCooldown = 3;
   bot.serverMergeAt = now + 15000;
+  bot.virusImmuneUntil = now + 600;
   for (let index = 1; index < masses.length; index++) {
     const shard = BlobPhysics.spikes.shardLaunch(bot, index - 1, masses.length - 1, turn, bot.radius);
     const radius = radiusForMass(masses[index]);
@@ -1043,7 +1044,7 @@ function simulateServerBots(dt) {
 
   for (let index = world.viruses.length - 1; index >= 0; index--) {
     const virus = world.viruses[index];
-    // Same rule as players: the biggest bot piece covering the spike pops it, if it has room to split.
+    // Same rule as players: the biggest bot piece hitting the spike pops it, if it has room to split.
     const bot = world.bots.filter(candidate => candidate.alive && Date.now() >= (candidate.virusImmuneUntil || 0) && BlobPhysics.spikes.covered(candidate, virus))
       .sort((a, b) => b.mass - a.mass)[0];
     if (!bot) continue;

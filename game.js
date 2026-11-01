@@ -765,6 +765,8 @@ function popPlayerCell(cell) {
   cell.mass = masses[0];
   cell.radius = radiusForMass(cell.mass);
   cell.mergeAt = now + 3000;
+  // One hit = one pop: the popped piece and its shards can't pop another spike for a moment.
+  cell.virusImmuneUntil = now + 600;
   for (let i = 1; i < masses.length; i++) {
     const shard = BlobPhysics.spikes.shardLaunch(cell, i - 1, masses.length - 1, turn, cell.radius);
     const shardRadius = radiusForMass(masses[i]);
@@ -788,6 +790,7 @@ function popBotCell(bot) {
   bot.radius = radiusForMass(bot.mass);
   bot.splitCooldown = 7;
   bot.mergeAt = performance.now() + 15000;
+  bot.virusImmuneUntil = performance.now() + 600;
   for (let i = 1; i < masses.length; i++) {
     const shard = BlobPhysics.spikes.shardLaunch(bot, i - 1, masses.length - 1, turn, bot.radius);
     const shardRadius = radiusForMass(masses[i]);
@@ -798,7 +801,7 @@ function popBotCell(bot) {
   return true;
 }
 
-// A spike pops the biggest piece covering it. If that piece can't pop (no room to split), the spike stays.
+// A spike pops the biggest piece hitting it. If that piece can't pop (no room to split), the spike stays.
 function handleViruses() {
   const now = performance.now();
   for (let virusIndex = viruses.length - 1; virusIndex >= 0; virusIndex--) {

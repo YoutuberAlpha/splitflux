@@ -1,6 +1,6 @@
 // Servers: anyone can make a server (name, optional password, bots or not). Each server is its own arena; its host
 // gets the admin panel there, admins can make other players admins, their bans only cover their server, and
-// REMOVE ALL BOTS is a switch on every server (main included). Empty servers close after 5 minutes.
+// REMOVE ALL BOTS is a switch on every server (main included). Servers close after 10 minutes without players.
 const assert = require("assert/strict"), fs = require("fs"), os = require("os"), path = require("path");
 const {createEngine, captureResponse, arenaOf} = require("../cloud-runtime.cjs");
 const {createLiveRuntime} = require("../live-runtime.cjs");
@@ -164,18 +164,24 @@ function browser(runtime) {
     assert.equal((await owner.join(roomId)).status, 200);
     assert.equal(owner.session.adminRole, "owner");
 
-    // A server closes 5 minutes after its last player leaves.
+    // A server closes after 10 minutes with no players in it. Bots don't count as players.
+    assert.equal(runtime.rooms.EMPTY_CLOSE_MS, 10 * 60_000);
+    await owner.post("/api/admin/arena", {view: 2, botsOff: false}); tick(2000);
     const room = runtime.rooms.rooms.get(roomId);
+    assert(room.engine.exportState().world.bots.length > 0, "The server has bots");
     for (const {id} of room.engine.exportState().sessions) room.engine.getSession(id).lastSeen = 0;  // everyone left
     runtime.rooms.tick();
     assert(runtime.rooms.rooms.has(roomId), "Still open right after everyone left");
+    room.emptySince = Date.now() - 9 * 60_000;
+    runtime.rooms.tick();
+    assert(runtime.rooms.rooms.has(roomId), "Still open after 9 minutes with only bots");
     room.emptySince = Date.now() - runtime.rooms.EMPTY_CLOSE_MS - 1;
     runtime.rooms.tick();
-    assert(!runtime.rooms.rooms.has(roomId), "Closed after 5 empty minutes");
+    assert(!runtime.rooms.rooms.has(roomId), "Gone after 10 minutes with no players, bots or not");
     joined = await bob.join(roomId, {pass});
     assert.equal(joined.status, 404); assert.equal(joined.body.roomGone, true, "Joining a closed server says it closed");
 
-    console.log("PASS: make servers (name, optional password, bots or not), separate arenas, host gets admin, admins make admins, server-only bans, REMOVE ALL BOTS switch on main and made servers, owner powers everywhere, empty servers close after 5 minutes.");
+    console.log("PASS: make servers (name, optional password, bots or not), separate arenas, host gets admin, admins make admins, server-only bans, REMOVE ALL BOTS switch on main and made servers, owner powers everywhere, servers close after 10 minutes without players (bots don't count).");
   } finally {
     await runtime?.close();
     for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key];

@@ -54,14 +54,14 @@
 
   // ---- Spikes ----
   // One set of rules for players, bots, the game and the server, so a pop looks and counts the same everywhere.
-  // - A piece pops a spike only when it is big enough (90+ mass) AND covers it: the spike's middle is well inside
-  //   the piece, like eating a cell. Brushing the edge does nothing. Smaller pieces slide under spikes.
+  // - A piece pops a spike as soon as it hits it (overlaps the spike's edge) and is big enough (90+ mass).
+  //   Smaller pieces slide under spikes.
   // - A popped piece keeps half its mass in the middle; the other half bursts out as up to 7 equal shards in an
   //   even ring. If there is no room for even one shard (16 pieces already), nothing pops and the spike stays.
   const SPIKE_RADIUS = 42, POP_MASS = 90, MAX_SHARDS = 7, MIN_PIECE = 17.5;
   function spikeCovered(cell, spike) {
     const size = Number(cell.radius) || radius(cell.mass), spikeSize = Number(spike.r) || SPIKE_RADIUS;
-    return cell.mass >= POP_MASS && size > spikeSize && Math.hypot(cell.x - spike.x, cell.y - spike.y) < size - spikeSize * .28;
+    return cell.mass >= POP_MASS && size > spikeSize && Math.hypot(cell.x - spike.x, cell.y - spike.y) < size + spikeSize * .65;
   }
   // [mass the piece keeps, ...shard masses], or [] when it can't pop.
   function popMasses(mass, freeSlots) {
