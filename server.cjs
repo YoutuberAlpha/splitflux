@@ -230,16 +230,26 @@ function respawnSpikes(now) {
 
 // A player's game reports which spikes it popped; the server removes a spike only if one of that
 // player's pieces big enough to pop it (over 90 mass) really passed over it.
-function popSpikes(paths, rawPops) {
+// A player's pop counts if the piece that popped was big enough before popping (path.popMass), covered the
+// spike somewhere along the way it moved (same rule as BlobPhysics.spikes.covered, plus a little room for lag),
+// and really split this update (`poppers`: pieces that sent out new pieces; each can pop one spike).
+// The owner's game is trusted to split, so `poppers` is null there.
+function popSpikes(paths, rawPops, poppers = null) {
   if (!world || !Array.isArray(rawPops) || !paths.length) return 0;
   let popped = 0;
+  const used = new Set();
   for (const raw of rawPops.slice(0, 16)) {
     const index = world.viruses.findIndex(virus => virus.id === String(raw ?? ""));
     if (index < 0) continue;
     const virus = world.viruses[index];
-    const hit = paths.some(path => path.mass > 90 &&
-      distanceToPath(virus.x, virus.y, path.fromX, path.fromY, path.toX, path.toY) < path.radius + virus.r * .65 + path.margin);
+    const hit = paths.find(path => {
+      if (poppers && (!poppers.has(path.id) || used.has(path.id))) return false;
+      const mass = Math.max(path.popMass || 0, path.mass || 0);
+      if (mass < BlobPhysics.spikes.popMass) return false;
+      return distanceToPath(virus.x, virus.y, path.fromX, path.fromY, path.toX, path.toY) < cellRadius(mass) - (virus.r || 42) * .28 + path.margin;
+    });
     if (!hit) continue;
+    used.add(hit.id);
     world.viruses.splice(index, 1);
     worldRevision++;
     popped++;
@@ -717,6 +727,29 @@ function simulateSharedEjected(dt) {
   return changed;
 }
 
+// A bot popped by a spike: like a player, it keeps half its mass and the rest bursts out as an even ring of shards.
+function popServerBot(bot) {
+  const team = bot.botTeam || bot.name;
+  const teamPieces = world.bots.filter(other => other.alive && (other.botTeam || other.name) === team).length;
+  const masses = BlobPhysics.spikes.popMasses(bot.mass, Math.min(BOT_TEAM_PIECES - teamPieces, BOT_PIECE_HARD_CAP - world.bots.length));
+  if (!bot.alive || !masses.length) return false;
+  const turn = Math.random() * Math.PI * 2, now = Date.now();
+  bot.mass = masses[0];
+  bot.radius = radiusForMass(bot.mass);
+  bot.splitCooldown = 3;
+  bot.serverMergeAt = now + 15000;
+  for (let index = 1; index < masses.length; index++) {
+    const shard = BlobPhysics.spikes.shardLaunch(bot, index - 1, masses.length - 1, turn, bot.radius);
+    const radius = radiusForMass(masses[index]);
+    world.bots.push({ ...bot, netId: crypto.randomUUID(), mass: masses[index], radius,
+      x: Math.max(radius, Math.min(world.worldSize - radius, shard.x)), y: Math.max(radius, Math.min(world.worldSize - radius, shard.y)),
+      launchX: shard.launchX, launchY: shard.launchY, targetX: shard.x + shard.launchX, targetY: shard.y + shard.launchY,
+      splitLineX: 0, splitLineY: 0, splitLineUntil: 0, splitLineUntilEpoch: 0, think: 0, splitCooldown: 3,
+      serverMergeAt: bot.serverMergeAt, virusImmuneUntil: now + 600 });
+  }
+  return true;
+}
+
 function splitServerBot(bot, target, burstPieces = 1, commanded = false) {
   if (!world || !bot.alive || bot.mass < (commanded ? .000002 : 44)) return 0;
   const team = bot.botTeam || bot.name;
@@ -1010,12 +1043,12 @@ function simulateServerBots(dt) {
 
   for (let index = world.viruses.length - 1; index >= 0; index--) {
     const virus = world.viruses[index];
-    const bot = world.bots.find(candidate => (
-      candidate.alive && candidate.mass > 90 && distance(candidate, virus) < candidate.radius + virus.r * .65
-    ));
+    // Same rule as players: the biggest bot piece covering the spike pops it, if it has room to split.
+    const bot = world.bots.filter(candidate => candidate.alive && Date.now() >= (candidate.virusImmuneUntil || 0) && BlobPhysics.spikes.covered(candidate, virus))
+      .sort((a, b) => b.mass - a.mass)[0];
     if (!bot) continue;
-    // If the bot can't split (piece limit reached) it just passes through and the spike stays.
-    if (!splitServerBot(bot, null, 6)) continue;
+    // If the bot can't split (piece limit reached) it just passes over and the spike stays.
+    if (!popServerBot(bot)) continue;
     world.viruses.splice(index, 1);
   }
 
@@ -1223,6 +1256,8 @@ function validateClientCells(session, previousCells, cells, rawCells, spawning, 
     entry.paths = grace
       ? [{ id: cell.netId, fromX: cell.x, fromY: cell.y, toX: cell.x, toY: cell.y, radius, mass: pathMass, margin: 60 + speed * elapsed }]
       : [{ id: cell.netId, fromX: ref.x, fromY: ref.y, toX: cell.x, toY: cell.y, radius, mass: pathMass, margin: 14 + radius * (severalPieces ? .35 : .1) }];
+    // How big this piece was before this update: a spike pop is judged on that (a popped piece has just halved).
+    entry.paths[0].popMass = isNew ? pathMass : Math.max(pathMass, Number(ref.mass) || 0);
     // Pieces that merged into this one ate food on their own way in.
     for (const id of Object.keys(origins.get(cell.netId) || {})) {
       const merged = previous.get(id);
@@ -1235,7 +1270,7 @@ function validateClientCells(session, previousCells, cells, rawCells, spawning, 
   // (Being eaten, eating others and feeding are applied by the server itself.)
   const paths = entries.flatMap(entry => entry.paths);
   const earned = claimFood(paths, rawClaims, rejectedFood);
-  popSpikes(paths, rawPops);
+  popSpikes(paths, rawPops, splitParents);
   const kept = entries.map(entry => entry.cell);
   const previousTotal = [...previous.values()].reduce((sum, cell) => sum + cell.mass, 0);
   const total = kept.reduce((sum, cell) => sum + cell.mass, 0);
@@ -1257,7 +1292,8 @@ function ownerActions(previousCells, cells, rawClaims, rejectedFood, rawPops) {
   const previous = new Map((previousCells || []).map(cell => [cell.netId, cell]));
   const paths = cells.filter(cell => cell.alive).map(cell => {
     const from = previous.get(cell.netId) || cell;
-    return { id: cell.netId, fromX: from.x, fromY: from.y, toX: cell.x, toY: cell.y, radius: cell.radius, mass: cell.mass, margin: 120 };
+    return { id: cell.netId, fromX: from.x, fromY: from.y, toX: cell.x, toY: cell.y, radius: cell.radius, mass: cell.mass,
+      popMass: Math.max(cell.mass, Number(from.mass) || 0), margin: 120 };
   });
   claimFood(paths, rawClaims, rejectedFood);
   popSpikes(paths, rawPops);
