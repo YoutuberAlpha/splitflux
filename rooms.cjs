@@ -1,12 +1,12 @@
 // SERVERS: the main server plus the servers players make from the SERVERS tab.
 // Each made server runs in its own copy of the game engine (its own arena, bots, food and players), so nothing
 // that happens in one can affect another. Accounts, bans, sign-in limits and the live connection are shared
-// with the main server. Made servers live in memory: they close 5 minutes after their last player leaves.
+// with the main server. Made servers live in memory: they close after 10 minutes without players (bots don't count).
 const crypto = require("crypto");
 const {captureResponse} = require("./cloud-runtime.cjs");
 
 const MAX_SERVERS = 10;                 // made servers at once (the free game server only has a small CPU share)
-const EMPTY_CLOSE_MS = 5 * 60_000;      // a made server closes 5 minutes after its last player leaves
+const EMPTY_CLOSE_MS = 10 * 60_000;     // a made server closes after 10 minutes with no players in it (bots don't count)
 const CREATES_PER_HOUR = 5;             // per browser or account
 const JOIN_FAILURES_PER_10_MIN = 10;    // wrong passwords per browser
 const NAME_PATTERN = /^[\p{L}\p{N} _'!?.&#-]{3,24}$/u;
@@ -76,7 +76,7 @@ function createRoomManager({main, loadEngine, now = () => Date.now(), tickMain =
     const password = typeof body.password === "string" ? body.password : "";
     if (password && (password.length < 4 || password.length > 64)) return sendJson(response, 400, {error: "Use a password with 4-64 characters, or leave it empty."});
     const mine = [...rooms.values()].find(room => isHostOf(room, deviceId, account));
-    if (mine) return sendJson(response, 409, {error: `You already host "${mine.name}". It closes 5 minutes after everyone leaves.`});
+    if (mine) return sendJson(response, 409, {error: `You already host "${mine.name}". It closes after 10 minutes with no players.`});
     if (rooms.size >= MAX_SERVERS) return sendJson(response, 503, {error: `All ${MAX_SERVERS} server slots are in use. Try again later.`});
     const hostKey = account ? `account:${account.username}` : `device:${deviceId}`;
     const made = recent(creations, hostKey, 3_600_000);
@@ -150,7 +150,8 @@ function createRoomManager({main, loadEngine, now = () => Date.now(), tickMain =
     }
   }
 
-  // Every 40 ms: the main server always runs; a made server only runs while someone is in it.
+  // Every 40 ms: the main server always runs; a made server only runs while a player is in it (players on its
+  // menu count, bots don't). After 10 minutes with no players at all, the server is gone.
   // (On a PC the main server has its own timer, so tickMain is false there.)
   function tick() {
     if (tickMain) main.advanceArena();
