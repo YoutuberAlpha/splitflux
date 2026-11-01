@@ -115,17 +115,18 @@ function browser() {
     assert(refused, "A flood of new connections is limited"); assert.equal(refused.body.full, true);
     assert.equal((await owner.open()).status, 200, "The owner still gets in");
 
-    // Limits checked with the test clock: full server, skin download budget.
+    // Limits checked with the test clock: full server, shop requests.
     const game = createServer();
     game.run(`for (let i = 0; i < MAX_SESSIONS; i++) sessions.set("s" + i, {id: "s" + i, deviceId: "d" + i, lastSeen: Date.now(), cells: [], running: false})`);
     assert.equal((await game.call("/api/session")).status, 503, "A full server turns new players away");
     game.run("sessions.clear()");
-    assert.equal(game.run("takeSkinBudget(19_000_000, Date.now())"), true);
-    assert.equal(game.run("takeSkinBudget(2_000_000, Date.now())"), false, "Skin downloads stop at 20 MB an hour");
-    game.advance(3_600_000);
-    assert.equal(game.run("takeSkinBudget(2_000_000, Date.now())"), true, "and start again the next hour");
+    const shopper = await game.player(false, "shopper"), ask = () => game.call("/api/shop", {id: shopper.session.id, sessionKey: shopper.session.sessionKey}, false, "shopper");
+    for (let i = 0; i < 20; i++) assert.equal((await ask()).status, 200);
+    assert.equal((await ask()).status, 429, "At most 20 shop requests per 10 seconds");
+    game.advance(10_001);
+    assert.equal((await ask()).status, 200, "then it opens again");
 
-    console.log("PASS: 30-day renewable logins, old logins still work, password change signs out other browsers, owner password reset, 6 tabs per browser, 25 updates/s per player, 60 new connections/min, full-server and skin download limits.");
+    console.log("PASS: 30-day renewable logins, old logins still work, password change signs out other browsers, owner password reset, 6 tabs per browser, 25 updates/s per player, 60 new connections/min, full-server and shop request limits.");
   } finally {
     if (child && child.exitCode === null) await new Promise(resolve => { child.once("exit", resolve); child.kill(); });
     fs.rmSync(dataDirectory, {recursive: true, force: true});

@@ -4,6 +4,7 @@ const assert = require("assert/strict");
 const fs = require("fs");
 const path = require("path");
 const vm = require("vm");
+const os = require("os");
 const physics = require("../physics.js");
 const {captureResponse} = require("../cloud-runtime.cjs");
 
@@ -15,11 +16,15 @@ function createServer({world = "cleanWorld({worldSize: 5200, bots: [], viruses: 
       if (name === "http") return {createServer: () => ({listen() {}})};
       if (name === "fs") return {mkdirSync() {}, existsSync: () => true, readFileSync: () => JSON.stringify({key: "test-key"}), writeFileSync() {}, renameSync() {}};
       if (name === "./accounts.cjs") return () => ({
-        fromRequest: request => request.headers["x-test-owner"] ? {username: "alpha", role: "owner", isAdmin: true} : null,
+        fromRequest: request => request.headers["x-test-owner"] ? {username: "alpha", role: "owner", isAdmin: true}
+          : request.headers["x-test-user"] ? {username: request.headers["x-test-user"], role: "player", isAdmin: false} : null,
         remember() {}, forget() {},
       });
       if (name === "./moderation.cjs") return () => ({device: () => "device", until: () => 0, bannedBotTeams: () => []});
       if (name === "./physics.js") return physics;
+      if (name === "./skins.js") return require("../skins.js");
+      // The real coin and skin store, writing into its own temporary folder.
+      if (name === "./shop.cjs") return () => require("../shop.cjs")(fs.mkdtempSync(path.join(os.tmpdir(), "splitflux-shop-")));
       return require(name);
     },
     __dirname: path.join(__dirname, ".."), process: {env: {}}, Buffer, module: {exports: {}}, console,
@@ -28,18 +33,20 @@ function createServer({world = "cleanWorld({worldSize: 5200, bots: [], viruses: 
   vm.runInContext(fs.readFileSync(path.join(__dirname, "..", "server.cjs"), "utf8"), context);
   vm.runInContext(`world = ${world};`, context);
   const handleRequest = context.module.exports.handleRequest;
-  async function call(route, body, owner = false) {
+  // owner: signed in as the owner; user: signed in to that (player) account.
+  async function call(route, body, owner = false, user = null) {
     const response = captureResponse();
-    await handleRequest({method: body ? "POST" : "GET", url: route, headers: {host: "test", ...(owner ? {"x-test-owner": "1"} : {})}, body}, response);
+    await handleRequest({method: body ? "POST" : "GET", url: route,
+      headers: {host: "test", ...(owner ? {"x-test-owner": "1"} : {}), ...(user ? {"x-test-user": user} : {})}, body}, response);
     return {status: response.statusCode, body: JSON.parse(response.body.toString() || "{}")};
   }
-  async function player(owner = false) {
-    const session = (await call("/api/session")).body;
-    const who = {session, owner, snapshot: null, food: null};
+  async function player(owner = false, user = null) {
+    const session = (await call("/api/session", undefined, owner, user)).body;
+    const who = {session, owner, user, snapshot: null, food: null};
     who.state = async (extra = {}) => {
       const result = await call("/api/state", {id: session.id, sessionKey: session.sessionKey, running: true, name: "T", color: "#55d6ff",
         ackRevision: who.snapshot?.self.revision || 0, cells: who.cells || [],
-        foodSeed: who.food?.seed ?? null, ackFoodRevision: who.food?.revision ?? -1, ...extra}, owner);
+        foodSeed: who.food?.seed ?? null, ackFoodRevision: who.food?.revision ?? -1, ...extra}, owner, who.user);
       assert.equal(result.status, 200, JSON.stringify(result.body));
       who.snapshot = result.body;
       // Compact updates only include the player's own pieces when the server changed them.
