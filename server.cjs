@@ -1634,6 +1634,8 @@ const handleRequest = async (request, response) => {
       if (!session || session.sessionKey !== body.sessionKey) { sendJson(response, 401, { error: "Session expired" }); return; }
       session.account = accounts.fromRequest(request);
       if (playerBanUntil(session)) { sendJson(response, 403, { error: "You are banned from this arena." }); return; }
+      // Guests can read the chat but not write in it.
+      if (!session.account) { sendJson(response, 403, { error: "You have to sign in or create an account to text, but you can still see the messages.", signIn: true }); return; }
       const text = String(body.text ?? "").replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/g, " ").replace(/\s+/g, " ").trim().slice(0, 120);
       if (!text) { sendJson(response, 400, { error: "Type a message first." }); return; }
       const now = Date.now();
