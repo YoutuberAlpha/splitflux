@@ -453,6 +453,9 @@
     document.querySelector("#adminUnlockStatus").textContent = account
       ? `Signed in as ${account.username} - ${role}` : `Playing as guest${adminRole ? ` - ${role}` : ""}. Sign in or create an account.`;
     document.querySelector("#accountLogout").hidden = !account;
+    // CHAT: guests can read it; signing in lets you write.
+    document.querySelector("#chatInput").hidden = !account;
+    document.querySelector("#chatGuestNote").hidden = Boolean(account);
     document.querySelector("#accountTools").hidden = !account;
     document.querySelector("#ownerReset").hidden = !(account && account.isAdmin);
     updateServerAdmin();
@@ -1297,7 +1300,15 @@
       chatInput.blur();
     } else if (event.key === "Escape") chatInput.blur();
   });
-  window.focusChat = () => { for (const code in keys) keys[code] = false; chatInput.focus(); };
+  window.focusChat = () => {
+    if (chatInput.hidden) {  // a guest: point at the note instead
+      const note = document.querySelector("#chatGuestNote");
+      note.classList.remove("flash"); void note.offsetWidth; note.classList.add("flash");
+      return;
+    }
+    for (const code in keys) keys[code] = false;
+    chatInput.focus();
+  };
   if (matchMedia("(pointer: coarse)").matches) chatInput.placeholder = "Tap to chat";
   document.querySelector("#chat").hidden = false;
   document.querySelector("#refreshServers").addEventListener("click", loadServers);

@@ -81,6 +81,10 @@ button, input, select { font: inherit; }
 .chat-log .system { color: var(--muted); font-style: italic; }
 .chat input { width: 100%; padding: 7px 9px; border: 1px solid rgba(255,255,255,.12); outline: none; background: rgba(0,0,0,.35); color: white; font: 12px Inter, system-ui, sans-serif; }
 .chat input:focus { border-color: var(--lime); }
+.chat input[hidden], .chat-note[hidden] { display: none; }
+.chat-note.flash { animation: chat-note-flash 1s ease-out; }
+@keyframes chat-note-flash { from { border-color: var(--lime); color: var(--text); background: rgba(182,255,74,.12); } }
+.chat-note { margin: 0; padding: 6px 8px; border: 1px dashed rgba(255,255,255,.18); color: var(--muted); font-size: 11px; line-height: 1.35; }
 .coin-row { display: grid; grid-template-columns: 1fr auto; gap: 6px; margin-top: 10px; }
 .coin-row[hidden], .coin-box[hidden] { display: none; }
 .coin-row input { min-width: 0; padding: 8px; border: 1px solid rgba(255,255,255,.14); background: rgba(0,0,0,.3); color: white; font-family: Consolas, monospace; }
