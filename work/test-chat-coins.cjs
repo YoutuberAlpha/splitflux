@@ -74,14 +74,17 @@ const {createServer} = require("./server-harness.cjs");
   assert.equal(view.chat.messages[0].text.length, 120, "120 characters at most");
   assert.equal(view.chat.messages[0].role, "owner", "The owner's messages are tagged");
   assert.equal((await amy.state({ackChat: 999})).chat.messages.length, 2, "After a server restart the recent chat comes again");
-  assert.equal((await post(amy, "/api/chat", {text: "guests can chat"})).status, 200);
+  // Guests can read the chat (amy got the messages above) but can't write.
+  answer = await post(amy, "/api/chat", {text: "guests can't chat"});
+  assert.equal(answer.status, 403); assert.equal(answer.body.error, "You have to sign in or create an account to text, but you can still see the messages.");
+  assert.equal((await post(carl, "/api/chat", {text: "signed in players can"})).status, 200);
   // Rate limit: one every 0.7 s, 5 per 10 s.
-  assert.equal((await post(amy, "/api/chat", {text: "too fast"})).status, 429);
-  for (let i = 0; i < 4; i++) { game.advance(800); assert.equal((await post(amy, "/api/chat", {text: "m" + i})).status, 200); }
+  assert.equal((await post(carl, "/api/chat", {text: "too fast"})).status, 429);
+  for (let i = 0; i < 4; i++) { game.advance(800); assert.equal((await post(carl, "/api/chat", {text: "m" + i})).status, 200); }
   game.advance(800);
-  assert.equal((await post(amy, "/api/chat", {text: "sixth"})).status, 429, "5 messages per 10 seconds");
+  assert.equal((await post(carl, "/api/chat", {text: "sixth"})).status, 429, "5 messages per 10 seconds");
   game.advance(10_000);
-  assert.equal((await post(amy, "/api/chat", {text: "later"})).status, 200);
+  assert.equal((await post(carl, "/api/chat", {text: "later"})).status, 200);
   // Only the newest 40 are kept, and a newcomer gets the last 20.
   for (let i = 0; i < 50; i++) game.run(`chatLog = [...chatLog, {seq: ++chatSeq, name: "X", text: "${i}", at: 0}].slice(-CHAT_KEEP)`);
   assert.equal(game.run("chatLog.length"), 40);
@@ -93,5 +96,5 @@ const {createServer} = require("./server-harness.cjs");
   game.run("chatLog = []; chatSeq = 0"); game.run("importState")(saved);
   assert.equal(game.run("chatLog.length"), 40); assert(game.run("chatSeq") >= 50);
 
-  console.log("PASS: players gift their own coins by username (not as guests, not to themselves, not more than they have; the owner and real admins can gift coins they don't have), owner and real admins add coins to themselves and gift them to signed-in players (who are told once), not players/guests/server owners, amounts 1-1,000,000; chat per server, cleaned and cut to 120 characters, owner/admin tags, only new messages sent, 1 per 0.7 s and 5 per 10 s, newest 40 kept, saved with the arena.");
+  console.log("PASS: players gift their own coins by username (not as guests, not to themselves, not more than they have; the owner and real admins can gift coins they don't have), owner and real admins add coins to themselves and gift them to signed-in players (who are told once), not players/guests/server owners, amounts 1-1,000,000; chat per server (guests read but can't write), cleaned and cut to 120 characters, owner/admin tags, only new messages sent, 1 per 0.7 s and 5 per 10 s, newest 40 kept, saved with the arena.");
 })().catch(error => { console.error(error); process.exitCode = 1; });
